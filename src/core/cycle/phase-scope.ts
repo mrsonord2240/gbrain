@@ -38,6 +38,7 @@ export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
   synthesize_concepts: 'global',
   conversation_facts_backfill: 'source',
   enrich_thin: 'source',
+  inbox_triage: 'source',
   skillopt: 'global',
 };
 
