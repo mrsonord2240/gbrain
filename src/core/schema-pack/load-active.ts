@@ -91,7 +91,7 @@ export function _resetPackLocatorForTests(): void {
  * Returns null when the pack is not found. Callers handle null by
  * throwing UnknownPackError with a paste-ready install hint.
  */
-function defaultPackLocator(name: string): string | null {
+export function defaultPackLocator(name: string): string | null {
   // v0.39 T8 — bundled packs registry. gbrain-base + gbrain-recommended
   // ship in src/core/schema-pack/base/. Add a new entry here to bundle
   // additional canonical packs.

@@ -137,6 +137,25 @@ export function parseYamlMini(content: string): unknown {
     return trimmed;
   }
 
+  // Block scalars (`key: |` or `key: >`, optionally with chomping
+  // indicators like `|-`/`>+`) are explicitly unsupported per this
+  // parser's documented contract above. Without this guard, hitting one
+  // doesn't throw — the body's indented lines fail the `indent >
+  // baseIndent` check in the enclosing parseMapping/parseSequence call
+  // and silently end that block early, dropping every sibling key that
+  // follows (e.g. a pack's `description: |` swallowing page_types and
+  // link_types with zero error). Fail loud instead.
+  const BLOCK_SCALAR_RE = /^[|>][+-]?\d*$/;
+  function assertNotBlockScalar(rest: string, key: string): void {
+    if (BLOCK_SCALAR_RE.test(rest)) {
+      throw new Error(
+        `unsupported YAML block scalar at "${key}: ${rest}" — block literals (|) and folded ` +
+          `scalars (>) are not supported by gbrain's schema-pack YAML parser. Use a quoted ` +
+          `single-line string instead, or ship the pack as JSON.`,
+      );
+    }
+  }
+
   function indentOf(line: string): number {
     let n = 0;
     while (n < line.length && line[n] === ' ') n++;
@@ -193,6 +212,7 @@ export function parseYamlMini(content: string): unknown {
             if (rest === '') {
               map[key] = parseBlock(nextIndent + 2);
             } else {
+              assertNotBlockScalar(rest, key);
               map[key] = parseScalar(rest);
             }
           }
@@ -209,6 +229,7 @@ export function parseYamlMini(content: string): unknown {
         if (rest === '') {
           map[key] = parseBlock(indent + 2);
         } else {
+          assertNotBlockScalar(rest, key);
           map[key] = parseScalar(rest);
         }
         // Continue siblings at indent+2
@@ -228,6 +249,7 @@ export function parseYamlMini(content: string): unknown {
           if (rest2 === '') {
             map[key2] = parseBlock(nextIndent + 2);
           } else {
+            assertNotBlockScalar(rest2, key2);
             map[key2] = parseScalar(rest2);
           }
         }
@@ -258,6 +280,7 @@ export function parseYamlMini(content: string): unknown {
       if (rest === '') {
         result[key] = parseBlock(indent + 2);
       } else {
+        assertNotBlockScalar(rest, key);
         result[key] = parseScalar(rest);
       }
     }

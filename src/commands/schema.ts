@@ -31,6 +31,7 @@ import {
   removePrefixFromType,
   removeTypeFromPack,
   resolveActivePackNameOnly,
+  defaultPackLocator,
   loadPackFromFile,
   parseSchemaPackManifest,
   runStatsCore,
@@ -366,18 +367,14 @@ function runUse(args: string[]): void {
 }
 
 function packPathByName(name: string): string | null {
-  if (name === 'gbrain-base') {
-    // Resolve bundled YAML — try a few locations.
-    const here = dirname(new URL(import.meta.url).pathname);
-    const candidates = [
-      join(here, '..', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
-      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
-    ];
-    for (const c of candidates) {
-      if (existsSync(c)) return c;
-    }
-    return null;
-  }
+  // Delegate to the same locator every other consumer (loadActivePack,
+  // findPackSuccessors) uses. Prior to this fix, this function hand-rolled
+  // a locator that only special-cased the literal string 'gbrain-base',
+  // so `gbrain schema use gbrain-recommended` (and every other bundled
+  // lens pack) failed with "Unknown pack" even though `gbrain schema list`
+  // correctly advertised them as bundled.
+  const bundled = defaultPackLocator(name);
+  if (bundled) return bundled;
   const baseDir = gbrainPath('schema-packs', name);
   for (const c of ['pack.yaml', 'pack.yml', 'pack.json']) {
     const candidate = join(baseDir, c);
