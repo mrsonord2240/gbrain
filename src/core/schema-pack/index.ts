@@ -101,6 +101,7 @@ export {
   loadResolvedPackByName,
   resolveLoadedPack,
   resolveActivePackNameOnly,
+  defaultPackLocator,
   __setPackLocatorForTests,
   _resetPackLocatorForTests,
   type LoadActivePackInput,
