@@ -91,6 +91,14 @@ export type CyclePhase =
   // Same brain-wide BudgetTracker + walltime-cap shape as
   // conversation_facts_backfill; the phase wrapper does its own per-source loop.
   | 'enrich_thin'
+  // Opt-in (default OFF). Files raw inbox/ captures (Clipper webhook drops
+  // via POST /ingest -> ingest_capture, etc.) into their canonical home
+  // per the active schema pack + primary-subject filing rules, via a
+  // cheap Haiku (utility tier) classification call. High confidence ->
+  // retype + move via put_page (auto-link/auto-timeline fire same as
+  // `gbrain capture`) + soft-delete the old inbox slug. Low confidence ->
+  // tag needs-review and leave in place.
+  | 'inbox_triage'
   // v0.41.20.0 — SkillOpt-paper-grounded self-evolving skills. Default OFF;
   // walks skills with stale skillopt-benchmark.jsonl AND last_run_at >7d.
   // Per-skill cost cap $0.50; brain-wide cap $2.00. Bundled-skill safety
@@ -161,6 +169,10 @@ export const ALL_PHASES: CyclePhase[] = [
   // conversation_facts_backfill, BEFORE embed so enriched bodies get
   // chunked + embedded in the same cycle.
   'enrich_thin',
+  // Opt-in inbox triage. After enrich_thin (both are opt-in per-tick
+  // trickles over Haiku/model calls), BEFORE embed so retyped/moved pages
+  // get chunked + embedded at their new slug in the same cycle.
+  'inbox_triage',
   // v0.41.20.0 SkillOpt — self-evolving skills phase. Dispatch order
   // places it AFTER the main graph-mutating cluster (extract, patterns,
   // consolidate, calibration, conversation-facts) so any skill that
@@ -237,6 +249,9 @@ export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
   conversation_facts_backfill: 'source',
   // v0.41.39 (#1700) — per-source (wrapper loops listSources, same as above).
   enrich_thin: 'source',
+  // inbox/ pages are naturally per-source (each source's own inbox
+  // prefix); the phase accepts an optional sourceId scope.
+  inbox_triage: 'source',
   // v0.41.20.0 SkillOpt — global (walks the skills/ directory; per-skill
   // DB lock inside D14 handles cross-source coordination).
   skillopt: 'global',
@@ -299,6 +314,9 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   // v0.41.39 (#1700) — writes pages via put_page (per-page advisory-locked
   // internally too); coordinate via the cycle lock like the other writers.
   'enrich_thin',
+  // Writes pages via put_page + delete_page (retype/move/soft-delete);
+  // coordinate via the cycle lock like the other writers.
+  'inbox_triage',
   // v0.41.20.0 SkillOpt — writes SKILL.md + skillopt/ artifacts; needs lock.
   // Per-skill lock (D14) is acquired inside runSkillOpt; this NEEDS_LOCK
   // entry covers the cycle-level coordination.
@@ -2122,6 +2140,31 @@ export async function runCycle(
         const { runPhaseEnrichThin } = await import('./cycle/enrich-thin.ts');
         const { result, duration_ms } = await timePhase(() =>
           runPhaseEnrichThin(engine, { dryRun, signal: opts.signal }),
+        );
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── inbox_triage: files raw inbox/ captures into their canonical ──
+    // home per the active schema pack. Opt-in (default OFF).
+    if (phases.includes('inbox_triage')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'inbox_triage',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.inbox_triage');
+        const { runPhaseInboxTriage } = await import('./cycle/inbox-triage.ts');
+        const { result, duration_ms } = await timePhase(() =>
+          runPhaseInboxTriage(engine, { dryRun, signal: opts.signal, sourceId: opts.sourceId }),
         );
         result.duration_ms = duration_ms;
         phaseResults.push(result);
