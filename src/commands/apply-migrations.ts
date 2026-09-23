@@ -16,13 +16,17 @@ import { VERSION } from '../version.ts';
 import { loadConfig } from '../core/config.ts';
 import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
-
-/** Bug 3 — max consecutive partials before we wedge a migration. */
-const MAX_CONSECUTIVE_PARTIALS = 3;
+import {
+  indexCompletedEntries,
+  statusForVersion as ledgerStatusForVersion,
+  MAX_CONSECUTIVE_PARTIALS,
+} from '../core/migration-ledger.ts';
 
 interface ApplyMigrationsArgs {
   list: boolean;
   dryRun: boolean;
+  json: boolean;
+  dbOnlyExport?: OrchestratorOpts['dbOnlyExport'];
   yes: boolean;
   nonInteractive: boolean;
   mode?: 'always' | 'pain_triggered' | 'off';
@@ -42,6 +46,8 @@ interface ApplyMigrationsArgs {
   forceAll?: boolean;
   /** v0.30.1 (D6 / X3): bypass verify-hook drift detection on a single run. */
   skipVerify?: boolean;
+  /** #4364: exit 1 when the DB pre-flight probe fails instead of proceeding filesystem-only. */
+  requireDb: boolean;
   help: boolean;
 }
 
@@ -52,6 +58,11 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
     return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
   };
   const mode = val('--mode') as ApplyMigrationsArgs['mode'];
+  const exporting = has('--export-db-only');
+  if (exporting && !val('--content-root') || has('--backup-confirmed') && has('--acknowledge-no-backup')) {
+    console.error('DB-only export requires --content-root and exactly one explicit backup choice for a non-dry run.');
+    process.exit(2);
+  }
   if (mode && !['always', 'pain_triggered', 'off'].includes(mode)) {
     console.error(`Invalid --mode "${mode}". Allowed: always, pain_triggered, off.`);
     process.exit(2);
@@ -59,17 +70,22 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
   return {
     list: has('--list'),
     dryRun: has('--dry-run'),
+    json: has('--json'),
+    dbOnlyExport: exporting ? { root: val('--content-root')!, sourceId: val('--export-source') ?? 'default',
+      confirmQuiesced: has('--confirm-quiesced'),
+      backup: has('--backup-confirmed') ? 'operator_verified' : has('--acknowledge-no-backup') ? 'acknowledged_unprotected' : undefined } : undefined,
     yes: has('--yes'),
     nonInteractive: has('--non-interactive'),
     mode,
     specificMigration: val('--migration'),
     hostDir: val('--host-dir'),
-    noAutopilotInstall: has('--no-autopilot-install'),
+    noAutopilotInstall: has('--no-autopilot-install') || process.env.GBRAIN_NO_AUTOPILOT_INSTALL === '1',
     forceRetry: val('--force-retry'),
     forceOrchestrator: has('--force-orchestrator'),
     forceSchema: has('--force-schema'),
     forceAll: has('--force-all') || has('--force'),
     skipVerify: has('--skip-verify'),
+    requireDb: has('--require-db'),
     help: has('--help') || has('-h'),
   };
 }
@@ -81,6 +97,14 @@ Usage:
   gbrain apply-migrations                Run all pending migrations interactively.
   gbrain apply-migrations --yes          Non-interactive; uses default mode (pain_triggered).
   gbrain apply-migrations --dry-run      Print the plan; take no action.
+  gbrain apply-migrations --dry-run --json
+                                        Include read-only content inventories and conflicts.
+  gbrain apply-migrations --migration 0.53.0 --export-db-only --content-root <path>
+    [--export-source <id>] --dry-run --json
+                                        Preview a lossless host-side DB-only content export.
+    --confirm-quiesced                   Attest old writers and skill servers are stopped.
+    --backup-confirmed                   Attest an operational backup was verified by you.
+    --acknowledge-no-backup               Explicitly proceed without a verified backup.
   gbrain apply-migrations --list         Show applied + pending migrations.
   gbrain apply-migrations --migration vX.Y.Z
                                          Force-run a specific migration by version.
@@ -100,10 +124,14 @@ Usage:
                                          non-idempotent migrations (D6 escape hatch).
 
 Flags:
+  --require-db                           Exit 1 when the database is unreachable
+                                         instead of continuing with the
+                                         filesystem-only migration plan.
   --mode <always|pain_triggered|off>     Set minion_mode without prompting.
   --host-dir <path>                      Include this directory in host-file walk
                                          (default scope: \$HOME/.claude + \$HOME/.openclaw).
   --no-autopilot-install                 Skip the Phase F autopilot install step.
+                                         Also: GBRAIN_NO_AUTOPILOT_INSTALL=1.
   --non-interactive                      Equivalent to --yes; never prompt.
 
 Exit codes:
@@ -117,53 +145,18 @@ interface CompletedIndex {
   byVersion: Map<string, CompletedMigrationEntry[]>;
 }
 
+// Ledger status logic moved to src/core/migration-ledger.ts (shared with the
+// get_health op's migrations block, TODOS:4063) — same semantics, same Bug 3
+// "complete wins / trailing retry overrides / consecutive-partial cap" rules.
 function indexCompleted(entries: CompletedMigrationEntry[]): CompletedIndex {
-  const byVersion = new Map<string, CompletedMigrationEntry[]>();
-  for (const e of entries) {
-    const list = byVersion.get(e.version) ?? [];
-    list.push(e);
-    byVersion.set(e.version, list);
-  }
-  return byVersion.size > 0
-    ? { byVersion }
-    : { byVersion: new Map() };
+  return { byVersion: indexCompletedEntries(entries) };
 }
 
-/**
- * Returns the resolved status for a migration based on its entries.
- *
- * Semantics (Bug 3 — keep "complete wins" safety):
- *   - If the latest entry is `retry`, the version is pending. This is the
- *     explicit escape hatch written by `--force-retry`, and it overrides an
- *     earlier `complete` entry without hand-editing the ledger.
- *   - Otherwise, if any entry is `complete`, the version is complete.
- *   - Otherwise, if any entry is `partial`, the version is partial.
- *   - Otherwise, pending.
- *
- * `complete` never regresses accidentally. A later `partial` append cannot
- * undo a completed migration; only a trailing, explicit `retry` marker can.
- */
 function statusForVersion(
   version: string,
   idx: CompletedIndex,
 ): 'complete' | 'partial' | 'pending' | 'wedged' {
-  const entries = idx.byVersion.get(version) ?? [];
-  if (entries.length === 0) return 'pending';
-  const latest = entries[entries.length - 1];
-  if (latest.status === 'retry') return 'pending';
-  if (entries.some(e => e.status === 'complete')) return 'complete';
-  // Bug 3 attempt cap — count consecutive partials from the end (stopping
-  // at any 'retry' or 'complete'). If we hit MAX_CONSECUTIVE_PARTIALS,
-  // the migration is wedged and needs explicit --force-retry to try again.
-  let consecutive = 0;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.status === 'partial') consecutive++;
-    else break;
-  }
-  if (consecutive >= MAX_CONSECUTIVE_PARTIALS) return 'wedged';
-  if (entries.some(e => e.status === 'partial')) return 'partial';
-  return 'pending';
+  return ledgerStatusForVersion(version, idx.byVersion);
 }
 
 interface Plan {
@@ -204,8 +197,29 @@ function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: strin
   return plan;
 }
 
-function printList(plan: Plan, installed: string): void {
-  console.log(`Installed gbrain version: ${installed}\n`);
+/**
+ * #4364: pre-flight DB probe outcome. Surfaced on --list/--dry-run so an
+ * unreachable database is distinguishable from a clean one — both used to
+ * print the identical all-pending plan at exit 0.
+ */
+type DbProbeOutcome =
+  | { status: 'connected'; schemaVer: number; latest: number }
+  | { status: 'unreachable'; reason: string }
+  | { status: 'skipped'; reason: string };
+
+function formatDbProbeLine(probe: DbProbeOutcome): string {
+  if (probe.status === 'connected') {
+    return `Database: connected, schema v${probe.schemaVer} (latest ${probe.latest})`;
+  }
+  if (probe.status === 'unreachable') {
+    return `Database: UNREACHABLE (${probe.reason})`;
+  }
+  return `Database: not probed (${probe.reason})`;
+}
+
+function printList(plan: Plan, installed: string, dbProbe: DbProbeOutcome): void {
+  console.log(`Installed gbrain version: ${installed}`);
+  console.log(`${formatDbProbeLine(dbProbe)}\n`);
   console.log('  Status   Version   Headline');
   console.log('  -------  --------  -----------------------------------------');
   const rows: Array<{ status: string; m: Migration }> = [
@@ -230,8 +244,9 @@ function printList(plan: Plan, installed: string): void {
   }
 }
 
-function printDryRun(plan: Plan, installed: string): void {
+function printDryRun(plan: Plan, installed: string, dbProbe: DbProbeOutcome): void {
   console.log(`Dry run — installed gbrain version: ${installed}`);
+  console.log(formatDbProbeLine(dbProbe));
   console.log('');
   if (plan.applied.length) {
     console.log('Already applied:');
@@ -302,6 +317,7 @@ function orchestratorOptsFrom(cli: ApplyMigrationsArgs): OrchestratorOpts {
     dryRun: cli.dryRun,
     hostDir: cli.hostDir,
     noAutopilotInstall: cli.noAutopilotInstall,
+    dbOnlyExport: cli.dbOnlyExport,
   };
 }
 
@@ -320,7 +336,8 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // to migrate. Exit silently for --yes / --non-interactive so postinstall
   // stays quiet; mention the init step when invoked interactively.
   if (!loadConfig()) {
-    if (cli.list) console.log('No brain configured. Run `gbrain init` to set one up.');
+    if (cli.dryRun && cli.json) console.log(JSON.stringify({ status: 'unconfigured', previews: [] }));
+    else if (cli.list) console.log('No brain configured. Run `gbrain init` to set one up.');
     else if (cli.dryRun) console.log('No brain configured (run `gbrain init` first). Nothing to migrate.');
     return;
   }
@@ -397,6 +414,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // --yes/--non-interactive we apply them here; otherwise we warn and make
   // sure the run does NOT report "All migrations up to date" with exit 0.
   let schemaBehind = false;
+  let dbProbe: DbProbeOutcome = { status: 'skipped', reason: 'no probe attempted' };
   try {
     const { LATEST_VERSION } = await import('../core/migrate.ts');
     const { loadConfig: lc, toEngineConfig } = await import('../core/config.ts');
@@ -411,11 +429,14 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       // schema lifecycle internally on PGLite (phase A routes in-process),
       // so the warning here adds no information for PGLite users.
       const skipPreflight = cfg.engine === 'pglite';
-      if (!skipPreflight) {
+      if (skipPreflight) {
+        dbProbe = { status: 'skipped', reason: 'pglite manages schema in-process' };
+      } else {
         const eng = await createEngine(toEngineConfig(cfg));
         await eng.connect(toEngineConfig(cfg));
         const verStr = await eng.getConfig('version');
         const schemaVer = parseInt(verStr || '1', 10);
+        dbProbe = { status: 'connected', schemaVer, latest: LATEST_VERSION };
         const { runMigrations } = await import('../core/migrate.ts');
         schemaBehind = await resolveSchemaBehind({
           schemaVer,
@@ -428,9 +449,17 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
         await eng.disconnect();
       }
     }
-  } catch {
-    // Non-fatal: if DB is unreachable, orchestrator migrations can still
-    // run their filesystem-only phases.
+  } catch (err) {
+    // Non-fatal by default: if DB is unreachable, orchestrator migrations can
+    // still run their filesystem-only phases. #4364: keep the (redacted)
+    // reason so --list/--dry-run say UNREACHABLE and --require-db fails hard —
+    // connect errors are exactly what users paste into issues and CI logs.
+    const { redactUrlsInText } = await import('../core/url-redact.ts');
+    const { redactConnectionInfo } = await import('../core/audit/redact-connection-info.ts');
+    dbProbe = {
+      status: 'unreachable',
+      reason: redactConnectionInfo(redactUrlsInText(err instanceof Error ? err.message : String(err))),
+    };
   }
 
   const completed = loadCompletedMigrations();
@@ -455,10 +484,32 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
     process.exit(2);
   }
 
-  if (cli.list) { printList(plan, installed); process.exit(0); }
-  if (cli.dryRun) { printDryRun(plan, installed); process.exit(0); }
+  // #4364: --require-db turns an unreachable DB into a hard failure instead
+  // of a filesystem-only plan that renders identically to a clean database.
+  const listExit = cli.requireDb && dbProbe.status === 'unreachable' ? 1 : 0;
+  if (cli.list) { printList(plan, installed, dbProbe); process.exit(listExit); }
+  if (cli.dryRun) {
+    const previews: Array<{ version: string; preview?: unknown; error?: string }> = [];
+    for (const migration of [...plan.applied, ...plan.partial, ...plan.pending, ...plan.wedged]) {
+      if (!migration.preview) continue;
+      try { previews.push({ version: migration.version, preview: await migration.preview(orchestratorOptsFrom(cli)) }); }
+      catch (error) { previews.push({ version: migration.version, error: error instanceof Error ? error.message : 'Inventory unavailable.' }); }
+    }
+    if (cli.json) console.log(JSON.stringify({ installed, database: dbProbe, plan: Object.fromEntries(Object.entries(plan).map(([state, entries]) => [state, entries.map((migration: Migration) => migration.version)])), previews }));
+    else {
+      printDryRun(plan, installed, dbProbe);
+      for (const preview of previews) console.log(JSON.stringify(preview));
+    }
+    process.exit(listExit || (previews.some(preview => preview.error) ? 1 : 0));
+  }
+  if (cli.requireDb && dbProbe.status === 'unreachable') {
+    console.error(formatDbProbeLine(dbProbe));
+    console.error('--require-db: database is unreachable; aborting before orchestrators run.');
+    process.exit(1);
+  }
 
-  const toRun: Migration[] = [...plan.partial, ...plan.pending];
+  const toRun: Migration[] = [...plan.partial, ...plan.pending, ...plan.applied.filter(migration => migration.reconcile)]
+    .sort((left, right) => compareVersions(left.version, right.version));
   if (toRun.length === 0) {
     if (schemaBehind) {
       console.error(
@@ -469,6 +520,9 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
     }
     console.log('All migrations up to date.');
     process.exit(0);
+  }
+  if (!schemaBehind && plan.pending.length === 0 && plan.partial.length === 0) {
+    console.log('All migrations up to date. This covers orchestrator checkpoints only; host publication and client activation are being rechecked.');
   }
 
   // Run each orchestrator in registry order. An orchestrator failure aborts
@@ -481,6 +535,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // ledger drop was the root cause of the original infinite-retry symptom).
   let failed = false;
   for (const m of toRun) {
+    const recordCheckpoint = !m.reconcile || !plan.applied.includes(m);
     console.log(`\n=== Applying migration v${m.version}: ${m.featurePitch.headline} ===`);
     try {
       const result = await m.orchestrator(orchestratorOptsFrom(cli));
@@ -496,7 +551,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
         // Record the attempt as 'partial' (not 'complete') so the cap counts
         // it. Don't let a failed orchestrator look like it never ran.
         try {
-          appendCompletedMigration({
+          if (recordCheckpoint) appendCompletedMigration({
             version: m.version,
             status: 'partial',
             phases: result.phases,
@@ -516,7 +571,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       // the last entry for this version is already 'complete' (idempotency
       // guard), so repeated clean runs don't spam the ledger.
       try {
-        appendCompletedMigration({
+        if (recordCheckpoint) appendCompletedMigration({
           version: m.version,
           status: result.status, // 'complete' | 'partial'
           phases: result.phases,
@@ -534,6 +589,8 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 
       if (result.status === 'partial') {
         console.log(`Migration v${m.version} finished as PARTIAL. Re-run \`gbrain apply-migrations --yes\` after resolving any pending host-work items.`);
+      } else if (m.reconcile && result.pending_host_work) {
+        console.log(`Migration v${m.version} mechanical checks complete; host publication or client actions remain pending.`);
       } else {
         console.log(`Migration v${m.version} complete.`);
       }
@@ -542,7 +599,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       console.error(`Migration v${m.version} threw: ${msg}`);
       // Same partial-on-throw treatment so the cap counts runaway failures.
       try {
-        appendCompletedMigration({ version: m.version, status: 'partial' });
+        if (recordCheckpoint) appendCompletedMigration({ version: m.version, status: 'partial' });
       } catch { /* swallow ledger-write failure on throw path */ }
       failed = true;
       break;
@@ -559,4 +616,5 @@ export const __testing = {
   indexCompleted,
   statusForVersion,
   resolveSchemaBehind,
+  formatDbProbeLine,
 };

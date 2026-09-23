@@ -31,14 +31,33 @@
  */
 
 import { readFileSync } from 'node:fs';
-import matter from 'gray-matter';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult, RemoteMcpError } from '../core/mcp-client.ts';
 import { computeContentHash } from '../core/ingestion/types.ts';
-import { operations } from '../core/operations.ts';
+import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext } from '../core/operations.ts';
 import { resolveSourceWithTier } from '../core/source-resolver.ts';
+// Pure content helpers moved to core (shared with the capture MCP op — the
+// core module also breaks the capture.ts→operations.ts static import cycle).
+// Re-exported below so existing importers/tests keep their entry point.
+import {
+  defaultSlug,
+  detectBinaryNullByte,
+  detectBinarySignature,
+  normalizeForHash,
+  deriveTitle,
+  explicitCaptureType,
+  mergeCaptureFrontmatter,
+} from '../core/capture-content.ts';
+import { randomUUID } from 'node:crypto';
+import { parseMutationPrecondition } from '../core/persistence/preconditions.ts';
+import { isWriteReceipt, type WriteReceipt } from '../core/persistence/types.ts';
+import { maybeDelegateLocalOperation } from '../core/persistence/local-client.ts';
+import { getCliOptions } from '../core/cli-options.ts';
+import { reportPersistenceCliError } from './persistence-delegate.ts';
+
+export { detectBinaryNullByte, normalizeForHash, mergeCaptureFrontmatter } from '../core/capture-content.ts';
 
 interface RunOpts {
   content?: string;
@@ -49,6 +68,9 @@ interface RunOpts {
   source?: string;
   quiet?: boolean;
   json?: boolean;
+  expected_revision?: string;
+  request_id?: string;
+  force?: boolean;
   // v0.42.x — Life Chronicle (#2390): manual `--type event` frontmatter sugar.
   who?: string;    // comma-separated entity slugs
   what?: string;
@@ -66,6 +88,15 @@ function parseArgs(args: string[]): RunOpts | { help: true; positional: string |
     if (a === '--quiet' || a === '-q') { opts.quiet = true; continue; }
     if (a === '--json') { opts.json = true; continue; }
     if (a === '--stdin') { opts.stdin = true; continue; }
+    if (a === '--force') { opts.force = true; continue; }
+    const mutationFlag = /^--(request-id|expected-revision)(?:=(.*))?$/.exec(a);
+    if (mutationFlag) {
+      const value = mutationFlag[2] ?? args[++i];
+      if (!value || value.startsWith('--')) throw new OperationError('invalid_params', `${mutationFlag[1]} requires a UUID.`);
+      if (mutationFlag[1] === 'request-id') opts.request_id = value;
+      else opts.expected_revision = value;
+      continue;
+    }
     if (a === '--file') {
       const v = args[++i];
       if (v) opts.filePath = v;
@@ -92,7 +123,7 @@ function parseArgs(args: string[]): RunOpts | { help: true; positional: string |
     if (a === '--where') { const v = args[++i]; if (v) opts.where = v; continue; }
     if (a === '--kind') { const v = args[++i]; if (v) opts.kind = v; continue; }
     if (a === '--depth') { const v = args[++i]; if (v) opts.depth = v; continue; }
-    if (a.startsWith('--')) continue; // unknown flag, ignore
+    if (a.startsWith('--')) throw new OperationError('invalid_params', `Unsupported capture option '${a}'.`);
     positional.push(a);
   }
   if (positional.length > 0) {
@@ -122,6 +153,9 @@ Options:
                        registration scopes the source).
   --quiet, -q          Print just the slug on stdout (for shell pipelines)
   --json               JSON output for agents
+  --request-id UUID     Retry the same logical capture with its original UUID
+  --expected-revision UUID  Replace only this version of an existing page
+  --force              Explicitly replace an existing page without a revision
   --help, -h           Show this help
 
 Notes:
@@ -133,9 +167,8 @@ Notes:
     before hashing). The daemon's 24h LRU dedup uses this hash.
   - source_kind in the DB is ALWAYS 'capture-cli' for invocations of this
     command. --source maps to the source_id DB column, NOT to source_kind.
-    Different --type values write to the SAME slug for the same content
-    (slug = content hash), so a later capture with a different --type
-    overwrites the prior page.
+    Replacing an existing slug requires --expected-revision or --force.
+    Keep --request-id unchanged when retrying the same capture.
 
 Examples:
   gbrain capture "remember to follow up on the X deal"
@@ -144,45 +177,6 @@ Examples:
   JOB=$(gbrain capture "..." --quiet)
 `;
 
-// v0.42.x — Life Chronicle (#2390): route the default slug prefix by type so
-// `gbrain capture --type diary` lands under life/diary/ and `--type event`
-// under life/events/ (matching the chronicle path-prefix inference). Everything
-// else keeps the inbox/ default.
-function slugPrefixForType(type?: string): string {
-  if (type === 'diary') return 'life/diary';
-  if (type === 'event') return 'life/events';
-  return 'inbox';
-}
-function defaultSlug(content: string, now: Date = new Date(), type?: string): string {
-  const y = now.getUTCFullYear();
-  const m = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(now.getUTCDate()).padStart(2, '0');
-  const hashPrefix = computeContentHash(content).slice(0, 8);
-  return `${slugPrefixForType(type)}/${y}-${m}-${d}-${hashPrefix}`;
-}
-
-/**
- * v0.39.3.0 CV10 — binary file guard. Scans the first 8KB of `buf` for a
- * NUL byte (0x00). Real text files (including UTF-8 with multi-byte CJK,
- * emoji, BOM) never contain a NUL byte at any position — text encoding
- * uses non-zero continuation bytes. NUL appears in binary formats:
- * executables, archives, compressed images, PDFs (after the magic-byte
- * header), most office documents. Single-pass scan; constant memory.
- *
- * Returns the 0-indexed byte offset of the first NUL, or -1 if clean.
- * Caller decides the error shape (message vs JSON envelope).
- *
- * Known limit: a PNG-without-NUL-in-first-8KB slips through. v0.39
- * magic-byte allowlist (per CV10-B + TODOS.md) closes this hole. The
- * 8KB ceiling bounds the scan cost to ~microseconds even on huge files.
- */
-export function detectBinaryNullByte(buf: Buffer): number {
-  const limit = Math.min(buf.length, 8 * 1024);
-  for (let i = 0; i < limit; i++) {
-    if (buf[i] === 0) return i;
-  }
-  return -1;
-}
 
 async function readStdinBuffer(): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -192,20 +186,6 @@ async function readStdinBuffer(): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-/**
- * v0.39.3.0 CV9 — normalize content for content_hash so identical text
- * produces identical hashes regardless of leading/trailing whitespace,
- * line-ending style (CRLF vs LF), or Unicode normalization form. The
- * STORED body is preserved as-is (CRLF stays CRLF, BOM stays BOM).
- *
- * Two concerns, two transforms — the hash gets aggressive normalization
- * for dedup correctness; the stored body keeps user bytes for round-trip
- * fidelity. CQ2's CRLF/BOM preservation tests rely on this split.
- */
-export function normalizeForHash(s: string): string {
-  // Strip BOM, normalize line endings to LF, trim, NFKC for Unicode-stable hash.
-  return s.replace(/^﻿/, '').replace(/\r\n/g, '\n').trim().normalize('NFKC');
-}
 
 /**
  * v0.39.3.0 A2 + CV6 — detect Postgres FK violation on the sources table
@@ -231,115 +211,6 @@ export function maybeRewriteSourceFkError(err: unknown, sourceId: string | undef
   return `source '${sourceId}' is not registered. Register it first:\n  gbrain sources add ${sourceId} --path <path>\n\nList registered sources:\n  gbrain sources list`;
 }
 
-/**
- * Derive a title from the first non-empty, non-`---` line of the body,
- * stripping leading markdown heading marks, capped at 80 chars. Truncation
- * is codepoint-aware (never splits an astral surrogate pair) and appends an
- * ellipsis so a cut title is visibly cut.
- * Falls back to 'Capture' when no usable line exists.
- */
-function deriveTitle(rawBody: string): string {
-  const firstLine = rawBody
-    .split('\n')
-    .find((l) => l.trim().length > 0 && l.trim() !== '---') ?? '';
-  const stripped = firstLine.replace(/^#+\s*/, '');
-  const cps = [...stripped];
-  return (cps.length > 80 ? cps.slice(0, 79).join('') + '…' : stripped) || 'Capture';
-}
-
-/**
- * v0.39.3.0 (BUG-1): merge capture's auto-stamped fields with any existing
- * frontmatter in `rawBody`, rather than always prepending a second
- * frontmatter block. The pre-fix code stamped its own `---` block on top
- * of files that already had frontmatter, producing `title: '---'` (the
- * file's opening delimiter became the outer title) and two consecutive
- * frontmatter blocks the parser interpreted as the outer block + a body
- * starting with a horizontal rule.
- *
- * Precedence rules (user-wins by default):
- *   - `type`:         opts.type (CLI flag) > userFm.type > 'note'
- *   - `title`:        userFm.title > derived-from-body
- *   - `captured_via`: userFm.captured_via > opts.source > 'capture-cli'
- *                     (CV3/Phase 3c will narrow this to always 'capture-cli';
- *                     for Phase 2a we preserve current semantics)
- *   - `captured_at`:  userFm.captured_at > now (user can pre-stamp for retroactive
- *                     captures; see CQ2 test case 4)
- *   - Any other user-declared keys (description, tags, slug, etc.) pass through verbatim.
- *
- * For files WITHOUT existing frontmatter, preserves the original behavior:
- * stamps a fresh frontmatter block, and if the body doesn't already look
- * like markdown (no `#` heading), wraps it under a `# {title}` heading.
- */
-// v0.42.x — Life Chronicle (#2390): assemble the `event:` frontmatter block
-// from the --who/--what/--where/--kind/--depth flags (only for --type event).
-// Returns undefined when no event flags are set so non-event captures are
-// untouched.
-function buildEventBlock(opts: RunOpts): Record<string, unknown> | undefined {
-  if (opts.type !== 'event') return undefined;
-  const who = opts.who ? opts.who.split(',').map((s) => s.trim()).filter(Boolean) : [];
-  const block: Record<string, unknown> = {};
-  if (opts.what) block.what = opts.what;
-  if (who.length) block.who = who;
-  if (opts.where) block.where = opts.where;
-  if (opts.kind) block.kind = opts.kind;
-  if (opts.depth) block.depth = opts.depth;
-  return Object.keys(block).length ? block : undefined;
-}
-
-export function mergeCaptureFrontmatter(rawBody: string, opts: RunOpts): string {
-  const nowIso = new Date().toISOString();
-  // Detect frontmatter: leading `---\n` or `---\r\n`, tolerating leading BOM/whitespace.
-  // We do NOT use the more permissive `startsWith('---')` because a body that opens
-  // with a horizontal-rule like `--- separator ---` would false-positive.
-  const trimmedStart = rawBody.replace(/^﻿/, '');
-  const hasFrontmatter = /^---\r?\n/.test(trimmedStart);
-
-  if (!hasFrontmatter) {
-    // No existing frontmatter: stamp a fresh block and (if body lacks markdown
-    // structure) wrap under a derived heading.
-    const title = deriveTitle(rawBody);
-    const fm: Record<string, unknown> = {
-      type: opts.type ?? 'note',
-      title,
-      captured_via: opts.source ?? 'capture-cli',
-      captured_at: nowIso,
-    };
-    const ev = buildEventBlock(opts);
-    if (ev) fm.event = ev;
-    const looksMarkdown = /^#{1,6}\s/.test(rawBody.trimStart());
-    const body = looksMarkdown ? rawBody : `# ${title}\n\n${rawBody}`;
-    return matter.stringify(body, fm);
-  }
-
-  // Existing frontmatter: parse, merge user-wins, re-emit as a SINGLE block.
-  let parsed: matter.GrayMatterFile<string>;
-  try {
-    parsed = matter(rawBody);
-  } catch (e) {
-    throw new Error(
-      `malformed frontmatter in capture input: ${e instanceof Error ? e.message : String(e)}`,
-    );
-  }
-  const userFm = (parsed.data ?? {}) as Record<string, unknown>;
-  const merged: Record<string, unknown> = {
-    // Spread user's declared keys first so 'description', 'tags', etc. pass through.
-    ...userFm,
-    // Then apply auto-fields with the precedence rules above. The explicit
-    // assignment AFTER the spread is intentional: it lets us implement the
-    // mixed precedence (CLI flag wins for `type`; user wins for `title`/
-    // `captured_via`/`captured_at`) in one expression per key.
-    type: opts.type ?? userFm.type ?? 'note',
-    title: userFm.title ?? deriveTitle(parsed.content),
-    captured_via: userFm.captured_via ?? opts.source ?? 'capture-cli',
-    captured_at: userFm.captured_at ?? nowIso,
-  };
-  // v0.42.x — merge the event block (user-declared keys win per-key).
-  const ev = buildEventBlock(opts);
-  if (ev || userFm.event) {
-    merged.event = { ...(ev ?? {}), ...((userFm.event as Record<string, unknown>) ?? {}) };
-  }
-  return matter.stringify(parsed.content, merged);
-}
 
 /**
  * Build the put_page content (frontmatter + body). The user's --type and
@@ -362,6 +233,8 @@ interface CaptureResult {
   path?: string;
   source_kind: string;
   captured_at: string;
+  revision?: string;
+  write_request?: WriteReceipt;
 }
 
 function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): void {
@@ -381,9 +254,11 @@ function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): voi
     console.log(`  file:          ${result.path}`);
   }
   console.log(`  captured_at:   ${result.captured_at}`);
+  if (result.revision) console.log(`  revision:      ${result.revision}`);
+  if (result.write_request) console.log(`  request_id:    ${result.write_request.request_id}`);
 }
 
-export async function runCapture(engine: BrainEngine | null, args: string[]): Promise<void> {
+export async function runCapture(engine: BrainEngine | null, args: string[], options: { getEngine?: () => Promise<BrainEngine> } = {}): Promise<void> {
   const parsed = parseArgs(args);
   if ('help' in parsed) {
     console.log(HELP);
@@ -436,6 +311,23 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
     process.exit(1);
   }
 
+  // #4022 magic-byte guard runs FIRST: it names the actual format, and it
+  // catches the containers the NUL scan structurally cannot (an ASCII-armored
+  // PDF has no NUL in its head, so pre-fix it was decoded to mojibake and
+  // stored as a page body with its real text silently dropped).
+  const binaryFormat = detectBinarySignature(rawBuffer!);
+  if (binaryFormat !== null) {
+    console.error(
+      `gbrain capture: refusing to capture ${binaryFormat} content from ${inputLabel}\n` +
+      `  Detected by magic bytes. Storing it would write UTF-8 replacement characters as the\n` +
+      `  page body — for container formats the real text is compressed, so it would be lost\n` +
+      `  entirely while the command reported success.\n` +
+      `  Extract the text first, then capture that. For a PDF:\n` +
+      `    pdftotext ${inputLabel === 'stdin' ? 'input.pdf' : inputLabel} - | gbrain capture --stdin --slug <slug>`,
+    );
+    process.exit(1);
+  }
+
   // CV10 binary guard. Scans the first 8KB for NUL bytes; rejects with a
   // friendly message before UTF-8 decode mangles arbitrary bytes.
   const nullByteOffset = detectBinaryNullByte(rawBuffer!);
@@ -462,170 +354,92 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
     process.exit(1);
   }
 
-  // CV15: route source resolution through the canonical 6-tier chain
-  // (flag → env → dotfile → local_path → brain_default → seed_default).
-  // resolveSourceWithTier handles the assertSourceExists check and throws
-  // a friendly error BEFORE put_page is called if the source is missing.
-  // Only run on the LOCAL path — thin-client has no engine handle to
-  // probe the sources table; CV7 above already rejected explicit --source
-  // on thin-client. Implicit source resolution on thin-client uses
-  // 'default' (the server's auth layer scopes the actual write).
-  let resolvedSourceId = 'default';
-  if (!isThinClient(cfg) && engine) {
-    try {
-      const { source_id } = await resolveSourceWithTier(engine, parsed.source ?? null);
-      resolvedSourceId = source_id;
-    } catch (e) {
-      // assertSourceExists throws "Source 'X' not found. Available sources: ..."
-      console.error(`gbrain capture: ${e instanceof Error ? e.message : String(e)}`);
-      process.exit(1);
-    }
-  }
-
-  // CV8 (CLI side): content_hash for the RECEIPT comes from the normalized
-  // rawBody, NOT the assembled fullContent which contains a timestamp.
-  // The daemon's 24h LRU dedup keys on this hash; identical captures must
-  // produce identical hashes. The DB content_hash (importFromContent at
-  // src/core/import-file.ts) gets the same treatment in Phase 3d.
-  const slug = parsed.slug ?? defaultSlug(normalizedBody, new Date(), parsed.type);
-  const fullContent = buildContent(rawBody, parsed);
-  const capturedAt = new Date().toISOString();
+  // Raw input and explicit options are the idempotency intent. The owner
+  // materializes its default slug and capture timestamp once after admission;
+  // retrying a CLI invocation must not produce a different digest.
   const contentHash = computeContentHash(normalizedBody);
-
-  // Thin-client install: route through put_page over MCP. The server's
-  // write-through plumbing handles disk persistence. Per CV6 trust gate,
-  // the server overrides ANY provenance params we send to `mcp:put_page`
-  // — so we deliberately do NOT thread source_kind/source_uri/ingested_via
-  // through the wire (would be discarded server-side, and we don't want
-  // to suggest the values reached the DB column when they didn't).
-  if (isThinClient(cfg)) {
-    let raw: unknown;
-    try {
-      raw = await callRemoteTool(
-        cfg!,
-        'put_page',
-        { slug, content: fullContent },
-        { timeoutMs: 30_000 },
-      );
-    } catch (e) {
-      // A2/T1: detect server-side FK violation and rewrite to friendly hint.
-      // RemoteMcpError wraps the server's error envelope; the underlying
-      // PG message is in the wrapped string.
-      const hint = maybeRewriteSourceFkError(e, parsed.source ?? resolvedSourceId);
-      if (hint) {
-        console.error(`gbrain capture: ${hint}`);
-      } else if (e instanceof RemoteMcpError) {
-        console.error(`gbrain capture: remote put_page failed: ${e.message}`);
-        console.error('Run `gbrain remote doctor` to diagnose the connection.');
-      } else {
-        console.error(
-          `gbrain capture: remote put_page failed: ${e instanceof Error ? e.message : String(e)}`,
-        );
-        console.error('Run `gbrain remote doctor` to diagnose the connection.');
-      }
-      process.exit(1);
-    }
-    const remoteResult = unpackToolResult<{
-      slug: string;
-      status?: string;
-      chunks?: number;
-      write_through?: { written: boolean; path?: string };
-    }>(raw);
-    const result: CaptureResult = {
-      slug: remoteResult.slug,
-      status: remoteResult.status,
-      chunks: remoteResult.chunks,
-      content_hash: contentHash,
-      written: remoteResult.write_through?.written ?? false,
-      path: remoteResult.write_through?.path,
-      // CV3: source_kind ALWAYS 'capture-cli' for capture invocations,
-      // regardless of --source. --source maps to source_id (the DB FK),
-      // not the ingestion-channel taxonomy. Conflating these was the
-      // root cause of WARN-8's audit-trail labeling problem.
-      source_kind: 'capture-cli',
-      captured_at: capturedAt,
-    };
-    printReceipt(result, parsed.quiet ?? false, parsed.json ?? false);
-    return;
-  }
-
-  // Local install: route through put_page operation directly so we
-  // exercise the same write-through path the MCP server uses.
-  if (!engine) {
-    console.error('gbrain capture: engine not connected');
-    process.exit(1);
-  }
-  const putPageOp = operations.find((o) => o.name === 'put_page');
-  if (!putPageOp) {
-    console.error('gbrain capture: put_page operation missing (gbrain build issue)');
-    process.exit(1);
-  }
-  const ctx: OperationContext = {
-    engine,
-    config: cfg ?? { engine: 'pglite' as const },
-    logger: {
-      info: (msg: string) => { process.stderr.write(`[capture] ${msg}\n`); },
-      warn: (msg: string) => { process.stderr.write(`[capture] WARN: ${msg}\n`); },
-      error: (msg: string) => { process.stderr.write(`[capture] ERROR: ${msg}\n`); },
-    },
-    dryRun: false,
-    remote: false,
-    // v0.39.3.0 CV15: thread the resolved source from the canonical 6-tier
-    // chain (was `parsed.source ?? 'default'` pre-fix, which silently
-    // ignored env / dotfile / local_path / brain_default tiers — divergent
-    // from every other CLI op's behavior).
-    sourceId: resolvedSourceId,
-  };
+  const capturedAt = new Date().toISOString();
+  let resolvedSourceId = 'default';
+  let requestId: string | undefined;
   try {
-    // v0.39.3.0 WARN-8: pass provenance params to put_page. CV3 source_kind
-    // is always 'capture-cli'; ingested_via is 'put_page' (the write API),
-    // source_uri identifies the file path or stdin marker.
-    const sourceUri = parsed.filePath
-      ? `file://${parsed.filePath}`
-      : parsed.stdin
-        ? 'stdin'
-        : 'cli-positional';
-    const result = (await putPageOp.handler(ctx, {
-      slug,
-      content: fullContent,
+    const precondition = parseMutationPrecondition(parsed as unknown as Record<string, unknown>);
+    requestId = precondition.request_id ?? randomUUID();
+    const params: Record<string, unknown> = {
+      content: rawBody,
+      ...precondition,
+      request_id: requestId,
+      ...(parsed.slug ? { slug: parsed.slug } : {}),
+      ...(parsed.type ? { type: parsed.type } : {}),
+      ...(parsed.who ? { who: parsed.who } : {}),
+      ...(parsed.what ? { what: parsed.what } : {}),
+      ...(parsed.where ? { where: parsed.where } : {}),
+      ...(parsed.kind ? { kind: parsed.kind } : {}),
+      ...(parsed.depth ? { depth: parsed.depth } : {}),
       source_kind: 'capture-cli',
-      source_uri: sourceUri,
+      source_uri: parsed.filePath ? `file://${parsed.filePath}` : parsed.stdin ? 'stdin' : 'cli-positional',
       ingested_via: 'capture-cli',
-    })) as {
-      slug: string;
-      status?: string;
-      chunks?: number;
-      write_through?: { written: boolean; path?: string; skipped?: string };
     };
-    printReceipt(
-      {
-        slug: result.slug,
-        status: result.status,
-        chunks: result.chunks,
-        content_hash: contentHash,
-        written: result.write_through?.written ?? false,
-        path: result.write_through?.path,
-        // CV3: source_kind is the channel taxonomy, NOT the DB source FK.
-        source_kind: 'capture-cli',
-        captured_at: capturedAt,
-      },
-      parsed.quiet ?? false,
-      parsed.json ?? false,
-    );
-  } catch (e) {
-    // A2: detect FK violation on sources table and rewrite to friendly hint.
-    // resolveSourceWithTier above usually catches missing sources upstream,
-    // but a TOCTOU race (source deleted between pre-flight and put_page) or
-    // an explicit --source bypass would surface here.
-    const hint = maybeRewriteSourceFkError(e, parsed.source ?? resolvedSourceId);
-    if (hint) {
-      console.error(`gbrain capture: ${hint}`);
+    let result: Record<string, unknown>;
+    if (isThinClient(cfg)) {
+      const raw = await callRemoteTool(cfg!, 'capture', params, { timeoutMs: getCliOptions().timeoutMs ?? 30_000 });
+      result = unpackToolResult<Record<string, unknown>>(raw);
     } else {
-      console.error(
-        `gbrain capture: put_page failed: ${e instanceof Error ? e.message : String(e)}`,
-      );
+      const cli = getCliOptions();
+      const delegated = await maybeDelegateLocalOperation('capture', params, cfg, {
+        brain: cli.brain, source: parsed.source ?? null, timeoutMs: cli.timeoutMs ?? undefined,
+      });
+      if (delegated.handled) result = delegated.result as Record<string, unknown>;
+      else {
+        if (!engine && options.getEngine) engine = await options.getEngine();
+        if (!engine) throw new OperationError('owner_unavailable', 'Capture requires a connected engine or a local persistence owner.');
+        const resolved = await resolveSourceWithTier(engine, parsed.source ?? null);
+        resolvedSourceId = resolved.source_id;
+        const captureOp = operations.find(operation => operation.name === 'capture');
+        if (!captureOp) throw new OperationError('unavailable', 'The capture operation is missing; upgrade this installation.');
+        const ctx: OperationContext = {
+          engine, config: cfg ?? { engine: 'pglite' }, sourceId: resolvedSourceId,
+          remote: false, dryRun: false,
+          logger: {
+            info: (message: string) => process.stderr.write(`[capture] ${message}\n`),
+            warn: (message: string) => process.stderr.write(`[capture] WARN: ${message}\n`),
+            error: (message: string) => process.stderr.write(`[capture] ERROR: ${message}\n`),
+          },
+        };
+        result = await captureOp.handler(ctx, params) as Record<string, unknown>;
+      }
     }
-    process.exit(1);
+    const receipt = isWriteReceipt(result.write_request) ? result.write_request : undefined;
+    if (receipt && receipt.state !== 'committed') {
+      // Accepted is a real receipt, but never a false claim that capture
+      // finished. Quiet pipelines must not receive a made-up page slug.
+      if (parsed.json) console.log(JSON.stringify(result, null, 2));
+      else console.error(`Capture ${receipt.state}; request_id ${receipt.request_id}. Retry the same request ID for its result.`);
+      return;
+    }
+    const persistence = result.persistence as { file_written?: boolean } | undefined;
+    const writeThrough = result.write_through as { written?: boolean; path?: string } | undefined;
+    printReceipt({
+      slug: result.slug as string,
+      status: result.status as string | undefined,
+      chunks: result.chunks as number | undefined,
+      content_hash: contentHash,
+      written: persistence?.file_written ?? writeThrough?.written ?? false,
+      path: writeThrough?.path,
+      source_kind: 'capture-cli',
+      captured_at: receipt?.created_at ?? capturedAt,
+      ...(receipt ? { write_request: receipt } : {}),
+      ...(typeof result.revision === 'string' ? { revision: result.revision } : {}),
+    }, parsed.quiet ?? false, parsed.json ?? false);
+  } catch (error) {
+    if (await reportPersistenceCliError(error, parsed.json ?? false)) return;
+    const hint = maybeRewriteSourceFkError(error, parsed.source ?? resolvedSourceId);
+    console.error(`gbrain capture: ${hint ?? (error instanceof Error ? error.message : String(error))}`);
+    if (requestId) console.error(`Retry the same capture with --request-id ${requestId}.`);
+    if (parsed.json && error instanceof RemoteMcpError && error.detail?.write_request) {
+      console.log(JSON.stringify({ ...error.detail, request_id: requestId }, null, 2));
+    }
+    const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+    setCliExitVerdict(1);
   }
 }
 
@@ -635,8 +449,10 @@ export const __testing = {
   buildContent,
   mergeCaptureFrontmatter,
   deriveTitle,
+  explicitCaptureType,
   parseArgs,
   detectBinaryNullByte,
+  detectBinarySignature,
   normalizeForHash,
   maybeRewriteSourceFkError,
 };

@@ -4,8 +4,17 @@ This is your install + operating protocol. Claude Code reads `./CLAUDE.md` autom
 Everyone else (Codex, Cursor, OpenClaw, Aider, Continue, or an LLM fetching via URL):
 start here.
 
+> **Default: add memory to the existing agent.** Preserve its identity and unrelated instructions. Start keyless; automatic capture and paid enrichment are opt-in. No bootstrap interview or private repository is required.
+>
+> **Inside Grok Bot or Muse:** follow [Grok Bot](docs/guides/grok-bot.md) or [Muse](docs/guides/muse.md), using the isolated [in-agent setup](docs/guides/in-agent-setup.md) entry point. Use the absolute recorded launcher on every call. Sources organize local memory; they do not isolate agents that share files or credentials. Do not mark generated skills or routines as activated without native-harness evidence.
+>
+> **Existing hosted brain:** follow [hosted harness access](docs/guides/hosted-harness-access.md). Provision on the host; install the private handoff inside the intended harness. A URL or ordinary OAuth token is not administration authority.
+>
+> **Creating a new personal agent, explicitly requested by the user:** follow [BOOTSTRAP_FOR_AGENTS.md](BOOTSTRAP_FOR_AGENTS.md), then return here for the operating protocol.
+
 ## Install (5 min)
 
+<!-- npm-trap + #218 recovery: canonical copy lives in README.md ("Install" warning) — sync edits. -->
 1. Install gbrain via Bun (the canonical path):
    ```bash
    curl -fsSL https://bun.sh/install | bash
@@ -14,9 +23,9 @@ start here.
    ```
    If `bun install -g` aborts or `gbrain doctor` reports `schema_version: 0`,
    the CLI prints a recovery hint pointing at [#218](https://github.com/garrytan/gbrain/issues/218).
-   Run `gbrain apply-migrations --yes` to recover, or fall back to the
+   Run `gbrain apply-migrations --yes --no-autopilot-install` to recover without installing services, or fall back to the
    deterministic install: `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
-2. Init the brain: `gbrain init` (defaults to PGLite, zero-config). For 1000+ files or
+2. Init keyless memory: `gbrain init --pglite --no-embedding` (zero-config). For 1000+ files or
    multi-machine sync, init suggests Postgres + pgvector via Supabase.
 3. **STOP — ask the user about search mode.** `gbrain init` auto-applied a
    default but printed a 9-cell cost matrix (mode × downstream model)
@@ -26,8 +35,21 @@ start here.
    [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) Step 3.5 for the
    exact ask-the-user protocol. Same banner fires on `gbrain post-upgrade`
    for existing users (search modes were added in v0.32.3).
-4. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full 9-step flow
-   (API keys, identity, cron, verification).
+4. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full step-by-step
+   flow (keyless memory, optional API capabilities, maintenance, verification).
+
+## Memory operating protocol
+
+Recall relevant saved context before answering. Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
+
+Durable preferences and facts belong in shared memory when the user wants them
+recalled later. Transient task state, credentials, local configuration, and harness
+activation state do not. Remote `put_page` saves references as text without inline
+graph extraction; stdio has best-effort startup/idle sweeps, while HTTP requires
+explicit host maintenance or authorized `add_link` calls. Configured model
+providers can receive text; Markdown export is not a full database backup.
+Read [memory boundaries](docs/guides/memory-boundaries.md) before promising
+portability, graph freshness, privacy, or recovery.
 
 ## Read this order
 
@@ -58,45 +80,67 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 
 - **Configure:** [`docs/ENGINES.md`](./docs/ENGINES.md),
   [`docs/guides/live-sync.md`](./docs/guides/live-sync.md),
-  [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md).
+  [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md),
+  [`docs/guides/remote-mcp.md`](./docs/guides/remote-mcp.md) (`gbrain mcp expose`).
+- **Bring in your chat history:** `gbrain transcripts ingest` imports a
+  downloaded ChatGPT / Claude export (or agent session logs); `gbrain connectors`
+  connects the account and syncs new conversations live, incrementally and on an
+  opt-in schedule (cookie/OAuth credentials stay on your machine, 0600). Full
+  guide: [`docs/guides/chat-connectors.md`](./docs/guides/chat-connectors.md).
 - **Debug:** [`docs/GBRAIN_VERIFY.md`](./docs/GBRAIN_VERIFY.md),
   [`docs/guides/minions-fix.md`](./docs/guides/minions-fix.md), `gbrain doctor --fix`.
+  Database unreachable — or any `GBRAIN_DB_ACCESS <reason>` marker in gbrain
+  output: `gbrain engine status --probe` (which engine, where its URL comes from,
+  classified reachability), then `gbrain db-repair` to diagnose and
+  `gbrain db-repair --yes` to apply safe fixes. All three are engine-free — they
+  work while the database is down. Full loop:
+  [`docs/ENGINES.md`](./docs/ENGINES.md#engine-detection-and-access-repair).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
-  [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes` (manual schema-only).
+  [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes --no-autopilot-install` (manual migration orchestration without service installation).
 - **Eval retrieval changes:** capture is off by default. To benchmark a
   retrieval change against real captured queries, set
   `GBRAIN_CONTRIBUTOR_MODE=1`, then `gbrain eval export --since 7d > base.ndjson`
   and `gbrain eval replay --against base.ndjson`. For public benchmark
   coverage (LongMemEval, ground-truth scoring), `gbrain eval longmemeval
-  <dataset.jsonl>` (v0.28.8) runs against an isolated in-memory PGLite
+  <dataset.jsonl>` runs against an isolated in-memory PGLite
   per question — your `~/.gbrain` is never opened. Full guide:
   [`docs/eval-bench.md`](./docs/eval-bench.md).
-- **Drive the brain to a target health score (v0.36.4.0):** the one-command
+- **Drive the brain to a target health score:** the one-command
   loop. `gbrain doctor --remediation-plan --json` previews what would be
   fixed; `gbrain doctor --remediate --yes --target-score 90 --max-usd 5`
-  walks a dependency-ordered plan (sync before extract, embed after
-  consolidate), re-checking score between every step, refusing to spend
-  past the cost cap. Empty brains (no entity pages) or unconfigured embedding
+  walks a dependency-ordered plan, re-checking score between every step and
+  refusing to spend past the cost cap. Stale extraction uses source-scoped
+  database pages, including DB-only pages; it does not require a repository
+  sync first. Empty brains (no entity pages) or unconfigured embedding
   keys hit a `max_reachable_score` ceiling and bail with what's missing.
   Three phase handlers (synthesize / patterns / consolidate) are
   PROTECTED — only trusted local callers can submit them; MCP cannot.
-  Reference: [`docs/architecture/topologies.md`](./docs/architecture/topologies.md)
-  and the CHANGELOG entry for v0.36.4.0.
-- **Track a founder/company over time (v0.35.7):** when an entity has
+  Reference: [`docs/architecture/topologies.md`](./docs/architecture/topologies.md).
+- **Track a founder/company over time:** when an entity has
   typed metric claims in its `## Facts` fence (`metric: mrr`, `value: 50000`,
   `unit: USD`, `period: monthly` columns), run
   `gbrain eval trajectory <entity-slug>` for the chronological history
   with regressions auto-flagged, or `gbrain founder scorecard <entity-slug>`
   for a four-signal JSON rollup (claim_accuracy / consistency /
   growth_trajectory / red_flags). MCP op `find_trajectory` exposes the
-  same data — read scope, visibility-filtered for remote callers. **v0.40.2.0:**
-  `gbrain think` now uses this substrate automatically on temporal /
+  same data — read scope, visibility-filtered for remote callers.
+  `gbrain think` uses this substrate automatically on temporal /
   knowledge_update intent (default ON; flip `think.trajectory_enabled=false`
-  to opt out). Migration v82 added `facts.event_type` so non-metric event
-  rows (`meeting`, `job_change`, `location_change`) ride through the same
-  pipeline; pass `kind: 'event'` or `'all'` to `find_trajectory` to query
-  them.
+  to opt out). Non-metric event rows (`meeting`, `job_change`,
+  `location_change`) ride through the same pipeline via `facts.event_type`;
+  pass `kind: 'event'` or `'all'` to `find_trajectory` to query them.
+- **Answer "who is waiting on me?":** connect the user's Google account once
+  (`gbrain google setup` — two user interactions; relay the `[SHOW USER]`
+  blocks verbatim), then `gbrain waiting --json` returns the ranked people
+  waiting on the user, what they promised, evidence quotes, and Gmail deep
+  links. Manage loops with `gbrain loops done|drop|mute`. It refuses on
+  stale data and names the exact sync command to run first. Guides:
+  [`docs/guides/google-connect.md`](./docs/guides/google-connect.md) (setup +
+  every error and its fix),
+  [`docs/guides/open-loops.md`](./docs/guides/open-loops.md) (how detection
+  works); the harness protocol lives in
+  [`skills/google-loops/SKILL.md`](./skills/google-loops/SKILL.md).
 - **Everything else:** [`./llms.txt`](./llms.txt) is the full documentation map.
   [`./llms-full.txt`](./llms-full.txt) is the same map with core docs inlined for
   single-fetch ingestion.

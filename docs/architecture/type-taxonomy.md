@@ -1,7 +1,7 @@
-# Type Taxonomy (v0.41.22: gbrain-base-v2)
+# Type Taxonomy (gbrain-base-v2)
 
-> The 14-canonical-type DRY/MECE taxonomy shipped in v0.41.22. Predecessor
-> `gbrain-base` (24 types) stays bundled for back-compat; v0.42+ installs
+> The 14-canonical-type DRY/MECE taxonomy. Predecessor
+> `gbrain-base` (24 types) stays bundled for back-compat; fresh installs
 > default to `gbrain-base-v2`.
 
 ## Why
@@ -23,8 +23,7 @@ downstream feature degrades:
 - **Orphan inflation** — 5,521 concept-redirect pages inflated orphan
   counts without adding knowledge value.
 
-Issue #1479 catalogues the 9 clusters with exact counts. This doc is
-the response: a coherent 14-type taxonomy with subtypes/format/origin
+This doc is the response: a coherent 14-type taxonomy with subtypes/format/origin
 pushed to frontmatter, alias-table rows for redirects, real link-table
 rows for edge-shaped pages.
 
@@ -74,12 +73,11 @@ gbrain onboard --check                         # surfaces pack_upgrade_available
         ↓
 gbrain onboard --check --explain               # per-cluster narrative dry-run
         ↓
-gbrain jobs submit unify-types \               # PROTECTED + manual_only
-  --allow-protected \
+gbrain jobs submit unify-types \               # PROTECTED + manual_only (CLI submit trusts it)
   --params '{"target_pack":"gbrain-base-v2","apply":true}'
                                                # omit "apply":true → dry-run (default)
         ↓
-Handler runs 4 phases:
+Handler runs 8 phases:
   ┌─────────────────────────────────────┐
   │ Phase 1: Preflight + lock           │ → gbrain-unify db-lock (60min TTL)
   ├─────────────────────────────────────┤
@@ -127,7 +125,7 @@ For brains with substantial custom types that deserve their own canonical
 1. Fork gbrain-base-v2: `gbrain schema fork gbrain-base-v2 my-pack`
 2. Edit your fork to add page_types + mapping_rules covering your
    custom domain.
-3. Target your fork: `gbrain jobs submit unify-types --allow-protected
+3. Target your fork: `gbrain jobs submit unify-types
    --params '{"target_pack":"my-pack","apply":true}'` (omit `"apply":true`
    for a dry-run preview — that is the default)
 
@@ -165,8 +163,10 @@ explicitly disambiguated this as canonical, so it should outrank fuzzy
 matches that hit aliases by accident."
 
 `SearchResult.alias_resolved_boost` is stamped on touched results for
-`--explain` formatter visibility. KNOBS_HASH_VERSION bumped 5→6 to
-invalidate pre-v0.42 cache rows that don't reflect the new stage.
+`--explain` formatter visibility. The stage participates in the search
+cache key (`KNOBS_HASH_VERSION` in `src/core/search/mode.ts` is the
+single source of truth for the current cache-key version), so cache rows
+written before the stage existed are unreachable.
 
 ## Reference
 
@@ -176,4 +176,3 @@ invalidate pre-v0.42 cache rows that don't reflect the new stage.
 - Migration handler: `src/core/schema-pack/unify-types-handler.ts`
 - Onboard checks: `src/core/onboard/checks.ts`
 - Skill: `skills/schema-unify/SKILL.md`
-- Plan + decisions: `~/.claude/plans/system-instruction-you-are-working-transient-elephant.md`

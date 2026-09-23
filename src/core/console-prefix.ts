@@ -40,6 +40,7 @@
  *   - src/commands/sync.ts (performSync + in-file callees)
  *   - src/commands/embed.ts (runEmbedCore + helpers)
  *   - src/core/progress.ts (heartbeat / progress writer)
+ *   - src/commands/import.ts (runImport's human-only info() + summary lines)
  *
  * Anything outside those modules that writes directly to stdout/stderr will
  * NOT get the prefix. If you find a delegate-module line that escapes the
@@ -50,6 +51,69 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 const __prefixStore = new AsyncLocalStorage<string>();
+
+// MCP stdio mode: stdout is reserved for JSON-RPC frames. When the stdio
+// serve path activates this guard, every logging surface this module owns
+// (slog's console.log fallthrough, slog's prefixed process.stdout.write)
+// routes to stderr instead, and the global console.log/info/debug are
+// rebound to console.error so library code reached from op handlers
+// (performSync, runEmbedCore, importFromFile, ...) can't emit plain text
+// onto the JSON-RPC channel. One direction only — never unset at runtime
+// (the serve process is stdio-MCP for its whole lifetime).
+let __stdoutLoggingRedirected = false;
+
+// CLI `--json` mode: stdout is reserved for the JSON envelope (and any JSON
+// status lines). Scoped, not process-wide: rebinding console.log here would
+// also push the envelope itself to stderr. slog consults it; serr is stderr
+// already; direct console.log(JSON.stringify(..)) sites are untouched.
+const __humanToStderr = new AsyncLocalStorage<true>();
+
+/**
+ * Run `fn` with every `slog` line (prefixed or not) routed to stderr, so a
+ * command's human output cannot interleave with the JSON it emits on
+ * stdout. Propagates through `await` like `withSourcePrefix`; nests with it.
+ */
+export function withHumanLogsToStderr<T>(fn: () => Promise<T>): Promise<T> {
+  return __humanToStderr.run(true, fn);
+}
+
+/**
+ * Route ALL stdout-bound logging to stderr for the lifetime of this
+ * process. Called once by the stdio MCP serve path before the transport
+ * starts. Idempotent.
+ *
+ * Rationale: any non-JSON-RPC line on stdout makes the MCP client's
+ * parser throw ("Failed to parse JSONRPC message"). Progress output from
+ * ops that run in-process (sync_brain -> performSync -> embed) previously
+ * leaked to stdout via slog / console.log.
+ */
+export function redirectStdoutLoggingToStderr(): void {
+  if (__stdoutLoggingRedirected) return;
+  __stdoutLoggingRedirected = true;
+  // eslint-disable-next-line no-console
+  const toStderr = (...args: unknown[]): void => console.error(...args);
+  // eslint-disable-next-line no-console
+  console.log = toStderr;
+  // eslint-disable-next-line no-console
+  console.info = toStderr;
+  // eslint-disable-next-line no-console
+  console.debug = toStderr;
+}
+
+/**
+ * Read-only accessor (test seam): is the stdio stderr redirect active?
+ */
+export function isStdoutLoggingRedirected(): boolean {
+  return __stdoutLoggingRedirected;
+}
+
+/**
+ * Test-only reset. Does NOT restore the original console bindings (tests
+ * that need those should snapshot them before calling the redirect).
+ */
+export function _resetStdoutRedirectForTests(): void {
+  __stdoutLoggingRedirected = false;
+}
 
 /**
  * Run `fn` with an active per-source prefix `id`. Within the closure,
@@ -83,13 +147,18 @@ export function getSourcePrefix(): string | null {
  */
 export function slog(...args: unknown[]): void {
   const prefix = getSourcePrefix();
+  const toStderr = __stdoutLoggingRedirected || __humanToStderr.getStore() === true;
   if (prefix === null) {
-    // Back-compat fast path: bare console.log semantics.
+    // Back-compat fast path: bare console.log semantics. (Under the stdio
+    // MCP redirect, console.log is rebound to stderr — see
+    // redirectStdoutLoggingToStderr; under withHumanLogsToStderr the line
+    // is routed to stderr here instead.)
     // eslint-disable-next-line no-console
-    console.log(...args);
+    if (toStderr) console.error(...args); else console.log(...args);
     return;
   }
-  process.stdout.write(prefixLines(formatArgs(args), prefix) + '\n');
+  const out = toStderr ? process.stderr : process.stdout;
+  out.write(prefixLines(formatArgs(args), prefix) + '\n');
 }
 
 /**

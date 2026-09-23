@@ -35,7 +35,7 @@ Topologies 2 and 3 stack: a thin-client install can also host per-worktree
 code engines, and a per-worktree code engine can also point its artifact
 brain at a remote server.
 
-## Topology 1 — Single brain (today's default)
+## Topology 1 — Single brain (the default)
 
 ```
   ┌────────────────┐
@@ -108,11 +108,13 @@ instead of a local DB connection:
 }
 ```
 
-The CLI dispatch guard refuses any DB-bound command (`sync`, `embed`,
-`extract`, `migrate`, `apply-migrations`, `repair-jsonb`, `orphans`,
-`integrity`, `serve`) on a thin-client install with a clear error pointing
-at the remote host. `gbrain doctor` runs a dedicated thin-client check set
-(OAuth discovery, token round-trip, MCP smoke).
+The CLI dispatch guard refuses every DB-bound command (`sync`, `embed`,
+`extract`, `migrate`, `serve`, `enrich`, `jobs`, `sources`, `pages`,
+`files`, `eval`, and the rest of the local-only surface — the full hint
+table is `THIN_CLIENT_REFUSE_HINTS` in `src/cli.ts`) on a thin-client
+install with a clear error pointing at the remote host. `gbrain doctor`
+runs a dedicated thin-client check set (OAuth discovery, token round-trip,
+MCP smoke). See [`thin-client.md`](./thin-client.md) for the routing seam.
 
 ### Setup
 
@@ -120,14 +122,14 @@ at the remote host. `gbrain doctor` runs a dedicated thin-client check set
 
 ```bash
 gbrain init --supabase                         # or --pglite, doesn't matter
-gbrain serve --http --port 3001 --bind 0.0.0.0 # v0.34: bind explicitly for remote access
-                                                # (defaults to 127.0.0.1 since v0.34)
+gbrain serve --http --port 3001 --bind 0.0.0.0 # bind explicitly for remote access
+                                                # (default bind is 127.0.0.1)
 gbrain auth register-client neuromancer \
   --grant-types client_credentials \
   --scopes read,write,admin                    # admin needed for ping/doctor
 
-# v0.34: source-scoped client (write to one source, federate reads across
-# multiple sources). Omit both flags for a v0.33-compatible super-client.
+# source-scoped client (write to one source, federate reads across
+# multiple sources). Omit both flags for an unscoped super-client.
 gbrain auth register-client neuromancer-dept \
   --grant-types client_credentials \
   --scopes read,write \
@@ -136,9 +138,12 @@ gbrain auth register-client neuromancer-dept \
 ```
 
 The `register-client` command prints a `client_id` and `client_secret`.
-Note both. **Scope must include `admin`** — `submit_job` (used by
-`gbrain remote ping`) and `run_doctor` (used by `gbrain remote doctor`)
-both require it.
+Note both. **Scope must include `admin`** for `run_doctor` (used by
+`gbrain remote doctor`) and generic background jobs. `submit_job` accepts
+only `sync`, `import`, `lint`, and `lint-fix` with the authenticated source's
+registered root. `gbrain remote ping` no longer submits an autopilot cycle;
+run maintenance on the brain host. See the
+[authorization upgrade guide](../guides/authorization-upgrade.md#generic-remote-background-jobs).
 
 **Step 2 — On the thin client (neuromancer):**
 
@@ -201,7 +206,7 @@ Three storage paths in priority order:
    persist a config-file copy when the env var was the source.
 2. **`~/.gbrain/config.json` with 0600 perms** (default for interactive
    setup; mirrors how Supabase keys are stored today).
-3. macOS Keychain integration is on the roadmap; not in v1.
+3. macOS Keychain integration is not supported (roadmap item).
 
 ## Topology 3 — Split-engine, per-worktree code + remote artifacts
 
@@ -288,13 +293,13 @@ other config field):
 
 ```bash
 gbrain reinit-pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
-gbrain reindex --code --yes
+gbrain reindex-code --yes
 ```
 
-(`gbrain config set embedding_model` is refused as of v0.37.11.0 because
-the schema column has to resize alongside the config.)
+(`gbrain config set embedding_model` is refused because the schema column
+has to resize alongside the config.)
 
-`gbrain reindex --code` prints a recommendation when the configured
+`gbrain reindex-code` prints a recommendation when the configured
 embedding model isn't code-tuned. Suppress with
 `GBRAIN_NO_CODE_MODEL_NUDGE=1` if you've intentionally chosen another
 provider (single-vendor procurement, compliance, no Voyage key).
@@ -378,6 +383,72 @@ The agent's MCP client picks the alias and thus the destination per tool
 call. There's no global gbrain orchestrator that knows about all of them
 simultaneously — that's by design.
 
+## Writer administration is not routine repair
+
+An `owner_unavailable` write error means that the selected source cannot currently
+publish through its designated owner. It is not permission to claim a checkout,
+activate managed persistence, or transfer ownership. Start with read-only inspection
+on the selected brain host:
+
+```bash
+gbrain sources writer status --brain host --json
+```
+
+Keep the brain and source selection explicit. Inspect the existing owners, source
+bindings, epochs, enabled state and outstanding recovery before asking the operator
+what should change. `doctor`, `doctor --fix`, startup checks, scheduled maintenance
+and retries must leave these identities and epochs alone. Never remove ownership
+markers, recreate identities, or edit database rows to bypass a refusal.
+
+### Deliberate topology changes
+
+Only the trusted local CLI administration lane can perform these operations.
+Ordinary remote tokens and stdio agent credentials cannot administer ownership,
+even when they supply the flags below. Local shell access is already trusted:
+these flags record deliberate, state-bound intent, not proof that a human is
+typing. A TTY or a generic `--yes` is neither required nor sufficient.
+
+For a planned change, the operator must review `status` and retain its `admin_state`
+fingerprint. Each non-dry-run action requires both an exact `--admin-intent` and
+`--expected-state` containing that reviewed fingerprint:
+
+| Action | Required intent |
+|---|---|
+| `claim` | `writer_claim` |
+| `activate` | `writer_activate` |
+| `transfer prepare` | `writer_transfer_prepare` |
+| `transfer accept` | `writer_transfer_accept` |
+
+For example, after reviewing the target host and canonical directory:
+
+```bash
+gbrain sources writer claim default --brain host --path /absolute/canonical/source --dry-run --json
+gbrain sources writer claim default --brain host --path /absolute/canonical/source \
+  --admin-intent writer_claim --expected-state <reviewed-admin-state> --json
+```
+
+Inspect status again after each change. The fingerprint covers the brain identity,
+managed mode, source incarnations and paths, owner identities and epochs, worktree
+membership and transfer manifests. It excludes heartbeats and ordinary queue
+traffic. A changed fingerprint refuses with `writer_admin_state_changed`, including
+a change racing the final transaction. Re-inspect and re-review; do not blindly
+substitute the new value and retry. Dry runs do not grant permission to apply.
+
+Activation additionally requires every older writer and maintenance process on
+every host to be upgraded and stopped, filesystem sources to have their intended
+owners, and outstanding locks and recovery to be resolved. Preview activation
+with `--confirm-quiesced --dry-run`, then, only when approved:
+
+```bash
+gbrain sources writer activate --brain host --confirm-quiesced \
+  --admin-intent writer_activate --expected-state <reviewed-admin-state> --json
+```
+
+`--confirm-quiesced` remains an attestation about all hosts, not a way to bypass the
+intent and state checks. Explicit noninteractive provisioning uses the same
+procedure and preconditions. A transfer still requires the prepared epoch and an
+exact successor manifest; stale heartbeats never authorize takeover.
+
 ## When NOT to use these topologies
 
 - **Don't use Topology 2 if your agent only ever runs on the same machine
@@ -394,6 +465,9 @@ simultaneously — that's by design.
 
 ## See also
 
+- `docs/guides/bootstrap.md` — `gbrain bootstrap`, the paved-road paste-in
+  install for Topology 1 with a desktop coding agent (interview, hooks,
+  MCP registration, verify).
 - `docs/architecture/brains-and-sources.md` — in-brain organization (brains
   vs sources axes).
 - `docs/mcp/CLAUDE_DESKTOP.md` and siblings — per-client MCP setup.

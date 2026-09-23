@@ -31,6 +31,57 @@ import { LATEST_VERSION } from '../src/core/migrate.ts';
 delete process.env.GBRAIN_PGLITE_SNAPSHOT;
 
 describe('PGLiteEngine#applyForwardReferenceBootstrap', () => {
+  test('queue bootstrap preserves legacy jobs without authorizing them and repairs either missing column', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+      await db.exec(`
+        DROP TRIGGER IF EXISTS minion_queue_protocol ON minion_jobs;
+        ALTER TABLE minion_jobs DROP COLUMN submission_authority;
+        ALTER TABLE minion_jobs DROP COLUMN claim_generation;
+        INSERT INTO minion_jobs (name, status, data, attempts_made, attempts_started, delay_until)
+        VALUES ('sync', 'delayed', '{"sourceId":"default"}', 1, 2, '2026-09-01T00:00:00Z'),
+               ('lint', 'completed', '{}', 0, 1, NULL);
+      `);
+      const original = await engine.executeRaw(`
+        SELECT id, name, status, data, attempts_made, attempts_started, delay_until FROM minion_jobs ORDER BY id
+      `);
+      await (engine as any).applyForwardReferenceBootstrap();
+      await (engine as any).applyForwardReferenceBootstrap();
+      const columns = await engine.executeRaw<{ column_name: string; is_nullable: string; column_default: string | null }>(`
+        SELECT column_name, is_nullable, column_default FROM information_schema.columns
+        WHERE table_name = 'minion_jobs' AND column_name IN ('submission_authority', 'claim_generation')
+        ORDER BY column_name
+      `);
+      expect(columns).toEqual([
+        { column_name: 'claim_generation', is_nullable: 'NO', column_default: '0' },
+        { column_name: 'submission_authority', is_nullable: 'YES', column_default: null },
+      ]);
+      expect(await engine.executeRaw(`
+        SELECT id, name, status, data, attempts_made, attempts_started, delay_until FROM minion_jobs ORDER BY id
+      `)).toEqual(original);
+      expect(await engine.executeRaw(`
+        SELECT submission_authority, claim_generation::int FROM minion_jobs ORDER BY id
+      `)).toEqual([{ submission_authority: null, claim_generation: 0 }, { submission_authority: null, claim_generation: 0 }]);
+
+      // Partial upgrades must repair either field without overwriting the other.
+      await db.exec(`ALTER TABLE minion_jobs DROP COLUMN submission_authority;
+        UPDATE minion_jobs SET claim_generation = 7 WHERE name = 'lint';`);
+      await (engine as any).applyForwardReferenceBootstrap();
+      expect(await engine.executeRaw(`SELECT submission_authority, claim_generation::int FROM minion_jobs WHERE name = 'lint'`))
+        .toEqual([{ submission_authority: null, claim_generation: 7 }]);
+      await db.exec(`ALTER TABLE minion_jobs DROP COLUMN claim_generation;
+        UPDATE minion_jobs SET submission_authority = '{"version":1,"kind":"application"}' WHERE name = 'lint';`);
+      await (engine as any).applyForwardReferenceBootstrap();
+      expect(await engine.executeRaw(`SELECT submission_authority, claim_generation::int FROM minion_jobs WHERE name = 'lint'`))
+        .toEqual([{ submission_authority: { version: 1, kind: 'application' }, claim_generation: 0 }]);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
   test('no-op on fresh install (no pages or links table)', async () => {
     const engine = new PGLiteEngine();
     await engine.connect({});
@@ -253,4 +304,67 @@ describe('PGLiteEngine#applyForwardReferenceBootstrap', () => {
       await engine.disconnect();
     }
   }, 30000);
+
+  test('wedged-brain recovery: a brain that already FAILED the v0.42.56 upgrade converges on retry', async () => {
+    // The loudest #2626-class cohort: operators who upgraded, wedged, and are
+    // retrying with a fixed binary. Simulates the failed attempt (the blob's
+    // CREATE INDEX crashing on the missing column) and asserts the retry
+    // converges to the FULL final shape (column + FK + both partial indexes)
+    // with no residue — the failed attempt must not advance the version ledger.
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+
+      // Rewind to the pre-v121 shape: schema AND the version counter.
+      await db.exec(`
+        DROP INDEX IF EXISTS idx_timeline_event_page;
+        DROP INDEX IF EXISTS idx_timeline_event_dedup;
+        ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+        ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+      `);
+      await engine.setConfig('version', '120');
+
+      // The failed old-binary attempt: without the bootstrap probe, the blob's
+      // CREATE INDEX was the first statement to touch the missing column.
+      let wedgeError: Error | null = null;
+      try {
+        await db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_timeline_event_page
+             ON timeline_entries(event_page_id) WHERE event_page_id IS NOT NULL`,
+        );
+      } catch (e) {
+        wedgeError = e as Error;
+      }
+      expect(wedgeError?.message ?? '').toContain('event_page_id');
+
+      // The failed attempt must not have advanced the ledger.
+      expect(parseInt((await engine.getConfig('version')) || '1', 10)).toBe(120);
+
+      // Retry with the fixed binary: full initSchema converges to LATEST with
+      // the complete final shape.
+      await engine.initSchema();
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+      const { rows: col } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'timeline_entries' AND column_name = 'event_page_id'
+      `);
+      expect(col).toHaveLength(1);
+      const { rows: fk } = await db.query(`
+        SELECT conname FROM pg_constraint
+        WHERE conname = 'timeline_entries_event_page_id_fkey'
+      `);
+      expect(fk).toHaveLength(1);
+      const { rows: idx } = await db.query(`
+        SELECT indexname FROM pg_indexes
+        WHERE tablename = 'timeline_entries'
+          AND indexname IN ('idx_timeline_event_page', 'idx_timeline_event_dedup')
+      `);
+      expect(idx).toHaveLength(2);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
 });

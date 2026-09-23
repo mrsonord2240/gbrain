@@ -5,18 +5,16 @@
  * `sources.chunker_version` gate forces a re-walk next sync on any source
  * whose working tree hasn't drifted, but users who want the benefits NOW
  * (before the next sync) get this: walk every page where type='code', read
- * compiled_truth + frontmatter.file, re-import via importCodeFile. Pages
- * flow through the same code path as normal sync (chunker + embeddings +
- * content_hash folding), so a reindex is bit-identical to a fresh sync.
+ * compiled_truth + frontmatter.file, and rebuild guarded derived projections.
+ * Managed brains publish through their resident coordinator; canonical bytes,
+ * revisions, identities, and files remain unchanged.
  *
  * Flags:
  *   --source <id>   Scope to one sources row. Omit = all code pages.
  *   --dry-run       Preview cost + page count, exit 0.
  *   --yes           Skip interactive [y/N]. Required for non-TTY + non-JSON.
  *   --json          Machine-readable ConfirmationRequired / result envelope.
- *   --force         Bypass importCodeFile's content_hash early-return. Use
- *                   this for paranoid full reindex when content_hash equals
- *                   but you still want a re-chunk + re-embed pass.
+ *   --force         Rebuild even when the canonical text projection is current.
  *
  * Batched in chunks of 100 pages to avoid OOM on 47K-page brains (codex
  * review Finding 4.4). Idempotent: re-running on already-reindexed pages
@@ -24,11 +22,12 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { importCodeFile } from '../core/import-file.ts';
+import { reindexCodeProjection } from '../core/persistence/projection-reindex.ts';
+import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
 import { estimateTokens } from '../core/chunkers/code.ts';
 import { getEmbeddingModelName, estimateEmbeddingCostUsd } from '../core/embedding.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
-import { createInterface } from 'readline';
+import { promptYesNo } from '../core/confirm-prompt.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
@@ -120,6 +119,7 @@ function printCodeModelNudge(decision: Extract<NudgeDecision, { shouldNudge: tru
 
 interface CodePageRow {
   slug: string;
+  source_id: string;
   compiled_truth: string;
   frontmatter: Record<string, unknown> | null;
 }
@@ -133,11 +133,16 @@ async function fetchCodePages(
   // Direct SQL: listPages doesn't expose source_id filtering, and we need
   // compiled_truth + frontmatter anyway (not just the Page shape).
   const sourceClause = sourceId ? `AND p.source_id = '${sourceId.replace(/'/g, "''")}'` : '';
+  // source_id is SELECTed so the per-page re-import below targets each row's
+  // OWN source. Pre-fix this iterated all sources' code pages but imported
+  // with the CLI-level sourceId (undefined without --source), which — now
+  // that import reads/writes are default-scoped — would duplicate every
+  // non-default-source code page into 'default' and re-embed it.
   const rows = await engine.executeRaw<CodePageRow>(
-    `SELECT p.slug, p.compiled_truth, p.frontmatter
-     FROM pages p
-     WHERE p.type = 'code' ${sourceClause}
-     ORDER BY p.slug
+    `SELECT p.slug, p.source_id, p.compiled_truth, p.frontmatter
+     FROM pages p JOIN sources s ON s.id=p.source_id
+     WHERE p.page_kind = 'code' AND p.deleted_at IS NULL AND NOT s.archived ${sourceClause}
+     ORDER BY p.source_id,p.slug
      LIMIT ${batchSize} OFFSET ${offset}`,
   );
   return rows;
@@ -146,7 +151,7 @@ async function fetchCodePages(
 async function countCodePages(engine: BrainEngine, sourceId: string | undefined): Promise<number> {
   const sourceClause = sourceId ? `AND p.source_id = '${sourceId.replace(/'/g, "''")}'` : '';
   const rows = await engine.executeRaw<{ n: string | number }>(
-    `SELECT COUNT(*)::text AS n FROM pages p WHERE p.type = 'code' ${sourceClause}`,
+    `SELECT COUNT(*)::text AS n FROM pages p JOIN sources s ON s.id=p.source_id WHERE p.page_kind = 'code' AND p.deleted_at IS NULL AND NOT s.archived ${sourceClause}`,
   );
   if (rows.length === 0) return 0;
   const raw = rows[0]!.n;
@@ -180,23 +185,14 @@ async function estimateReindexCost(
   return { totalTokens, totalPages };
 }
 
-async function promptYesNo(question: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => {
-      rl.close();
-      const a = answer.trim().toLowerCase();
-      resolve(a === 'y' || a === 'yes');
-    });
-    rl.on('close', () => resolve(false));
-  });
-}
-
 export async function runReindexCode(
   engine: BrainEngine,
   opts: ReindexCodeOpts = {},
 ): Promise<ReindexCodeResult> {
   const batchSize = opts.batchSize ?? 100;
+  let model: string;
+  try { model = getEmbeddingModelName(); }
+  catch (error) { if (!opts.noEmbed) throw error; model = 'unconfigured'; }
 
   const { totalTokens, totalPages } = await estimateReindexCost(engine, opts.sourceId, batchSize);
   const costUsd = estimateEmbeddingCostUsd(totalTokens);
@@ -211,7 +207,7 @@ export async function runReindexCode(
     !opts.noEmbed &&
     process.env.GBRAIN_NO_CODE_MODEL_NUDGE !== '1'
   ) {
-    const decision = shouldNudgeCodeModel(getEmbeddingModelName());
+    const decision = shouldNudgeCodeModel(model);
     if (decision.shouldNudge) printCodeModelNudge(decision);
   }
 
@@ -224,7 +220,7 @@ export async function runReindexCode(
       failed: 0,
       totalTokens,
       costUsd,
-      model: getEmbeddingModelName(),
+      model,
     };
   }
 
@@ -237,13 +233,11 @@ export async function runReindexCode(
       failed: 0,
       totalTokens: 0,
       costUsd: 0,
-      model: getEmbeddingModelName(),
+      model,
     };
   }
 
-  // Walk every code page, re-run importCodeFile with compiled_truth as
-  // the content source. relativePath comes from frontmatter.file (set by
-  // the original importCodeFile call). Progress via stderr reporter.
+  // Walk stored code projections without replacing canonical page state.
   const reporter = createProgress(cliOptsToProgressOptions(getCliOptions()));
   reporter.start('reindex_code.pages', totalPages);
 
@@ -255,7 +249,7 @@ export async function runReindexCode(
   let budgetExhausted: BudgetExhausted | null = null;
 
   // F3: when --max-cost is set, run the body inside withBudgetTracker so
-  // every gateway.embed() call inside importCodeFile composes with the cap.
+  // every explicit embedding call composes with the cap.
   // On BudgetExhausted, we catch + persist what's been imported so far,
   // then surface the throw as a partial-progress result the caller can
   // re-run. importCodeFile is idempotent (content_hash short-circuit), so
@@ -289,23 +283,28 @@ export async function runReindexCode(
               reporter.tick();
               return;
             }
-            if (!row.compiled_truth) {
+            // `compiled_truth` is NOT NULL DEFAULT '': an empty file is legitimately '' (every
+            // `__init__.py`). Only a null row is missing; the falsy check counted every empty
+            // file as a failure (#4902).
+            if (row.compiled_truth == null) {
               failed++;
               failures.push({ slug: row.slug, error: 'missing compiled_truth' });
               reporter.tick();
               return;
             }
             try {
-              const result = await importCodeFile(engine, relPath, row.compiled_truth, {
+              const result = await reindexCodeProjection(engine, row.slug, row.source_id, {
                 noEmbed: opts.noEmbed,
                 force: opts.force,
-                sourceId: opts.sourceId,
+                // Each page re-imports into its OWN source (row-level), not
+                // the CLI-level default — reindex must be an in-place
+                // rebuild, never a cross-source copy.
               });
               if (result.status === 'imported') reindexed++;
               else if (result.status === 'skipped') skipped++;
               else {
                 failed++;
-                failures.push({ slug: row.slug, error: result.error ?? result.status });
+                failures.push({ slug: row.slug, error: result.status });
               }
             } catch (e: unknown) {
               // BudgetExhausted bypasses the helper's onError and hard-
@@ -342,6 +341,7 @@ export async function runReindexCode(
     }
   }
 
+  if (reindexed > 0) await refreshProjectionStatistics(engine);
   if (budgetExhausted) {
     // Partial-progress result: surfaces what got reindexed before the cap
     // fired. The CLI wrapper translates this into a clear user-facing
@@ -355,7 +355,7 @@ export async function runReindexCode(
       failed,
       totalTokens,
       costUsd: budgetExhausted.spent,
-      model: getEmbeddingModelName(),
+      model,
       failures: [
         { slug: '(budget)', error: budgetExhausted.message },
         ...(failures.length > 0 ? failures : []),
@@ -371,7 +371,7 @@ export async function runReindexCode(
     failed,
     totalTokens,
     costUsd,
-    model: getEmbeddingModelName(),
+    model,
     failures: failures.length > 0 ? failures : undefined,
   };
 }
@@ -413,6 +413,26 @@ export function buildCostRefusal(opts: {
       'Refusing to re-embed non-interactively without confirmation. ' +
       'Pass --yes to proceed, or --dry-run for the preview (exit 0).',
   };
+}
+
+/**
+ * issue #3970 — recovery hint for the "0 reindexed, N skipped" wall. Without
+ * --force, importCodeFile's content_hash short-circuit skips every unchanged
+ * page, so a user trying to backfill symbol metadata (or re-embed) sees an
+ * all-skipped pass with no pointer at the cure. Pure + exported for tests.
+ * Returns null when the hint doesn't apply (something reindexed, nothing
+ * skipped, or --force already passed).
+ */
+export function reindexForceHint(
+  result: Pick<ReindexCodeResult, 'reindexed' | 'skipped'>,
+  force: boolean | undefined,
+): string | null {
+  if (force || result.reindexed > 0 || result.skipped === 0) return null;
+  return (
+    `All ${result.skipped} page(s) already have current text projections ` +
+    `(no content_hash-changing canonical rewrite is needed). To rebuild symbol metadata ` +
+    `without provider costs, re-run with --force --no-embed.`
+  );
 }
 
 /**
@@ -461,7 +481,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
       }
       const n = v ? parseFloat(v) : NaN;
       if (!Number.isFinite(n) || n <= 0) {
-        console.error(`gbrain reindex --code: ${flag} requires a positive number in USD, or off/unlimited (got ${v ?? '(missing)'})`);
+        console.error(`gbrain reindex-code: ${flag} requires a positive number in USD, or off/unlimited (got ${v ?? '(missing)'})`);
         process.exit(2);
       }
       maxCostUsd = n;
@@ -546,6 +566,10 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
         `(${result.codePages} total code pages, ~${result.totalTokens.toLocaleString()} tokens, ` +
         `est. $${result.costUsd.toFixed(2)}).`,
     );
+    // #3970: an all-skipped pass without --force is usually someone trying to
+    // heal missing chunk metadata — point at the flag that actually does it.
+    const hint = reindexForceHint(result, force);
+    if (hint) console.log(hint);
     if (result.failures && result.failures.length > 0) {
       console.log(`\n${result.failures.length} failure(s):`);
       for (const f of result.failures.slice(0, 10)) {

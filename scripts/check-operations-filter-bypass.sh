@@ -39,6 +39,12 @@ cd "$ROOT"
 # Files allowed to import `operations` directly. Each entry must be
 # accompanied by a one-line rationale (the comment on the same line).
 ALLOWED=(
+  "src/core/grants/profiles.ts"                 # snapshots eligible remote ops with !op.localOnly; grant validation never exposes local-only operations
+  "src/core/bootstrap/harness.ts"              # trusted owner provisioning; filters localOnly and scopes before minting explicit follow operation snapshots
+  "src/core/token-mint.ts"                     # trusted token creation validates explicit snapshots against public scope-compatible operations
+  "src/core/shared-skills/tool-access.ts"       # skill usability intersects locality, scopes, snapshots, source fences, surface and publication gates
+  "src/mcp/skill-resources.ts"                  # resources map only catalog reads through equivalent scope/snapshot/surface/gate checks and shared dispatch
+  "src/core/harness/capabilities.ts"            # introspection applies !op.localOnly plus effective surface, scope, fence, snapshot and publish-gate filters
   "src/cli.ts"                                  # local CLI; user owns the machine, no trust boundary
   "src/mcp/dispatch.ts"                         # shared dispatch; sets ctx.remote from caller, handlers self-gate
   "src/mcp/server.ts"                           # stdio MCP; local-trusted (binary on user's box)
@@ -46,10 +52,24 @@ ALLOWED=(
   "src/mcp/tool-defs.ts"                        # pure helper; takes ops as parameter, never exposes them
   "src/core/minions/tools/brain-allowlist.ts"   # subagent registry; has its own opt-in allowlist (separate from localOnly)
   "src/commands/capture.ts"                     # local CLI tool; not network-exposed
+  "src/commands/recall.ts"                      # local CLI delegates forget through the frozen operation before acquiring an engine
+  "src/commands/takes-mutation.ts"              # local CLI adapter; trusted execution or authenticated persistence IPC only
+  "src/core/persistence/administration.ts"      # trusted-admin grant diagnostics; does not expose an operation transport
+  "src/core/persistence/provider.ts"            # authenticated local registrations; shared dispatch enforces localOnly and the immutable trust lane
   "src/commands/enrich.ts"                       # local CLI tool; calls put_page handler with remote=false, not network-exposed
   "src/commands/book-mirror.ts"                 # local CLI tool; not network-exposed
   "src/commands/tools-json.ts"                  # gbrain --tools-json introspection; full op list IS the purpose
+  "src/mcp/publish-gates.ts"                    # reads op.publishGateKey/name only to compute gate-DISABLED sets; never lists/exposes ops
+  "src/mcp/tool-catalog.ts"                     # docs/TOOL_CATALOG.md renderer; filters !op.localOnly at the boundary; never a transport surface
   "src/commands/serve-http.ts"                  # MUST APPLY .filter(op => !op.localOnly) — verified by grep below
+  "src/core/ops/request-tools.ts"               # visibleOpsForCaller loads the assembled list lazily (verbs.ts house pattern) and applies (isLocal || !op.localOnly) + surface + gate filtering
+  # The four below predate the widened specifier regex (they import via
+  # '../operations.ts', invisible to the old 'core/operations.ts' pattern) —
+  # all internal consumers, none a transport surface:
+  "src/core/advisor/collect-mcp-client-fit.ts"  # advisor collector; uses op.localOnly names to SCORE client fit, never serves the list
+  "src/core/bootstrap/verify.ts"                # bootstrap wiring verifier; finds ops by name to probe local wiring, remote=false context
+  "src/core/skillopt/rollout.ts"                # skillopt internals; iterates op metadata for rollout planning, not exposed
+  "src/core/skillopt/write-capture.ts"          # skillopt internals; iterates op params for capture schema, not exposed
 )
 
 # Pattern: any import that brings the `operations` VALUE in from core/operations.ts.
@@ -63,7 +83,11 @@ ALLOWED=(
 # inside the destructured clause OR a namespace import (`* as X`); type-only
 # imports of sibling exports like `sourceScopeOpts` / `OperationContext` are
 # left alone (those don't expose the op list to a transport surface).
-PATTERN='import[[:space:]]+(\*[[:space:]]+as[[:space:]]+[a-zA-Z_$][a-zA-Z0-9_$]*|\{[^}]*\boperations\b[^}]*\})[[:space:]]+from[[:space:]]*['\''"][^'\''"]*core/operations\.ts['\''"]'
+# Specifier: `core/operations.ts` from outside src/core, `../operations.ts`
+# from inside (the ops/ module dir sits one level down post-peel), and the
+# dynamic `import('...operations.ts')` house pattern — all three reach the
+# assembled op list.
+PATTERN='(import[[:space:]]+(\*[[:space:]]+as[[:space:]]+[a-zA-Z_$][a-zA-Z0-9_$]*|\{[^}]*\boperations\b[^}]*\})[[:space:]]+from[[:space:]]*['\''"][^'\''"]*(core/operations|\.\./operations)\.ts['\''"]|\{[^}]*\boperations\b[^}]*\}[[:space:]]*=[[:space:]]*await[[:space:]]+import\(['\''"][^'\''"]*operations\.ts['\''"]\))'
 
 # Collect files that import `operations`. Use a while-loop over grep output
 # instead of `mapfile` to stay compatible with macOS's default bash 3.2.

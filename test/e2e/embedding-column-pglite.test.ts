@@ -18,6 +18,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
 import {
@@ -27,6 +28,7 @@ import {
 import {
   configureGateway,
   resetGateway,
+  __unconfigureGatewayForTests,
   __setEmbedTransportForTests,
 } from '../../src/core/ai/gateway.ts';
 import type { ResolvedColumn } from '../../src/core/types.ts';
@@ -66,10 +68,10 @@ beforeAll(async () => {
     compiled_truth: 'Page B discusses dogs and their habits.',
   });
 
-  await engine.upsertChunks('docs/page-a', [
+  await installFixtureChunks(engine, 'docs/page-a', [
     { chunk_index: 0, chunk_text: 'cats behavior chunk A', chunk_source: 'compiled_truth' },
   ]);
-  await engine.upsertChunks('docs/page-b', [
+  await installFixtureChunks(engine, 'docs/page-b', [
     { chunk_index: 0, chunk_text: 'dogs habits chunk B', chunk_source: 'compiled_truth' },
   ]);
 
@@ -261,8 +263,13 @@ describe('upsertChunks — model provenance uses gateway-resolved model, not com
   test('#3461: unconfigured gateway falls back to the brain config model, never the compiled default', async () => {
     await engine.setConfig('embedding_model', 'voyage:voyage-3-large');
     // The preload's beforeEach re-configures the gateway before every test,
-    // so the reset must happen INSIDE the test body.
-    resetGateway();
+    // so the unconfigure must happen INSIDE the test body. Since commit
+    // 3aa064bcc (#3554), `resetGateway()` RESTORES the preload's OpenAI/1536
+    // baseline instead of unconfiguring — this test needs genuine no-gateway
+    // behavior (getEmbeddingModel() must THROW), which is exactly what
+    // `__unconfigureGatewayForTests()` was added for. The preload's
+    // beforeEach restores the baseline before the next test.
+    __unconfigureGatewayForTests();
 
     await engine.putPage('docs/provenance-throw-path', {
       type: 'concept',

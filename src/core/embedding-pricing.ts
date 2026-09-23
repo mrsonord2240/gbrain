@@ -34,18 +34,39 @@ export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
   'openai:text-embedding-3-small': { pricePerMTok: 0.02 },
   // Legacy OpenAI ada (still common in older brains)
   'openai:text-embedding-ada-002': { pricePerMTok: 0.10 },
-  // Voyage (https://docs.voyageai.com/docs/pricing, verified 2026-07-28)
+  // Voyage (https://docs.voyageai.com/docs/pricing, verified 2026-08-21)
   'voyage:voyage-4-large':         { pricePerMTok: 0.12 },
   'voyage:voyage-4':               { pricePerMTok: 0.06 },
   'voyage:voyage-4-lite':          { pricePerMTok: 0.02 },
+  'voyage:voyage-code-4':          { pricePerMTok: 0.12 },
+  // Domain + multimodal models (current-models section; multimodal rate is
+  // per 1M TEXT tokens — image pixel-token pricing is out of scope here).
+  'voyage:voyage-finance-2':       { pricePerMTok: 0.12 },
+  'voyage:voyage-law-2':           { pricePerMTok: 0.12 },
+  'voyage:voyage-multimodal-3':    { pricePerMTok: 0.12 },
+  // Voyage rerankers (same pricing page; 2.5 pair verified 2026-08-21, the
+  // rerank-3 preview pair 2026-09-06). Same budget-tracker rerank-kind
+  // fallback rationale as the zerank-2 row below. Rows carry the list rate:
+  // Voyage's free-token grants are per-account and not modeled here, so
+  // over-reporting inside a grant beats under-reporting past it.
+  'voyage:rerank-2.5':             { pricePerMTok: 0.05 },
+  'voyage:rerank-2.5-lite':        { pricePerMTok: 0.02 },
+  'voyage:rerank-3':               { pricePerMTok: 0.05 },
+  'voyage:rerank-3-lite':          { pricePerMTok: 0.02 },
   // voyage-4-nano is deliberately absent: it's the open-weight variant (see
   // src/core/ai/recipes/voyage.ts) and Voyage's pricing page lists no hosted
   // rate for it. A 0 entry would under-estimate anyone paying for it via the
   // hosted API; no entry means lookupEmbeddingPrice returns `unknown` and the
   // caller prints "estimate unavailable" instead of a wrong number.
   // Legacy Voyage models (same page, "older models" section — no free tokens):
+  // #4344: voyage-3.5 / voyage-3.5-lite are in the hosted recipe list but had
+  // no rows, so upgrade cost estimates showed "unavailable" for their users.
+  'voyage:voyage-3.5':             { pricePerMTok: 0.06 },
+  'voyage:voyage-3.5-lite':        { pricePerMTok: 0.02 },
   'voyage:voyage-3-large':         { pricePerMTok: 0.18 },
   'voyage:voyage-3':               { pricePerMTok: 0.06 },
+  'voyage:voyage-3-lite':          { pricePerMTok: 0.02 },
+  'voyage:voyage-code-3':          { pricePerMTok: 0.18 },
   // ZeroEntropy (https://www.zeroentropy.dev/pricing, verified 2026-07-28)
   'zeroentropyai:zembed-1':        { pricePerMTok: 0.05 },
   // ZeroEntropy reranker (docs/ai-providers/zeroentropy.md — $0.025/1M tokens).
@@ -58,11 +79,35 @@ export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
   // Perplexity (https://docs.perplexity.ai/getting-started/pricing, verified 2026-07-28)
   'perplexity:pplx-embed-v1-0.6b': { pricePerMTok: 0.004 },
   'perplexity:pplx-embed-v1-4b':   { pricePerMTok: 0.03 },
+  // Google (https://ai.google.dev/gemini-api/docs/pricing, verified 2026-09-07).
+  // #4344 class: both models are in the hosted recipe list
+  // (src/core/ai/recipes/google.ts) but had no rows, so cost estimates read
+  // "unavailable" for every brain on them — including the OpenRouter-routed
+  // ones, since `openrouter:google/gemini-embedding-001` resolves here through
+  // the #2504 nested-vendor retry. The two rates differ, so one shared row
+  // would misprice whichever model it didn't come from.
+  'google:gemini-embedding-001':   { pricePerMTok: 0.15 },
+  // gemini-embedding-2 is multimodal and priced per input kind ($0.45/1M image,
+  // $6.50 audio, $12.00 video). Same convention as voyage-multimodal-3 above:
+  // the TEXT rate is the row, pixel/audio token pricing is out of scope here.
+  'google:gemini-embedding-2':     { pricePerMTok: 0.20 },
 };
 
 export type PriceLookupResult =
   | { kind: 'known'; pricePerMTok: number; key: string }
   | { kind: 'unknown'; provider: string; model: string };
+
+/**
+ * Provider aliases resolved on a lookup miss (#4032). Azure deployments of
+ * OpenAI embedding models bill at the same per-token rates as OpenAI-hosted,
+ * so `azure-openai:<model>` falls back to the `openai:<model>` row. An alias
+ * (not duplicated rows) so new openai entries never drift from their Azure
+ * twins. A model with no twin in the alias target stays `unknown` — fail
+ * closed rather than fabricate a rate.
+ */
+const EMBEDDING_PROVIDER_ALIASES: Record<string, string> = {
+  'azure-openai': 'openai',
+};
 
 /**
  * Resolve a model string into a price-per-1M-tokens. Accepts both
@@ -77,6 +122,24 @@ export function lookupEmbeddingPrice(modelString: string): PriceLookupResult {
   const key = `${provider}:${model}`;
   const hit = EMBEDDING_PRICING[key];
   if (hit) return { kind: 'known', pricePerMTok: hit.pricePerMTok, key };
+  const alias = EMBEDDING_PROVIDER_ALIASES[provider];
+  if (alias) {
+    const aliasKey = `${alias}:${model}`;
+    const aliasHit = EMBEDDING_PRICING[aliasKey];
+    if (aliasHit) return { kind: 'known', pricePerMTok: aliasHit.pricePerMTok, key: aliasKey };
+  }
+  // #2504 — nested gateway ids: router providers wrap the upstream vendor in
+  // the model segment ('openrouter:openai/text-embedding-3-large'). On a
+  // miss, re-key on the nested vendor prefix and retry (provider aliases
+  // included via the recursion) — routers bill the upstream vendor's
+  // per-token rate, so the vendor row is the honest estimate. No nested
+  // match → still `unknown` (fail closed, never fabricate). Bounded: each
+  // recursion strips one '/segment'.
+  const slash = model.indexOf('/');
+  if (slash > 0 && slash < model.length - 1) {
+    const nested = lookupEmbeddingPrice(`${model.slice(0, slash)}:${model.slice(slash + 1)}`);
+    if (nested.kind === 'known') return nested;
+  }
   return { kind: 'unknown', provider, model };
 }
 

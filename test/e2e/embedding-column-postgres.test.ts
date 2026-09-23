@@ -16,10 +16,12 @@
  * matters; the doctor wrapping just renders the result.
  */
 
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { quoteIdentifier } from '../../src/core/search/embedding-column.ts';
 import type { ResolvedColumn } from '../../src/core/types.ts';
+import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 
 const dbUrl = process.env.DATABASE_URL;
 if (!dbUrl) {
@@ -33,6 +35,7 @@ if (!dbUrl) {
 
   beforeAll(async () => {
     engine = new PostgresEngine();
+    assertSafeE2eDatabaseUrl(dbUrl!);
     await engine.connect({ database_url: dbUrl } as never);
     await engine.initSchema();
 
@@ -63,10 +66,10 @@ if (!dbUrl) {
       title: 'Dog doc',
       compiled_truth: 'Dog doc compiled truth.',
     });
-    await engine.upsertChunks('docs/cat', [
+    await installFixtureChunks(engine, 'docs/cat', [
       { chunk_index: 0, chunk_text: 'cat chunk', chunk_source: 'compiled_truth' },
     ]);
-    await engine.upsertChunks('docs/dog', [
+    await installFixtureChunks(engine, 'docs/dog', [
       { chunk_index: 0, chunk_text: 'dog chunk', chunk_source: 'compiled_truth' },
     ]);
 

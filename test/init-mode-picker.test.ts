@@ -49,14 +49,17 @@ describe('recommendModeFor — auto-suggestion heuristic', () => {
     expect(r.reason).toMatch(/Haiku/);
   });
 
-  test('No OpenAI key → conservative (no LLM expansion possible)', () => {
-    const r = recommendModeFor({ hasOpenAIKey: false });
+  test('No expansion-capable key → conservative (LLM expansion cannot run)', () => {
+    const r = recommendModeFor({ hasExpansionKey: false });
     expect(r.mode).toBe('conservative');
-    expect(r.reason).toMatch(/No OpenAI/);
+    // Provider-neutral copy: expansion routes through the chat lane, so an
+    // Anthropic or Google key counts — the reason must not say "No OpenAI".
+    expect(r.reason).toMatch(/expansion-capable/i);
+    expect(r.reason).not.toMatch(/No OpenAI key/);
   });
 
   test('Sonnet / unknown → tokenmax (preserve-v0.31.x default)', () => {
-    const r = recommendModeFor({ subagentModel: 'anthropic:claude-sonnet-4-6', hasOpenAIKey: true });
+    const r = recommendModeFor({ subagentModel: 'anthropic:claude-sonnet-4-6', hasExpansionKey: true });
     expect(r.mode).toBe('tokenmax');
     expect(r.reason).toMatch(/v0\.31\.x|preserve/i);
   });
@@ -75,7 +78,7 @@ describe('recommendModeFor — auto-suggestion heuristic', () => {
     const r = recommendModeFor({
       defaultModel: 'anthropic:claude-opus-4-7',
       subagentModel: 'anthropic:claude-haiku-4-5',
-      hasOpenAIKey: true,
+      hasExpansionKey: true,
     });
     expect(r.mode).toBe('conservative');
   });
@@ -88,6 +91,14 @@ describe('MENU_TEXT cost-matrix anchors (must match CLAUDE.md + methodology doc)
     // methodology doc + README in lockstep.
     expect(MODE_PICKER_MENU).toContain('25x');
     expect(MODE_PICKER_MENU).toContain('corner-to-corner');
+  });
+
+  test('does not claim the semantic result cache saves money while it is disabled', async () => {
+    const { MODE_PICKER_MENU } = await import('../src/commands/init-mode-picker.ts');
+    // CLAUDE.md ## Search Mode: "Semantic result caching is temporarily
+    // disabled; budget for fresh retrieval on every query."
+    expect(MODE_PICKER_MENU).not.toContain('semantic cache is free');
+    expect(MODE_PICKER_MENU).toContain('semantic result caching is temporarily disabled');
   });
 
   test('cost matrix lists every cell at the natural diagonal and corners', async () => {
@@ -116,11 +127,15 @@ describe('MENU_TEXT cost-matrix anchors (must match CLAUDE.md + methodology doc)
     expect(MODE_PICKER_MENU).toContain('$5/M');
   });
 
-  test('tokenmax Haiku-expansion surcharge is named explicitly', async () => {
+  test('query-verb Haiku-expansion surcharge is named explicitly, not attributed to tokenmax', async () => {
     const { MODE_PICKER_MENU } = await import('../src/commands/init-mode-picker.ts');
     // Cross-line match — the surcharge phrase can wrap.
-    expect(MODE_PICKER_MENU.replace(/\s+/g, ' ')).toContain('~$1.50 per 1K queries');
+    const flat = MODE_PICKER_MENU.replace(/\s+/g, ' ');
+    expect(flat).toContain('gbrain query adds ~$1.50 per 1K queries');
     expect(MODE_PICKER_MENU).toContain('Haiku expansion call');
+    // `gbrain query` expands in every mode (#4601); the surcharge is not a tokenmax line item.
+    expect(flat).not.toContain('tokenmax adds');
+    expect(flat).toContain('--no-expand');
   });
 
   test('cache-hit discount framing is named', async () => {

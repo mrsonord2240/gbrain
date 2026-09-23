@@ -26,6 +26,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs'
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import {
   configureGateway,
   resetGateway,
@@ -141,7 +142,7 @@ describe('migrate embeddings — full flow on PGLite', () => {
     expect(await columnDims()).toBe(FROM_DIMS);
     for (const slug of PAGES) {
       await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `# ${slug}\n\ncontent for ${slug}` });
-      await engine.upsertChunks(slug, [
+      await installFixtureChunks(engine, slug, [
         { chunk_index: 0, chunk_text: `chunk text for ${slug}`, chunk_source: 'compiled_truth', token_count: 5 },
       ]);
     }
@@ -225,8 +226,10 @@ describe('migrate embeddings — full flow on PGLite', () => {
     const code = await runMigrate(['--to', 'openai:text-embedding-3-small', '--yes']);
     expect(code).toBe(0);
 
-    // Only the two previously-failed pages were embedded this pass.
-    expect(embeddedTexts.length).toBe(2);
+    // Only the two previously-failed pages were embedded this pass, plus the
+    // 3 completion smoke-check QUERY embeds (self-retrieval runs only on the
+    // completed path — the interrupted run above had none).
+    expect(embeddedTexts.length).toBe(5);
     expect(embeddedTexts.join(' ')).toContain('page-4');
     expect(embeddedTexts.join(' ')).toContain('page-5');
 

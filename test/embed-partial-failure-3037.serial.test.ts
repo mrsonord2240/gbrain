@@ -1,3 +1,4 @@
+import { mockEmbedProjectionEngine as mockEngine, embeddingUpdates } from './helpers/embed-projection-mock.ts';
 /**
  * #3037 — one oversized/bad chunk must not darken its ENTIRE page, and embed
  * failures must be visible on the run result.
@@ -47,21 +48,6 @@ const { runEmbedCore } = await import('../src/commands/embed.ts');
 const { __setEmbedTransportForTests } = await import('../src/core/ai/gateway.ts');
 __setEmbedTransportForTests(async () => ({ embeddings: [], usage: { tokens: 0 } } as any));
 
-function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
-  const calls: { method: string; args: any[] }[] = [];
-  const track = (method: string) => (...args: any[]) => {
-    calls.push({ method, args });
-    if (overrides[method]) return overrides[method](...args);
-    return Promise.resolve(null);
-  };
-  return new Proxy({} as any, {
-    get(_, prop: string) {
-      if (prop === '_calls') return calls;
-      if (overrides[prop]) return overrides[prop];
-      return track(prop);
-    },
-  });
-}
 
 /** Permanent 400-shaped batch failure (e.g. one oversized chunk). */
 function permanentBatchError(): Error {
@@ -102,22 +88,20 @@ describe('#3037 — one bad chunk no longer darkens its page', () => {
       slug: 'poisoned-page', chunk_index: c.chunk_index, chunk_text: c.chunk_text,
       chunk_source: c.chunk_source, model: null, token_count: 1, source_id: 'default', page_id: 1,
     }));
-    const upsertCalls: Array<{ slug: string; chunks: any[] }> = [];
     const engine = mockEngine({
       countStaleChunks: async () => 3,
       listStaleChunks: async () => stale,
       getChunks: async () => THREE_CHUNKS,
-      upsertChunks: async (slug: string, chunks: any[]) => { upsertCalls.push({ slug, chunks }); },
+      upsertChunks: async () => { throw new Error("Embedding must not replace canonical chunks"); },
     });
 
     const result = await runEmbedCore(engine, { stale: true });
 
-    // Pre-fix: the batch threw, upsertChunks never ran, embedded stayed 0.
-    expect(upsertCalls).toHaveLength(1);
-    const byIdx = new Map(upsertCalls[0].chunks.map((c: any) => [c.chunk_index, c]));
-    expect(byIdx.get(0)!.embedding).toBeInstanceOf(Float32Array);
-    expect(byIdx.get(2)!.embedding).toBeInstanceOf(Float32Array);
-    expect(byIdx.get(1)!.embedding).toBeUndefined(); // bad chunk stays NULL (re-run picks it up)
+    const updates = embeddingUpdates(engine);
+    expect(updates).toHaveLength(2);
+    expect(updates.map((call: any) => call.args[1][5])).toEqual(['good-a', 'good-b']);
+    expect(updates.every((call: any) => JSON.parse(call.args[1][1]).length === 1536)).toBe(true);
+    expect((engine as any)._calls.some((call: any) => call.method === 'upsertChunks')).toBe(false);
     expect(result.embedded).toBe(2);
     expect(result.failures).toBe(1);
     expect(result.failure_samples).toHaveLength(1);
@@ -129,19 +113,19 @@ describe('#3037 — one bad chunk no longer darkens its page', () => {
 
   test('--all: same isolation on the listPages path', async () => {
     oneBadChunkBehavior();
-    const upsertCalls: Array<{ slug: string; chunks: any[] }> = [];
     const engine = mockEngine({
       listPages: async () => [{ slug: 'poisoned-page', source_id: 'default' }],
       getChunks: async () => THREE_CHUNKS,
-      upsertChunks: async (slug: string, chunks: any[]) => { upsertCalls.push({ slug, chunks }); },
+      upsertChunks: async () => { throw new Error("Embedding must not replace canonical chunks"); },
     });
 
     const result = await runEmbedCore(engine, { all: true });
 
-    expect(upsertCalls).toHaveLength(1);
-    const byIdx = new Map(upsertCalls[0].chunks.map((c: any) => [c.chunk_index, c]));
-    expect(byIdx.get(0)!.embedding).toBeInstanceOf(Float32Array);
-    expect(byIdx.get(1)!.embedding).toBeUndefined();
+    const updates = embeddingUpdates(engine);
+    expect(updates).toHaveLength(2);
+    expect(updates.map((call: any) => call.args[1][5])).toEqual(['good-a', 'good-b']);
+    expect(updates.every((call: any) => JSON.parse(call.args[1][1]).length === 1536)).toBe(true);
+    expect((engine as any)._calls.some((call: any) => call.method === 'upsertChunks')).toBe(false);
     expect(result.embedded).toBe(2);
     expect(result.failures).toBe(1);
     const stamps = (engine as any)._calls.filter((c: any) => c.method === 'setPageEmbeddingSignature');
@@ -214,6 +198,18 @@ describe('#3037 — one bad chunk no longer darkens its page', () => {
 });
 
 describe('#3037 — cost bounding: no per-chunk fan-out on transient failures', () => {
+  // #3796: sustained-429 exhaustion now deliberately spans a rolling TPM
+  // minute (~120s of floors); shrink the ladder so these tests stay fast
+  // while still exercising every retry.
+  beforeEach(async () => {
+    const { _setRateLimitFloorsForTests } = await import('../src/commands/embed.ts');
+    _setRateLimitFloorsForTests([1, 1, 1, 1, 1]);
+  });
+  afterEach(async () => {
+    const { _setRateLimitFloorsForTests } = await import('../src/commands/embed.ts');
+    _setRateLimitFloorsForTests(null);
+  });
+
   test('sustained 429 does not fan out into single-chunk calls', async () => {
     embedBatchBehavior = async () => {
       const err = new Error('Rate limit reached. Please try again in 0ms.');
@@ -242,8 +238,12 @@ describe('#3037 — cost bounding: no per-chunk fan-out on transient failures', 
     expect(result.failures).toBe(3);
   }, 30_000);
 
-  test('AITransientError (outage/network) does not fan out', async () => {
-    embedBatchBehavior = async () => { throw new AITransientError('upstream 502', { status: 502 }); };
+  test('sustained 502 retries batch but does not fan out per-chunk (#3966)', async () => {
+    embedBatchBehavior = async () => {
+      const err = new Error('Bad Gateway — try again in 0ms.');
+      (err as any).cause = { status: 502 };
+      throw err;
+    };
     const stale = THREE_CHUNKS.map(c => ({
       slug: 'outage-page', chunk_index: c.chunk_index, chunk_text: c.chunk_text,
       chunk_source: c.chunk_source, model: null, token_count: 1, source_id: 'default', page_id: 1,
@@ -257,10 +257,10 @@ describe('#3037 — cost bounding: no per-chunk fan-out on transient failures', 
 
     const result = await runEmbedCore(engine, { stale: true });
 
-    // Non-429 → no backoff retries; transient → no isolation. Exactly 1 call.
-    expect(embedCalls).toHaveLength(1);
-    expect(embedCalls[0]).toHaveLength(3);
+    // 502 → embedBatchWithBackoff retries the full batch; never 1-text isolation.
+    expect(embedCalls.length).toBeGreaterThan(1);
+    for (const call of embedCalls) expect(call).toHaveLength(3);
     expect(result.embedded).toBe(0);
     expect(result.failures).toBe(3);
-  });
+  }, 30_000);
 });

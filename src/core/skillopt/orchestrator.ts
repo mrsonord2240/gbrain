@@ -77,9 +77,10 @@
  * └────────────────────────────────────────────────────────────────────────┘
  */
 
+import { assertLegacySkillWriter } from '../skillpack/writer-guard.ts';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
-import { BudgetTracker } from '../budget/budget-tracker.ts';
+import { BudgetExhausted, BudgetTracker } from '../budget/budget-tracker.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
 import { errorFor } from '../errors.ts';
 import { applyEditBatch, getWorkingTreeStatusForFile, splitFrontmatter } from './apply-edits.ts';
@@ -113,13 +114,19 @@ export interface RunSkillOptResult {
   mutatedSkillFile: boolean;
   /** When mutate was skipped, path where the proposed.md was written. */
   proposedPath?: string;
+  sharedOptimization?: { proposal_id: string; publication?: Record<string, unknown> };
 }
 
 export async function runSkillOpt(opts: SkillOptOpts): Promise<RunSkillOptResult> {
+  if (opts.sharedSkill) {
+    const { optimizeSharedSkill } = await import('../shared-skills/optimizer.ts');
+    return optimizeSharedSkill(opts, runSkillOpt);
+  }
   const { engine, skillName, skillsDir } = opts;
 
   // ── Pre-flight gates (fail-loud BEFORE any LLM spend) ───────────────────
   const skillFile = skillPath(skillsDir, skillName);
+  await assertLegacySkillWriter(engine, skillFile);
   if (!fs.existsSync(skillFile)) {
     throw errorFor({
       class: 'NoSkill',
@@ -243,6 +250,56 @@ export async function runSkillOpt(opts: SkillOptOpts): Promise<RunSkillOptResult
   });
 }
 
+/**
+ * Classifies a run-loop error into the abort taxonomy the receipt + audit
+ * trail surface. Pulled out of runOptimizationLoop's catch block so it's
+ * unit-testable without driving a full orchestrator run (engine, benchmark,
+ * lock, LLM calls) — the string-sniff bug this replaces went unexercised
+ * for exactly that reason: nothing could cheaply throw a real error deep
+ * inside the loop to catch it.
+ *
+ * `err instanceof BudgetExhausted` is the real classification signal — the
+ * string sniff it replaces (`msg.includes('BudgetExhausted') ||
+ * msg.includes('budget_exhausted')`) could never match, because every
+ * BudgetExhausted thrown by src/core/budget/budget-tracker.ts carries a
+ * human-readable message ("projected cost $X exceeds the configured cap
+ * $Y", "N exceeded --max-runtime Ns", ...) containing neither literal
+ * substring. Every cost-cap / no-pricing / (unreachable from this tracker
+ * today, since it's never constructed with maxRuntimeMs) runtime abort fell
+ * through to the generic catch-all instead, misreporting outcome='errored'
+ * / abortReason='error' on the receipt and audit trail.
+ */
+export function classifyAbortError(
+  err: unknown,
+  opts: { maxRuntimeMin: number },
+): {
+  outcome: 'aborted' | 'errored';
+  abortReason: 'budget_exhausted' | 'runtime_exceeded' | 'sigint' | 'error';
+  abortDetail: string;
+} {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (err instanceof BudgetExhausted) {
+    return {
+      outcome: 'aborted',
+      abortReason: err.reason === 'runtime' ? 'runtime_exceeded' : 'budget_exhausted',
+      abortDetail: msg,
+    };
+  } else if (msg.includes('skillopt_runtime_exceeded')) {
+    return {
+      outcome: 'aborted',
+      abortReason: 'runtime_exceeded',
+      abortDetail: `exceeded --max-runtime-min ${opts.maxRuntimeMin}`,
+    };
+  } else if (msg.includes('SIGINT')) {
+    return { outcome: 'aborted', abortReason: 'sigint', abortDetail: msg };
+  } else {
+    // #3516: truthful catch-all. Pre-fix this logged reason:'sigint' for
+    // EVERY unrecognized error (provider failures, no_pricing hard-fails),
+    // which made the audit trail lie about why the run died.
+    return { outcome: 'errored', abortReason: 'error', abortDetail: msg };
+  }
+}
+
 async function runOptimizationLoop(
   opts: SkillOptOpts,
   bench: ReturnType<typeof loadBenchmark>,
@@ -321,8 +378,13 @@ async function runOptimizationLoop(
 
   // Budget tracker for the whole run. BudgetExhausted propagates as
   // MUST_ABORT through every gateway.chat call.
+  //
+  // #3516: maxCostUsd === 0 means "no cap" (--no-max-cost / --max-cost-usd 0).
+  // Passing undefined switches the tracker's pricing-miss behavior from a
+  // hard BudgetExhausted(no_pricing) abort to the legacy warn-once path, so
+  // unpriced model ids (openrouter:*, litellm:*) can run at the user's own risk.
   const tracker = new BudgetTracker({
-    maxCostUsd: opts.maxCostUsd,
+    ...(opts.maxCostUsd > 0 ? { maxCostUsd: opts.maxCostUsd } : {}),
     label: `skillopt:${skillName}`,
   });
 
@@ -331,14 +393,22 @@ async function runOptimizationLoop(
 
   // Run the loop inside withBudgetTracker so every nested gateway call composes.
   let outcome: 'accepted' | 'no_improvement' | 'aborted' | 'errored' = 'no_improvement';
+  // #3516: why a run aborted/errored — surfaced on the receipt + CLI, not
+  // just the audit JSONL, so a failed run is never a silent "Outcome: errored".
+  let abortReason: 'budget_exhausted' | 'runtime_exceeded' | 'sigint' | 'error' | undefined;
+  let abortDetail: string | undefined;
   let finalText = checkpoint.best_skill_text;
   let totalStepsRun = 0;
   // Hoisted for the receipt (computed inside the budget-tracker closure).
   let baselineSelScore = 0;
   let testScore: number | undefined;
   let baselineTestScore: number | undefined;
-  // maxRuntimeMin enforcement: wall-clock deadline checked between steps. A
-  // breach throws `skillopt_runtime_exceeded`, caught below → outcome 'aborted'
+  // maxRuntimeMin enforcement (#4119): wall-clock deadline checked between
+  // steps AND inside every gate's rollout loop (deadlineMs is threaded into
+  // runValidationGate / scoreSkillOnTasks / runHeldOutGate, checked before
+  // each individual rollout) — a long batch can no longer blow past
+  // --max-runtime by a whole gate's worth of rollouts. A breach throws
+  // `skillopt_runtime_exceeded`, caught below → outcome 'aborted'
   // (no partial commit beyond whatever already passed every gate).
   const deadline = Date.now() + opts.maxRuntimeMin * 60_000;
 
@@ -348,11 +418,13 @@ async function runOptimizationLoop(
       // We use the FULL validation gate with median-of-3 for a stable baseline.
       const baselineGate = await runValidationGate({
         engine: opts.engine,
+        operationContext: opts.operationContext,
         candidateSkillText: baselineText,
         selSet: split.sel,
         bestScore: -1, // any score > -1 + 0.05 accepts; we just want the score.
         targetModel: opts.targetModel,
         judgeModel: opts.judgeModel,
+        deadlineMs: deadline,
       });
       if (checkpoint!.best_sel_score === 0) {
         // Fresh run; set baseline.
@@ -372,12 +444,14 @@ async function runOptimizationLoop(
         const fmBlock = baselineText.slice(0, bodyStart);
         const fwd = await runValidationGate({
           engine: opts.engine,
+          operationContext: opts.operationContext,
           candidateSkillText: baselineText,
           selSet: split.sel,
           bestScore: -1,
           targetModel: opts.targetModel,
           judgeModel: opts.judgeModel,
           runsPerTask: 1,
+          deadlineMs: deadline,
         });
         const rewrite = await runOneShotRewrite({
           skillBodyText: baselineBody,
@@ -394,9 +468,11 @@ async function runOptimizationLoop(
           if (heldOutTasks.length > 0) {
             const ho = await runHeldOutGate({
               engine: opts.engine,
+              operationContext: opts.operationContext,
               candidateSkillText: candidate,
               baselineSkillText: baselineText,
               heldOutTasks,
+              deadlineMs: deadline,
               targetModel: opts.targetModel,
               judgeModel: opts.judgeModel,
             });
@@ -405,10 +481,12 @@ async function runOptimizationLoop(
           if (promote) {
             const score = await scoreSkillOnTasks({
               engine: opts.engine,
+              operationContext: opts.operationContext,
               skillText: candidate,
               tasks: split.sel,
               targetModel: opts.targetModel,
               judgeModel: opts.judgeModel,
+              deadlineMs: deadline,
             });
             checkpoint!.best_sel_score = score;
             checkpoint!.best_skill_text = candidate;
@@ -452,12 +530,14 @@ async function runOptimizationLoop(
           // sel-side gate uses. ScoredRollouts come back via GateResult.
           const forwardGate = await runValidationGate({
             engine: opts.engine,
+            operationContext: opts.operationContext,
             candidateSkillText: checkpoint!.best_skill_text,
             selSet: batch,
             bestScore: -1,
             targetModel: opts.targetModel,
             judgeModel: opts.judgeModel,
             runsPerTask: 1,
+            deadlineMs: deadline,
           });
           // Partition into successes vs failures (>= 0.5 threshold). Reflect
           // gets the actual scored trajectories so failure-mode + success-mode
@@ -484,6 +564,35 @@ async function runOptimizationLoop(
           const fresh = allEdits.filter((e) => !isRejected(rejected, checkpoint!.best_skill_text, [e]));
           // Apply under LR budget.
           const applied = applyEditBatch(checkpoint!.best_skill_text, fresh, lrBudget);
+
+          if (fresh.length === 0) {
+            // #4741: the optimizer proposed NOTHING (reflect returned/parsed no
+            // edits, or every edit was already in the rejected buffer). This
+            // used to fall into the all-rejected branch below ([].every() is
+            // true) and log the same 'no_edits_applied' as "gated N candidates
+            // and rejected all" — so a whole run of zero candidates read as a
+            // real `no_improvement`. Say so per step; nothing to reject-buffer.
+            const why = reflectResult.errors[0]
+              ? `no_edits_proposed: ${reflectResult.errors[0]}`
+              : 'no_edits_proposed';
+            process.stderr.write(`[skillopt] epoch ${epoch} step ${step}: optimizer proposed no edits (${why})\n`);
+            logEvent({
+              kind: 'step',
+              run_id: runId,
+              skill: skillName,
+              epoch,
+              step,
+              sel_score_median: checkpoint!.best_sel_score,
+              sel_score_runs: [],
+              accepted: false,
+              edits_attempted: 0,
+              edits_applied: 0,
+              delta: 0,
+              reason: why,
+              cumulative_cost_usd: tracker.snapshot().cumulativeCostUsd,
+            } as never);
+            continue;
+          }
 
           if (applied.results.every((r) => r.outcome === 'rejected')) {
             // Nothing applied; record rejected entries + skip gate.
@@ -512,11 +621,13 @@ async function runOptimizationLoop(
           // VALIDATION GATE (D12 median-of-3 + epsilon=0.05, D4 parallel).
           const gate = await runValidationGate({
             engine: opts.engine,
+            operationContext: opts.operationContext,
             candidateSkillText: applied.newText,
             selSet: split.sel,
             bestScore: checkpoint!.best_sel_score,
             targetModel: opts.targetModel,
             judgeModel: opts.judgeModel,
+            deadlineMs: deadline,
           });
 
           // Ablation (cat31 config D): disableValidationGate greedy-accepts any
@@ -534,9 +645,11 @@ async function runOptimizationLoop(
             if (heldOutTasks.length > 0) {
               const ho = await runHeldOutGate({
                 engine: opts.engine,
+                operationContext: opts.operationContext,
                 candidateSkillText: applied.newText,
                 baselineSkillText: baselineText,
                 heldOutTasks,
+                deadlineMs: deadline,
                 targetModel: opts.targetModel,
                 judgeModel: opts.judgeModel,
               });
@@ -655,50 +768,36 @@ async function runOptimizationLoop(
       if (split.test.length > 0) {
         testScore = await scoreSkillOnTasks({
           engine: opts.engine,
+          operationContext: opts.operationContext,
           skillText: checkpoint!.best_skill_text,
           tasks: split.test,
           targetModel: opts.targetModel,
           judgeModel: opts.judgeModel,
+          deadlineMs: deadline,
         });
         baselineTestScore = await scoreSkillOnTasks({
           engine: opts.engine,
+          operationContext: opts.operationContext,
           skillText: baselineText,
           tasks: split.test,
           targetModel: opts.targetModel,
           judgeModel: opts.judgeModel,
+          deadlineMs: deadline,
         });
       }
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('BudgetExhausted') || msg.includes('budget_exhausted')) {
-      outcome = 'aborted';
-      logEvent({
-        kind: 'abort',
-        run_id: runId,
-        skill: skillName,
-        reason: 'budget_exhausted',
-        detail: msg,
-      } as never);
-    } else if (msg.includes('skillopt_runtime_exceeded')) {
-      outcome = 'aborted';
-      logEvent({
-        kind: 'abort',
-        run_id: runId,
-        skill: skillName,
-        reason: 'runtime_exceeded',
-        detail: `exceeded --max-runtime-min ${opts.maxRuntimeMin}`,
-      } as never);
-    } else {
-      outcome = 'errored';
-      logEvent({
-        kind: 'abort',
-        run_id: runId,
-        skill: skillName,
-        reason: 'sigint',
-        detail: msg,
-      } as never);
-    }
+    const classified = classifyAbortError(err, opts);
+    outcome = classified.outcome;
+    abortReason = classified.abortReason;
+    abortDetail = classified.abortDetail;
+    logEvent({
+      kind: 'abort',
+      run_id: runId,
+      skill: skillName,
+      reason: abortReason,
+      detail: abortDetail,
+    } as never);
   }
 
   // If --no-mutate or bundled+!allowMutateBundled: write proposed.md instead.
@@ -732,6 +831,10 @@ async function runOptimizationLoop(
     started_at: checkpoint.started_at,
     ended_at: new Date().toISOString(),
     outcome,
+    // #3516: abort/error detail rides the receipt so --json consumers and the
+    // CLI's stderr summary both see WHY, not just that the run died.
+    ...(abortReason !== undefined ? { abort_reason: abortReason } : {}),
+    ...(abortDetail !== undefined ? { abort_detail: abortDetail } : {}),
     baseline_sel_score: baselineSelScore,
     best_sel_score: checkpoint.best_sel_score,
     ...(testScore !== undefined ? { test_score: testScore } : {}),

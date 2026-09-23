@@ -19,7 +19,7 @@
  * the lower 'title' tier — discarding the in-progress synopsis vectors so
  * the page's chunks NEVER end up mid-state on disk. Only after PHASE 1
  * completes successfully does PHASE 2 run a single DB transaction to
- * replace all chunks + stamp `contextual_retrieval_mode` +
+ * update the captured chunks' vectors + stamp `contextual_retrieval_mode` +
  * `corpus_generation`. Crash anywhere in PHASE 1 = page-level retry with
  * zero half-state. Crash during PHASE 2 = standard transaction rollback.
  *
@@ -62,6 +62,8 @@ import { runSlidingPool } from './worker-pool.ts';
 import type { BrainEngine } from './engine.ts';
 import type { ChunkInput, CRMode, Page } from './types.ts';
 import type { SourceRow } from './sources-ops.ts';
+import { installPageEmbeddings, readProjectionSnapshot, type ProjectionSnapshot } from './page-state/projections.ts';
+import { digest } from './persistence/digest.ts';
 
 /**
  * v3 = chunks embed with optional contextual retrieval wrapper. The
@@ -178,6 +180,23 @@ export function titleTierCorpusGeneration(): string {
 }
 
 /**
+ * #3883: resolve the synopsis output-token cap from the
+ * `models.synopsis_max_tokens` config key. Returns undefined when unset or
+ * invalid so generatePerChunkSynopsis falls back to its SYNOPSIS_MAX_TOKENS
+ * default (200). Clamped to a sane range (16..8192); fail-open on config
+ * errors (a config read failure must never block a re-embed).
+ */
+export async function resolveSynopsisMaxTokens(engine: BrainEngine): Promise<number | undefined> {
+  try {
+    const raw = await engine.getConfig('models.synopsis_max_tokens');
+    if (raw == null || raw === '') return undefined;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 16 && n <= 8192) return Math.floor(n);
+  } catch { /* fail-open to the page-summary default */ }
+  return undefined;
+}
+
+/**
  * Compute source_text_hash for D27 P1-4 cache key composition. The
  * synopsis cache invalidates correctly when adjacent text changes (page
  * content edit, frontmatter change, fallback chain different source).
@@ -191,7 +210,7 @@ export function computeSourceTextHash(sourceText: string): string {
  * `kind`:
  *
  *   success → all chunks embedded + page stamped, DB transaction committed
- *   skipped → mode='none' OR page has no chunks; no DB writes
+ *   skipped → missing/deleted, or mode='none'/no chunks with a guarded context stamp
  *   page_fallback → PHASE 1 detected a refusal/empty/malformed; restarted
  *      at lower tier; final tier in `mode_applied` is what landed
  *   transient_error → caller should retry (Minion job retries; inline
@@ -245,6 +264,12 @@ export interface ReembedPageArgs {
   /** Resolved provider-neutral model used for per-chunk synopsis generation. */
   synopsisModel?: string;
   /**
+   * #3883: output-token cap for each synopsis call. When omitted, the
+   * `models.synopsis_max_tokens` config is read once per page; when that is
+   * unset too, page-summary's SYNOPSIS_MAX_TOKENS default (200) applies.
+   */
+  synopsisMaxTokens?: number;
+  /**
    * @deprecated Use `synopsisModel`. Retained for callers compiled against
    * the pre-provider-neutral service shape.
    */
@@ -274,15 +299,42 @@ export async function reembedPageWithContextualRetrieval(
   args: ReembedPageArgs,
 ): Promise<ReembedPageResult> {
   // ── Load page + source + chunks ────────────────────────────────────
-  const page = await args.engine.getPage(args.pageSlug, { sourceId: args.sourceId });
-  if (!page) {
+  const initial = await args.engine.getPage(args.pageSlug, { sourceId: args.sourceId });
+  if (!initial) {
     return { kind: 'skipped', reason: 'page_missing' };
   }
-  if (page.deleted_at != null) {
+  if (initial.deleted_at != null) {
     return { kind: 'skipped', reason: 'soft_deleted' };
   }
 
-  const source = await loadSourceRow(args.engine, args.sourceId);
+  const prepared = await readProjectionSnapshot(args.engine, args.pageSlug, args.sourceId, { allowUnsealed: true });
+  if (!prepared) return { kind: 'skipped', reason: 'page_missing' };
+  const page = prepared.snapshot.page;
+  const source = await loadSourceRow(args.engine, page.source_id);
+  const superseded: ReembedPageResult = { kind: 'transient_error', cause: 'db',
+    detail: 'The page projection or contextual policy changed during preparation; retry from its current snapshot.' };
+  // The same guarded completion publishes vectors and their context together.
+  // Metadata-only branches also compare the raw inventory, including empty or
+  // intentionally unsealed pages; those chunks never reach a provider.
+  const publish = async (mode: CRMode, generation: string | null, embedded?: ChunkInput[]): Promise<ReembedPageResult | null> => {
+    try {
+      const installed = await args.engine.transaction(async tx => {
+        await tx.lockPageKeys([{ sourceId: page.source_id, slug: page.slug }]);
+        if (digest(sourcePolicy(await loadSourceRow(tx, page.source_id))) !== digest(sourcePolicy(source))) return false;
+        if (embedded) {
+          if (!await installPageEmbeddings(tx, prepared, embedded.map(chunk => ({ ...chunk, model: prepared.embeddingModel ?? undefined })))) return false;
+        } else {
+          const current = await readProjectionSnapshot(tx, page.slug, page.source_id, { allowUnsealed: true });
+          if (!sameProjection(prepared, current)) return false;
+        }
+        await tx.updatePageContextualRetrievalState(page.slug, page.source_id, mode, generation);
+        return true;
+      });
+      return installed ? null : superseded;
+    } catch (err) {
+      return { kind: 'transient_error', cause: 'db', detail: err instanceof Error ? err.message : String(err) };
+    }
+  };
 
   // ── Resolve effective mode (D5+D6+D15+D18) ─────────────────────────
   const resolution = resolveContextualRetrievalMode({
@@ -300,31 +352,26 @@ export async function reembedPageWithContextualRetrieval(
   // the page is up-to-date relative to current global state — prevents
   // the reindex sweep from re-walking pages that are already aligned.
   if (resolution.mode === 'none') {
-    await args.engine.updatePageContextualRetrievalState(
-      args.pageSlug,
-      args.sourceId,
-      'none',
-      null,
-    );
+    const failure = await publish('none', null);
+    if (failure) return failure;
     return { kind: 'skipped', reason: 'mode_none' };
   }
 
-  const chunks = await args.engine.getChunks(args.pageSlug, { sourceId: args.sourceId });
+  const chunks = prepared.chunks;
   if (chunks.length === 0) {
     // No chunks but page exists (frontmatter-only or empty). Stamp the
     // column anyway so subsequent reindex sweeps don't keep visiting.
-    await args.engine.updatePageContextualRetrievalState(
-      args.pageSlug,
-      args.sourceId,
-      resolution.mode,
+    const failure = await publish(resolution.mode,
       computeCorpusGeneration({
         crMode: resolution.mode,
         synopsisModel: args.synopsisModel ?? args.haikuModel ?? DEFAULT_SYNOPSIS_MODEL,
         synopsisDocMaxChars: resolution.mode === 'per_chunk_synopsis' ? SYNOPSIS_DOC_MAX_CHARS : undefined,
       }),
     );
+    if (failure) return failure;
     return { kind: 'skipped', reason: 'no_chunks' };
   }
+  if (page.text_projection_revision !== prepared.snapshot.revision) return superseded;
 
   // ── PHASE 1: in-memory build (no DB writes) ────────────────────────
   // Iterate at most twice — once at the requested tier, once at the
@@ -333,6 +380,10 @@ export async function reembedPageWithContextualRetrieval(
   // single bad chunk demotes the whole page to title-only so all
   // chunks on the page share the same wrapper shape.
   const synopsisModel = args.synopsisModel ?? args.haikuModel ?? DEFAULT_SYNOPSIS_MODEL;
+  // #3883: explicit arg wins; else the models.synopsis_max_tokens config;
+  // else undefined → page-summary's SYNOPSIS_MAX_TOKENS default (200).
+  const synopsisMaxTokens =
+    args.synopsisMaxTokens ?? (await resolveSynopsisMaxTokens(args.engine));
   let attemptMode: CRMode = resolution.mode;
   let fallbackReason: SynopsisFailureKind | null = null;
 
@@ -344,6 +395,7 @@ export async function reembedPageWithContextualRetrieval(
       chunks: chunks as ChunkInput[],
       args,
       synopsisModel,
+      synopsisMaxTokens,
     });
 
     if (phase1.kind === 'success') {
@@ -354,22 +406,8 @@ export async function reembedPageWithContextualRetrieval(
       });
 
       // ── PHASE 2: single DB transaction ───────────────────────────
-      try {
-        await args.engine.transaction(async (tx) => {
-          await tx.upsertChunks(args.pageSlug, phase1.embeddedChunks, {
-            sourceId: args.sourceId,
-          });
-          await tx.updatePageContextualRetrievalState(
-            args.pageSlug,
-            args.sourceId,
-            attemptMode,
-            corpus_generation,
-          );
-        });
-      } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        return { kind: 'transient_error', cause: 'db', detail };
-      }
+      const failure = await publish(attemptMode, corpus_generation, phase1.embeddedChunks);
+      if (failure) return failure;
 
       if (fallbackReason != null) {
         return {
@@ -445,8 +483,10 @@ async function tryBuildPhase1(opts: {
   chunks: ChunkInput[];
   args: ReembedPageArgs;
   synopsisModel: string;
+  /** #3883: resolved output-token cap (undefined → page-summary default). */
+  synopsisMaxTokens?: number;
 }): Promise<Phase1Result> {
-  const { attemptMode, page, chunks, args, synopsisModel } = opts;
+  const { attemptMode, page, chunks, args, synopsisModel, synopsisMaxTokens } = opts;
 
   // Build the wrapper prefix for THIS page. Title-only tier: one prefix
   // reused across all chunks. per_chunk_synopsis tier: prefix is built
@@ -506,6 +546,7 @@ async function tryBuildPhase1(opts: {
         page,
         args,
         synopsisModel,
+        synopsisMaxTokens,
       });
     },
   });
@@ -553,8 +594,10 @@ async function buildWrappedChunkText(opts: {
   page: Page;
   args: ReembedPageArgs;
   synopsisModel: string;
+  /** #3883: resolved output-token cap (undefined → page-summary default). */
+  synopsisMaxTokens?: number;
 }): Promise<string> {
-  const { chunk: c, sourceText, safeTitle, page, args, synopsisModel } = opts;
+  const { chunk: c, sourceText, safeTitle, page, args, synopsisModel, synopsisMaxTokens } = opts;
 
   // Code chunks always bypass the wrapper (D20-T4) — pass through.
   if (c.chunk_source === 'fenced_code') {
@@ -591,6 +634,7 @@ async function buildWrappedChunkText(opts: {
       chunkIndex: c.chunk_index,
       model: synopsisModel,
       abortSignal: args.abortSignal,
+      maxTokens: synopsisMaxTokens,
     });
   } finally {
     if (leaseAcquired && args.releaseSynopsisLease) {
@@ -672,7 +716,14 @@ function readSourceTextWithFallback(page: Page, chunks: ChunkInput[]): string {
     .join('\n\n');
 }
 
-async function loadSourceRow(engine: BrainEngine, sourceId: string): Promise<SourceRow> {
+/**
+ * Load one source row with the CR-relevant columns. Exported for reuse by
+ * the import path (#3885: stored `sources set-cr-mode` must apply on
+ * capture/reindex, not just the Minion backfill) and the conversation-parser
+ * body reader (#3911: relative raw_transcript resolves against the OWNING
+ * source's local_path). Throws when the source id is unknown.
+ */
+export async function loadSourceRow(engine: BrainEngine, sourceId: string): Promise<SourceRow> {
   const rows = await engine.executeRaw<SourceRow>(
     `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at,
             contextual_retrieval_mode, trust_frontmatter_overrides
@@ -683,6 +734,20 @@ async function loadSourceRow(engine: BrainEngine, sourceId: string): Promise<Sou
     throw new Error(`Source not found: ${sourceId}`);
   }
   return rows[0];
+}
+
+function sourcePolicy(source: SourceRow) {
+  return { id: source.id, mode: source.contextual_retrieval_mode ?? null,
+    trustFrontmatter: source.trust_frontmatter_overrides ?? false };
+}
+
+function sameProjection(prepared: ProjectionSnapshot, current: ProjectionSnapshot | null): boolean {
+  return current !== null && current.snapshot.revision === prepared.snapshot.revision
+    && current.snapshot.sourceIncarnation === prepared.snapshot.sourceIncarnation
+    && current.snapshot.page.id === prepared.snapshot.page.id
+    && current.snapshot.page.text_projection_revision === prepared.snapshot.page.text_projection_revision
+    && current.indexingContext === prepared.indexingContext
+    && digest(current.chunks) === digest(prepared.chunks);
 }
 
 function classifyEmbedError(err: unknown, detail: string): Phase1Transient | Phase1Permanent {

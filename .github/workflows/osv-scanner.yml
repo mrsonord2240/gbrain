@@ -12,12 +12,19 @@ on:
     paths:
       - 'bun.lock'
       - 'package.json'
+      - 'admin/bun.lock'
+      - 'admin/package.json'
   schedule:
     - cron: '30 6 * * 1'  # weekly, Monday 06:30 UTC
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Rapid pushes to the same PR previously queued duplicate scans.
+concurrency:
+  group: osv-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   osv-scan:

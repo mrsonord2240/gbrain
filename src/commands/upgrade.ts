@@ -1,19 +1,42 @@
+import { isZeroEntropyModel } from '../core/ai/defaults.ts';
 import { execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
 import { basename, join, dirname, resolve } from 'path';
+import { parseSemver, semverGt } from '../core/semver.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { VERSION } from '../version.ts';
 
 const GBRAIN_GITHUB_REPO = 'garrytan/gbrain';
 
-export async function runUpgrade(args: string[]) {
+/**
+ * Compare the post-swap resolved version against the caller's target (#4366).
+ * `bun update` exits 0 without upgrading exact-tag Git installs (the pin
+ * wins), so exit status alone cannot prove a swap happened. 'unverified'
+ * (missing/unparseable observed version) keeps legacy fail-open behavior —
+ * only a confirmed still-older version is a 'mismatch'.
+ */
+export function assessUpgradeOutcome(
+  target: string | undefined,
+  observed: string,
+): 'ok' | 'mismatch' | 'unverified' {
+  if (!target) return 'ok';
+  const t = parseSemver(target);
+  const o = parseSemver(observed.trim());
+  if (!t || !o) return 'unverified';
+  return semverGt(t, o) ? 'mismatch' : 'ok';
+}
+
+export async function runUpgrade(args: string[], opts: { targetVersion?: string } = {}) {
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: gbrain upgrade [--swap-only]\n\nSelf-update the CLI.\n\nDetects install method (bun, binary, clawhub) and runs the appropriate update.\nAfter upgrading, shows what\'s new and offers to set up new features.\n\n--swap-only  Perform ONLY the binary/source swap and skip post-upgrade\n             (migrations run on the next launch). Used by the autopilot\n             silent self-upgrade channel so the daemon can swap + relaunch\n             without a 30-min blocking post-upgrade inside its tick.');
+    console.log('Usage: gbrain upgrade [--swap-only] [--no-autopilot-install]\n\nSelf-update the CLI.\n\nDetects install method (bun, binary, clawhub) and runs the appropriate update.\nAfter upgrading, shows what\'s new and offers to set up new features.\n\n--no-autopilot-install  Skip autopilot installation and service rewrites, including package postinstall.\n                       Also supported as GBRAIN_NO_AUTOPILOT_INSTALL=1.\n--swap-only  Perform ONLY the binary/source swap and skip post-upgrade\n             (migrations run on the next launch). Used by the autopilot\n             silent self-upgrade channel so the daemon can swap + relaunch\n             without a 30-min blocking post-upgrade inside its tick.');
     return;
   }
 
   // --swap-only: do the swap, skip the (potentially 30-min) post-upgrade. The
   // relaunched binary runs migrations on boot (split-brain guard). v0.42.
   const swapOnly = args.includes('--swap-only');
+  const noAutopilotInstall = args.includes('--no-autopilot-install') || process.env.GBRAIN_NO_AUTOPILOT_INSTALL === '1';
+  const upgradeEnv = noAutopilotInstall ? { ...process.env, GBRAIN_NO_AUTOPILOT_INSTALL: '1' } : process.env;
 
   // Capture old version BEFORE upgrading (Codex finding: old binary runs this code)
   const oldVersion = VERSION;
@@ -32,7 +55,7 @@ export async function runUpgrade(args: string[]) {
       console.log(`Upgrading bun-link source clone at ${linkInfo.repoRoot}...`);
       try {
         execFileSync('git', ['-C', linkInfo.repoRoot, 'pull', '--ff-only'], { stdio: 'inherit', timeout: 120_000 });
-        execFileSync('bun', ['install'], { cwd: linkInfo.repoRoot, stdio: 'inherit', timeout: 120_000 });
+        execFileSync('bun', ['install'], { cwd: linkInfo.repoRoot, env: upgradeEnv, stdio: 'inherit', timeout: 120_000 });
         upgraded = true;
       } catch {
         console.error('Auto-upgrade failed. Try manually:');
@@ -45,7 +68,7 @@ export async function runUpgrade(args: string[]) {
       console.log('Upgrading via bun...');
       const bunGlobalRoot = resolveBunGlobalRoot();
       try {
-        execFileSync('bun', ['update', 'gbrain'], { cwd: bunGlobalRoot, stdio: 'inherit', timeout: 120_000 });
+        execFileSync('bun', ['update', 'gbrain'], { cwd: bunGlobalRoot, env: upgradeEnv, stdio: 'inherit', timeout: 120_000 });
         upgraded = true;
       } catch {
         console.error('Upgrade failed. Try running manually:');
@@ -66,6 +89,33 @@ export async function runUpgrade(args: string[]) {
         console.log('No published binary for this platform/arch.');
         console.log('Download the latest binary from GitHub Releases:');
         console.log('  https://github.com/garrytan/gbrain/releases');
+      } else if (
+        result.reason === 'integrity_failed' ||
+        result.reason === 'integrity_unavailable' ||
+        result.reason === 'version_mismatch'
+      ) {
+        // Fail-closed: the downloaded binary was never installed (renamed over
+        // the live path). "signed" is intentionally omitted — we match against
+        // the build-provenance attestation's digest + builder identity fetched
+        // over TLS from the GitHub API; we do NOT independently verify the
+        // Sigstore signature chain (see src/core/binary-self-update.ts header).
+        const detail =
+          result.reason === 'integrity_failed'
+            ? 'the downloaded binary did not match its build-provenance attestation (digest/builder mismatch)'
+            : result.reason === 'version_mismatch'
+              ? 'the downloaded binary reported a different version than the release it was fetched for (possible downgrade)'
+              : 'the build-provenance attestation could not be fetched (offline, rate-limited, or missing)';
+        console.error(`Binary self-update rejected — integrity not confirmed: ${detail}.`);
+        console.error('Your existing binary is unchanged and the download was discarded.');
+        console.error('Retry later, or download + verify manually:');
+        console.error('  https://github.com/garrytan/gbrain/releases');
+        recordUpgradeError({
+          phase: 'binary-self-update',
+          fromVersion: oldVersion,
+          toVersion: opts.targetVersion ?? result.targetVersion ?? 'unknown',
+          error: result.reason,
+          hint: 'Integrity check failed; existing binary retained. Retry or download manually.',
+        });
       } else {
         console.error(`Binary self-update failed (${result.reason}${result.error ? `: ${result.error}` : ''}).`);
         console.error('Your existing binary is unchanged. Download manually if needed:');
@@ -73,7 +123,7 @@ export async function runUpgrade(args: string[]) {
         recordUpgradeError({
           phase: 'binary-self-update',
           fromVersion: oldVersion,
-          toVersion: '',
+          toVersion: opts.targetVersion ?? result.targetVersion ?? 'unknown',
           error: `${result.reason}${result.error ? `: ${result.error}` : ''}`,
           hint: 'Download from https://github.com/garrytan/gbrain/releases',
         });
@@ -84,7 +134,7 @@ export async function runUpgrade(args: string[]) {
     case 'clawhub':
       console.log('Upgrading via ClawHub...');
       try {
-        execSync('clawhub update gbrain', { stdio: 'inherit', timeout: 120_000 });
+        execSync('clawhub update gbrain', { env: upgradeEnv, stdio: 'inherit', timeout: 120_000 });
         upgraded = true;
       } catch {
         console.error('ClawHub upgrade failed. Try: clawhub update gbrain');
@@ -101,6 +151,25 @@ export async function runUpgrade(args: string[]) {
 
   if (upgraded) {
     const newVersion = verifyUpgrade();
+    // #4366: a still-older resolved version means the swap never happened
+    // (exact-tag Git pins make `bun update` a successful no-op). Fail loudly
+    // and return BEFORE the breadcrumb/cache bookkeeping below, so the
+    // pending-upgrade marker survives and keeps nagging.
+    const target = opts.targetVersion;
+    if (target && assessUpgradeOutcome(target, newVersion) === 'mismatch') {
+      console.error(`Upgrade did not take effect: still running ${newVersion}, expected ${target}.`);
+      console.error('Exact-tag Git installs stay pinned through `bun update`. Reinstall with:');
+      console.error(`  bun add -g github:garrytan/gbrain#v${target}`);
+      recordUpgradeError({
+        phase: 'verify-target',
+        fromVersion: oldVersion,
+        toVersion: target,
+        error: `still running ${newVersion} after upgrade`,
+        hint: `bun add -g github:garrytan/gbrain#v${target}`,
+      });
+      setCliExitVerdict(1);
+      return;
+    }
     // Save old version for post-upgrade migration detection
     saveUpgradeState(oldVersion, newVersion);
 
@@ -136,7 +205,7 @@ export async function runUpgrade(args: string[]) {
       process.env.GBRAIN_POST_UPGRADE_TIMEOUT_MS || 1_800_000,
     );
     try {
-      execSync('gbrain post-upgrade', { stdio: 'inherit', timeout: postUpgradeTimeoutMs });
+      execFileSync('gbrain', ['post-upgrade', ...(noAutopilotInstall ? ['--no-autopilot-install'] : [])], { env: upgradeEnv, stdio: 'inherit', timeout: postUpgradeTimeoutMs });
     } catch (e) {
       // post-upgrade is best-effort, don't fail the upgrade. BUT leave a
       // trail so `gbrain doctor` can surface it and give the user a clear
@@ -288,7 +357,7 @@ function saveUpgradeState(oldVersion: string, newVersion: string) {
  * one-time informational banner, and rewrite an existing autopilot systemd unit
  * to Restart=always so the silent channel's exit-for-relaunch respawns.
  */
-async function applySelfUpgradeSetup(): Promise<void> {
+async function applySelfUpgradeSetup(noAutopilotInstall: boolean): Promise<void> {
   try {
     const { loadConfig, saveConfig } = await import('../core/config.ts');
     const cfg = loadConfig();
@@ -322,6 +391,7 @@ async function applySelfUpgradeSetup(): Promise<void> {
   } catch {
     /* best-effort */
   }
+  if (noAutopilotInstall) return;
   try {
     const { migrateSystemdUnitToRestartAlways } = await import('./autopilot.ts');
     const r = migrateSystemdUnitToRestartAlways();
@@ -335,8 +405,9 @@ async function applySelfUpgradeSetup(): Promise<void> {
 
 export async function runPostUpgrade(args: string[] = []): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: gbrain post-upgrade');
+    console.log('Usage: gbrain post-upgrade [--no-autopilot-install]');
     console.log('Prints feature pitches for new migrations and runs apply-migrations.');
+    console.log('--no-autopilot-install (or GBRAIN_NO_AUTOPILOT_INSTALL=1) skips autopilot installation and service rewrites.');
     console.log('Idempotent — safe to re-run any time.');
     return;
   }
@@ -355,7 +426,8 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   // autonomy), inform once, and rewrite an existing systemd unit to
   // Restart=always so the silent channel's exit-for-relaunch respawns. All
   // file-plane + mechanical + idempotent; never blocks the upgrade.
-  await applySelfUpgradeSetup();
+  const noAutopilotInstall = args.includes('--no-autopilot-install') || process.env.GBRAIN_NO_AUTOPILOT_INSTALL === '1';
+  await applySelfUpgradeSetup(noAutopilotInstall);
   // Cosmetic: print feature pitches for migrations newer than the prior binary.
   try {
     const statePath = join(process.env.HOME || '', '.gbrain', 'upgrade-state.json');
@@ -386,7 +458,7 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   // (autopilot install) doesn't hit a subprocess boundary.
   try {
     const { runApplyMigrations } = await import('./apply-migrations.ts');
-    await runApplyMigrations(['--yes', '--non-interactive']);
+    await runApplyMigrations(['--yes', '--non-interactive', ...(noAutopilotInstall ? ['--no-autopilot-install'] : [])]);
   } catch (e) {
     // Surface the error but don't throw — post-upgrade is best-effort.
     // Users can re-run `gbrain apply-migrations` manually if they want
@@ -463,6 +535,46 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
           // Banner is cosmetic; never block the upgrade.
         }
 
+        // Ambient-writeback consent ask (WP8): one-shot for EXISTING installs
+        // upgrading into the feature. Personal brains only; double-gated on
+        // its own sentinel + the setting being unset; [AGENT]-relayed;
+        // never auto-enables; its own try/catch lives inside.
+        {
+          const { runWritebackNudge } = await import('../core/onboard/writeback-nudge.ts');
+          await runWritebackNudge(engine, { context: 'post-upgrade' });
+        }
+
+        // Waiting-TTL pre-notice (one-shot, warn-before-act). The worker
+        // gates its first sweep behind the SAME flag via runWaitingTtlTick
+        // (notice → grace window → sweep) because daemon restarts never run
+        // this CLI path — this banner is the interactive channel. Stamping
+        // the ISO timestamp here starts the same grace clock, so an operator
+        // who sees this banner gets the full window to tune before anything
+        // is cancelled.
+        try {
+          const { admissionKilled, resolveTtlNames, countTtlExpiredWaiting, ttlNoticeGraceMs, TTL_NOTICE_SHOWN_KEY } =
+            await import('../core/minions/admission.ts');
+          const shown = await engine.getConfig(TTL_NOTICE_SHOWN_KEY);
+          if ((shown == null || shown.trim() === '') && !admissionKilled()) {
+            const ttlNames = await resolveTtlNames(engine);
+            const { total: affected, by_name } = await countTtlExpiredWaiting(engine, ttlNames);
+            const parts = [...ttlNames].map(([name, hours]) => `${name} > ${hours}h: ${by_name[name] ?? 0}`);
+            console.log('');
+            console.log(`⚠ [gbrain] Waiting-TTL is now active: queued jobs that never get claimed are`);
+            console.log(`  cancelled after their per-type TTL (${parts.join('; ') || 'defaults'}).`);
+            if (affected > 0) {
+              console.log(`  ${affected} currently-queued job(s) already exceed their TTL and will be`);
+              console.log(`  cancelled after a ${Math.round(ttlNoticeGraceMs() / 60_000)}min grace window`);
+              console.log(`  (auditable error_text; visible in 'gbrain jobs stats').`);
+            }
+            console.log(`  Tune or disable: gbrain config set minions.ttl_waiting_hours.<name> <hours|0>`);
+            console.log('');
+            await engine.setConfig(TTL_NOTICE_SHOWN_KEY, new Date().toISOString());
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
         // #3390: ZeroEntropy sunset notice. ZE announced (2026-07-24) that
         // its hosted endpoints — including /models/embed and /models/rerank —
         // shut down on 2026-09-04. Any brain resolving to a zeroentropyai:*
@@ -473,19 +585,40 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
         // `ze_sunset_notice_shown` (same pattern as the search-mode banner).
         try {
           const shown = await engine.getConfig('ze_sunset_notice_shown');
-          const { DEFAULT_EMBEDDING_MODEL } = await import('../core/ai/defaults.ts');
+          const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE } = await import('../core/ai/defaults.ts');
           const effectiveModel = cfgSchema.embedding_model ?? DEFAULT_EMBEDDING_MODEL;
-          const rerankerModel = await engine.getConfig('search.reranker.model');
-          const onZeEmbedding = effectiveModel.startsWith('zeroentropyai:');
-          const onZeReranker = !!rerankerModel?.startsWith('zeroentropyai:');
+          // Effective reranker via the plane search actually reranks with
+          // (mode bundle + search.reranker.* overrides) — the bare config
+          // key is unset by default while balanced/tokenmax rerank with the
+          // bundle's zeroentropyai model. Same resolution as the
+          // provider_sunset doctor check.
+          let rerankerModel: string | undefined;
+          try {
+            const { loadSearchModeConfig, resolveSearchMode } = await import('../core/search/mode.ts');
+            const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
+            if (knobs.reranker_enabled) rerankerModel = knobs.reranker_model;
+          } catch { /* no reranker-exposure claim */ }
+          const onZeEmbedding = isZeroEntropyModel(effectiveModel);
+          const onZeReranker = isZeroEntropyModel(rerankerModel);
           if (shown !== 'true' && (onZeEmbedding || onZeReranker)) {
+            // Paste-ready --dim from the ACTUAL column width (config can
+            // drift): keeping the current width avoids a needless dimension
+            // transition + index rebuild when the target supports it.
+            let colDims: number | null = null;
+            try {
+              const { readContentChunksEmbeddingDim } = await import('../core/embedding-dim-check.ts');
+              colDims = (await readContentChunksEmbeddingDim(engine)).dims;
+            } catch { /* fresh brain — canonical command carries its own --dim */ }
+            const { renderCanonicalMigrationCommands } = await import('../core/ai/defaults.ts');
+            const cmds = renderCanonicalMigrationCommands({ colDims });
             console.log('');
             console.log('═══════════════════════════════════════════════════════════════');
-            console.log('[gbrain] ACTION REQUIRED: ZeroEntropy hosted API sunsets 2026-09-04.');
+            console.log(`[gbrain] ACTION REQUIRED: ZeroEntropy hosted API sunsets ${ZEROENTROPY_SUNSET_DATE}.`);
             if (onZeEmbedding) {
               console.log(`[gbrain] This brain embeds with ${effectiveModel}. After the sunset,`);
-              console.log('[gbrain] semantic retrieval STOPS WORKING (queries can no longer be');
-              console.log('[gbrain] embedded against your existing vectors).');
+              console.log('[gbrain] semantic retrieval STOPS WORKING entirely — your EXISTING');
+              console.log('[gbrain] vectors become unqueryable (queries embed through the same');
+              console.log('[gbrain] endpoint), not just new content.');
             }
             if (onZeReranker) {
               console.log(`[gbrain] The reranker (${rerankerModel}) also sunsets; search falls`);
@@ -493,18 +626,67 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
             }
             console.log('═══════════════════════════════════════════════════════════════');
             console.log('');
-            console.log('Migrate before the sunset (resumable; preview cost first):');
-            console.log('  gbrain migrate embeddings --to <provider:model> --dry-run');
-            console.log('  gbrain migrate embeddings --to <provider:model>');
+            console.log('Two fixes, either works:');
             console.log('');
-            console.log('Self-hosting zembed-1 (weights are Apache-2.0) via llama-server /');
-            console.log('ollama also works and preserves your existing vectors — point');
-            console.log('embedding at the local endpoint instead of migrating.');
+            console.log('[1] Self-host the same model — zembed-1 weights are Apache-2.0. Keep the');
+            console.log('    zeroentropyai:zembed-1 id and point provider_base_urls.zeroentropyai');
+            console.log('    at a ZE-wire-compatible endpoint (NOT a generic OpenAI-compatible');
+            console.log('    server — the id speaks ZE\'s /models/embed dialect). Keeps every');
+            console.log('    vector; NO re-embed. See docs/guides/embedding-migration.md.');
+            console.log('');
+            console.log('[2] Migrate to another provider (resumable; preview cost first):');
+            console.log(`      ${cmds.recommendedDryRun}`);
+            console.log(`      ${cmds.recommended}`);
+            if (cmds.note) console.log(`    ${cmds.note}`);
+            if (cmds.openaiAlternative) {
+              console.log(`    Keep-width alternative: ${cmds.openaiAlternative}`);
+            }
             if (onZeReranker) {
+              console.log('');
               console.log('Reranker: gbrain config set search.reranker.enabled false (or pick another).');
             }
             console.log('');
+            console.log(`\`gbrain doctor\` will keep flagging this until the brain is off the`);
+            console.log('provider (check name: provider_sunset).');
+            console.log('');
             await engine.setConfig('ze_sunset_notice_shown', 'true');
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
+        // v0.46.3: stage-2 sunset notice, gated by `ze_sunset_notice_v2_shown`.
+        // Fires even for brains that saw stage 1 — this release ships the
+        // migration playbook + the Voyage default, and the exposure story
+        // widened (custom columns, env overrides, reranker-without-key).
+        // The gate opens on `exposed` and on `unknown` (fail-safe: nag rather
+        // than stay silent). Reranker-only exposure is COVERED by `exposed`:
+        // detectZeExposure sets status='exposed' whenever the resolved
+        // reranker is ZE (including the legacy bundle default), so an
+        // OpenAI/Voyage-embedding brain whose reranking rides the ZE bundle
+        // still opens the gate, and renderZeActionRequired includes the
+        // reranker paragraph.
+        try {
+          const shownV2 = await engine.getConfig('ze_sunset_notice_v2_shown');
+          if (shownV2 !== 'true') {
+            const { detectZeExposure, renderZeActionRequired } =
+              await import('../core/ze-exposure.ts');
+            const exposure = await detectZeExposure(engine);
+            if (exposure.status === 'exposed' || exposure.status === 'unknown') {
+              console.log('');
+              console.log('═══════════════════════════════════════════════════════════════');
+              console.log('[gbrain] ACTION REQUIRED — ZeroEntropy shutdown (v0.46.3 notice)');
+              console.log('═══════════════════════════════════════════════════════════════');
+              for (const line of renderZeActionRequired(exposure).split('\n')) {
+                console.log(`[gbrain] ${line}`);
+              }
+              console.log('[AGENT] Relay this to your operator: this brain needs an embedding/');
+              console.log('[AGENT] reranker migration before the shutdown date. Playbook:');
+              console.log('[AGENT] skills/migrations/v0.46.3.0.md');
+              console.log('═══════════════════════════════════════════════════════════════');
+              console.log('');
+              await engine.setConfig('ze_sunset_notice_v2_shown', 'true');
+            }
           }
         } catch {
           // Banner is cosmetic; never block the upgrade.
@@ -516,36 +698,48 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
         // One-time, gated by `mcp.publish_skills_prompted`. Strongly recommended.
         try {
           const prompted = await engine.getConfig('mcp.publish_skills_prompted');
-          const current = await engine.getConfig('mcp.publish_skills');
+          const { loadConfigFileOnly } = await import('../core/config.ts');
+          const filePublication = loadConfigFileOnly()?.mcp?.publish_skills;
+          const current = await engine.getConfig('mcp.publish_skills') ?? (filePublication == null ? null : String(filePublication));
           if (prompted !== 'true' && current == null) {
-            const { autoDetectSkillsDir } = await import('../core/repo-root.ts');
-            const det = autoDetectSkillsDir();
-            const dirLine = det.dir
-              ? `Skills dir: ${det.dir} (source: ${det.source})`
-              : 'Skills dir: not auto-detected — set $GBRAIN_SKILLS_DIR or mcp.skills_dir before enabling.';
+            const sources = await engine.executeRaw<{ id: string }>('SELECT id FROM sources WHERE NOT archived AND local_path IS NOT NULL');
+            const dirLine = sources.length
+              ? `${sources.length} registered content source(s); shared skills require reviewed source-local publication.`
+              : 'No registered content root: choose a canonical source and complete host content migration first.';
             console.log('');
             console.log('═══════════════════════════════════════════════════════════════');
             console.log('[gbrain] Publish your skills to MCP clients?');
             console.log('[gbrain] Codex desktop, Claude Code/Cowork, and Perplexity can then');
-            console.log("[gbrain] DISCOVER and FOLLOW your agent's skills over `gbrain serve`.");
+            console.log('[gbrain] DISCOVER approved source-scoped skill prose over `gbrain serve`.');
             console.log('[gbrain] This makes your MCP server dramatically more useful.');
             console.log('[gbrain]');
             console.log(`[gbrain] ${dirLine}`);
             console.log('[gbrain] Effect: the CONTENTS of your SKILL.md files become readable by');
             console.log('[gbrain] remote MCP callers you have authorized. Source code is NOT exposed.');
+            console.log('[gbrain] Following updates, bundle bytes and skill editing require separate approval.');
             console.log('═══════════════════════════════════════════════════════════════');
             const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
             let enabled = false;
             if (isTty) {
               const { createInterface } = await import('readline');
+              // #4318 residual: rl.close() must not run before the answer's
+              // resolveAns() — the unguarded rl.on('close', ...) below would
+              // otherwise settle the promise `false` first (the close event
+              // fires synchronously during rl.close()), so an operator
+              // pressing Enter to accept this [Y/n]-default-yes prompt would
+              // always land on "declined" regardless of what they typed.
               enabled = await new Promise<boolean>((resolveAns) => {
                 const rl = createInterface({ input: process.stdin, output: process.stdout });
+                let answered = false;
                 rl.question('[gbrain] Enable skill publishing now? (recommended) [Y/n] ', (answer) => {
-                  rl.close();
+                  answered = true;
                   const a = answer.trim().toLowerCase();
                   resolveAns(a === '' || a === 'y' || a === 'yes');
+                  rl.close();
                 });
-                rl.on('close', () => resolveAns(false));
+                rl.on('close', () => {
+                  if (!answered) resolveAns(false);
+                });
               });
             } else {
               console.log('[AGENT] Relay this to your operator. Recommended: enable it.');
@@ -666,18 +860,46 @@ export async function postUpgradeReferenceSweep(
     if (path.resolve(targetWorkspace) === path.resolve(gbrainRoot)) return;
 
     const result = runReferenceAll({ gbrainRoot, targetWorkspace });
-    // Print only skills that (a) the host has actually scaffolded, AND
-    // (b) have at least one differs or missing entry. Pure-`missing`
-    // skills the host never scaffolded are noise; skip them.
+    // Drifted = skills the host has actually scaffolded that now differ from
+    // the bundle (local edits are legitimate — this is advisory).
     const drifted = result.skills.filter(
       s =>
         s.summary.identical + s.summary.differs > 0 &&
         (s.summary.differs > 0 || s.summary.missing > 0),
     );
-    if (drifted.length === 0) return;
+
+    // New = skills the host never scaffolded (own body absent). These used to
+    // be filtered out as "noise", which meant an upgrade that shipped brand-new
+    // skills said nothing about them. Surface them via the currency classifier
+    // (own-files aware) so new capability is discoverable — but ONLY for a host
+    // that has already scaffolded at least one skill (a skills user missing the
+    // new ones). A host with zero scaffolded skills has opted out; surfacing
+    // every bundled skill on every upgrade would be exactly the noise the old
+    // filter avoided, so it stays silent for them.
+    let newSkills: string[] = [];
+    try {
+      const { computeSkillCurrency } = await import('../core/skillpack/skill-currency.ts');
+      const currency = computeSkillCurrency({ gbrainRoot, targetWorkspace });
+      const hasScaffolded = currency.counts.current > 0 || currency.counts.drifted > 0;
+      if (hasScaffolded) {
+        newSkills = currency.skills.filter(s => s.status === 'new').map(s => s.slug);
+      }
+    } catch {
+      // Best-effort; drift report still prints below.
+    }
+
+    if (drifted.length === 0 && newSkills.length === 0) return;
 
     console.log('');
-    console.log('Skillpack reference sweep (post-upgrade):');
+    console.log('Skillpack sweep (post-upgrade):');
+    if (newSkills.length > 0) {
+      const shown = newSkills.slice(0, 10);
+      console.log(
+        `  ${newSkills.length} new built-in skill(s) not installed here: ${shown.join(', ')}` +
+          (newSkills.length > shown.length ? `, … +${newSkills.length - shown.length} more` : ''),
+      );
+      console.log('  Add them all: `gbrain skillpack sync`');
+    }
     for (const s of drifted) {
       console.log(
         `  ${s.slug.padEnd(40)} differs:${s.summary.differs} missing:${s.summary.missing}`,
@@ -685,7 +907,7 @@ export async function postUpgradeReferenceSweep(
     }
     console.log('');
     console.log(
-      'Run `gbrain skillpack reference <slug>` to inspect per-skill diffs.\nSee `skills/_AGENT_README.md` for what your agent should do on update.\nSkip this sweep: `GBRAIN_SKIP_REFERENCE_SWEEP=1`.',
+      'New skills → `gbrain skillpack sync`. Drifted skills → `gbrain skillpack reference <slug>` (local edits are yours; nothing is overwritten).\nSee `skills/_AGENT_README.md` for what your agent should do on update.\nSkip this sweep: `GBRAIN_SKIP_REFERENCE_SWEEP=1`.',
     );
   } catch {
     // Best-effort. Never block post-upgrade.

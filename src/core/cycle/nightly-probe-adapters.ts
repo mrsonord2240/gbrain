@@ -21,6 +21,7 @@ import { readFileSync, existsSync } from 'node:fs';
 export interface LongMemEvalProbeArgs {
   fixturePath: string;
   outputPath: string;
+  searchConfigSnapshot?: Record<string, string>;
 }
 
 /** Arguments accepted by the cross-modal adapter. */
@@ -47,14 +48,15 @@ export interface CrossModalBatchSummary {
  * The CLI's first positional arg is `<dataset.jsonl>` (fixturePath).
  * `--output PATH` writes per-question rows.
  *
- * The CLI calls `process.exit(1)` on errors. The adapter doesn't trap
- * exit — the caller (nightly-quality-probe phase) wraps in try/catch and
- * treats any exit-style failure as a probe failure that doesn't crash
- * autopilot.
+ * Embedded failures throw so the nightly phase can audit the failure
+ * without terminating autopilot. Standalone CLI invocations still exit.
  */
 export async function runLongMemEvalForProbe(args: LongMemEvalProbeArgs): Promise<void> {
   const { runEvalLongMemEval } = await import('../../commands/eval-longmemeval.ts');
-  await runEvalLongMemEval([args.fixturePath, '--output', args.outputPath]);
+  await runEvalLongMemEval(
+    [args.fixturePath, '--output', args.outputPath],
+    { searchConfigSnapshot: args.searchConfigSnapshot, exitOnError: false },
+  );
 }
 
 /**

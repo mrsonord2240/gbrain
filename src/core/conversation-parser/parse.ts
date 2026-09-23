@@ -300,6 +300,13 @@ function monthNameToIndex(name: string): number {
   return MONTHS_SHORT.indexOf(name.toLowerCase().slice(0, 3));
 }
 
+// #4136 — folded-heading detection constants. The label capture is capped at
+// 48 chars (privacy: labels can carry page text into stderr/JSON) and the
+// list at 10 entries per parse.
+const UNRECOGNIZED_HEADING_RE = /^(#{1,6})\s+(.{1,48}?)\s*:?\s*$/;
+const FENCE_RE = /^(```|~~~)/;
+const MAX_UNRECOGNIZED_HEADINGS = 10;
+
 /**
  * Apply ONE pattern to the full body. Returns the matched messages
  * with their ISO timestamps. Handles multi-line continuations per D5.
@@ -318,6 +325,7 @@ export function applyPattern(
   body: string,
   entry: PatternEntry,
   dateCtx: DateContext,
+  diag?: { unrecognized_headings: string[]; date_fallback_count?: number },
 ): MatchedMessage[] {
   if (!body) return [];
   const out: MatchedMessage[] = [];
@@ -327,10 +335,50 @@ export function applyPattern(
   // while advancing a local date anchor as those headings are encountered.
   const runningCtx: DateContext = { ...dateCtx };
   const dateHeaderRe = /^#{1,4}\s+(\d{4}-\d{2}-\d{2})\s*$/;
+  // #4136 — when the WINNING pattern anchors on headings, a heading-shaped
+  // line whose label is outside the pattern's closed speaker set is not
+  // rejected and not reported: it folds into the PREVIOUS turn's body
+  // (heading line and all), or drops silently before the first anchor.
+  // The parse still returns phase 'regex_match', so one speaker gets
+  // credited with another's words and nothing downstream declines. Detection
+  // is diagnostic-only (zero behavior change here): collect the folded
+  // labels so ParseResult can surface them. Fence-aware so a transcript
+  // whose answers paste markdown/shell inside code fences is not flagged.
+  const headingAnchored =
+    diag !== undefined &&
+    entry.multi_line === true &&
+    entry.score_continuations_as_body === true &&
+    (entry.test_positive ?? []).some((s) => /^#{2,3}\s/.test(s));
+  let fenceMarker: '```' | '~~~' | null = null;
+  const collectFoldedHeading = (line: string): void => {
+    if (!headingAnchored || fenceMarker !== null || !diag) return;
+    if (diag.unrecognized_headings.length >= MAX_UNRECOGNIZED_HEADINGS) return;
+    const h = UNRECOGNIZED_HEADING_RE.exec(line);
+    if (!h) return;
+    const label = h[2].trim();
+    // Speaker-shaped-ish cap: ≤3 whitespace tokens, no sentence punctuation
+    // tail — long prose headings are section titles, not lost speakers.
+    if (!label || label.split(/\s+/).length > 3 || /[.!?]$/.test(label)) return;
+    if (entry.regex.test(line)) return; // a real anchor, not a fold
+    if (!diag.unrecognized_headings.includes(label)) diag.unrecognized_headings.push(label);
+  };
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
     const line = rawLine.trim();
     if (!line) continue;
+    if (headingAnchored) {
+      // Adversarial F6 (partial): a fence closes only on ITS OWN marker —
+      // CommonMark treats a mismatched marker as content, so `~~~` must not
+      // close a ```-opened fence. (An UNCLOSED fence still suppresses
+      // detection for the rest of the document — CommonMark-consistent, and
+      // the fail direction is warn-noise-free but detection-free; noted in
+      // the PR body as a known residual for truncated-LLM-output corpora.)
+      const fm = FENCE_RE.exec(line)?.[1] as '```' | '~~~' | undefined;
+      if (fm) {
+        if (fenceMarker === null) fenceMarker = fm;
+        else if (fenceMarker === fm) fenceMarker = null;
+      }
+    }
 
     const dateHeader = dateHeaderRe.exec(line);
     if (dateHeader) {
@@ -340,6 +388,7 @@ export function applyPattern(
 
     // Quick-reject fast path.
     if (entry.quick_reject && !entry.quick_reject.test(line)) {
+      collectFoldedHeading(line); // #4136 — folded below or dropped pre-anchor
       // Continuation handling for orphan lines.
       if (out.length > 0) {
         out[out.length - 1].text = out[out.length - 1].text
@@ -351,8 +400,17 @@ export function applyPattern(
 
     const m = entry.regex.exec(line);
     if (m) {
-      const iso = buildIso(m, entry, runningCtx);
-      if (iso === null) continue; // reconstruction failed; skip line
+      let iso = buildIso(m, entry, runningCtx);
+      if (iso === null) {
+        // Reconstruction failed (e.g. a localized month name). Dropping the
+        // anchor would fold this message's body into the PREVIOUS speaker
+        // (silent misattribution, phase still regex_match), so open the
+        // message anyway and count it. Inherit the previous anchor's
+        // timestamp so ordering and downstream segment continuity survive;
+        // midnight of the page date only when this is the first anchor.
+        iso = out[out.length - 1]?.timestamp ?? `${runningCtx.fallbackDate}T00:00:00Z`;
+        if (diag) diag.date_fallback_count = (diag.date_fallback_count ?? 0) + 1;
+      }
       const rawSpeaker = m[entry.captures.speaker_group] ?? '';
       const speaker = cleanSpeaker(rawSpeaker, entry.speaker_clean);
       let text = '';
@@ -363,11 +421,16 @@ export function applyPattern(
       // (Even when text_group is set, multi_line=true means SUBSEQUENT
       // non-anchor lines also absorb into this message's body.)
       out.push({ speaker, timestamp: iso, text });
-    } else if (out.length > 0) {
-      // Continuation line.
-      out[out.length - 1].text = out[out.length - 1].text
-        ? `${out[out.length - 1].text}\n${line}`
-        : line;
+    } else {
+      // Passed quick_reject but failed the full regex (e.g. '## Assistant
+      // Bot' against the closed-set heading pattern) — the OTHER fold site.
+      collectFoldedHeading(line); // #4136
+      if (out.length > 0) {
+        // Continuation line.
+        out[out.length - 1].text = out[out.length - 1].text
+          ? `${out[out.length - 1].text}\n${line}`
+          : line;
+      }
     }
   }
   return out;
@@ -392,7 +455,7 @@ function getNonBlankLines(body: string, headCap?: number): string[] {
  * window) and `scorePatternFull` (whole body) delegate here so the
  * quick_reject + regex loop lives in one place. Reused by
  * `parseConversation`'s fallback path which pre-splits ONCE and
- * passes the array to all 17 candidates (saves 16 redundant body
+ * passes the array to all 18 candidates (saves 17 redundant body
  * splits per fallback pass).
  */
 function scoreFromLines(
@@ -403,24 +466,62 @@ function scoreFromLines(
   let anchored = 0;
   let anchorCandidates = 0;
   let firstLineAnchored = false;
+  let firstAnchorIndex = -1;
+  // Only populated when score_continuations_min_distinct_speakers is set
+  // (avoids a Set + exec() per line for every other pattern, which only
+  // needs the boolean match `test()` already gave before this change).
+  const tracksDistinctSpeakers =
+    entry.score_continuations_min_distinct_speakers !== undefined;
+  const distinctSpeakers: Set<string> | undefined = tracksDistinctSpeakers
+    ? new Set()
+    : undefined;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
     if (entry.quick_reject && !entry.quick_reject.test(line)) {
       continue;
     }
     anchorCandidates++;
-    if (entry.regex.test(line)) {
+    let isMatch: boolean;
+    if (distinctSpeakers) {
+      const m = entry.regex.exec(line);
+      isMatch = m !== null;
+      if (m) {
+        const speaker = m[entry.captures.speaker_group];
+        if (speaker) distinctSpeakers.add(speaker);
+      }
+    } else {
+      isMatch = entry.regex.test(line);
+    }
+    if (isMatch) {
       anchored++;
       if (index === 0) firstLineAnchored = true;
+      if (firstAnchorIndex === -1) firstAnchorIndex = index;
     }
   }
+
+  const distinctSpeakersOk =
+    entry.score_continuations_min_distinct_speakers === undefined ||
+    (distinctSpeakers?.size ?? 0) >=
+      entry.score_continuations_min_distinct_speakers;
+  // Bounds how far into the body the FIRST anchor may appear before the
+  // candidate-only density score activates. A genuine export's anchor
+  // grammar starts near the top of the body (allowing a short title/heading
+  // preamble); an anchor pair merely embedded deep inside an unrelated long
+  // document — which would otherwise get the SAME density immunity once
+  // both roles are present — sits far past this bound instead.
+  const preambleOk =
+    entry.score_continuations_max_preamble_lines === undefined ||
+    (firstAnchorIndex !== -1 &&
+      firstAnchorIndex <= entry.score_continuations_max_preamble_lines);
 
   if (
     entry.score_continuations_as_body &&
     entry.multi_line &&
     entry.quick_reject &&
     anchorCandidates > 0 &&
-    (anchored >= 2 || firstLineAnchored)
+    (anchored >= 2 || firstLineAnchored) &&
+    distinctSpeakersOk &&
+    preambleOk
   ) {
     return anchored / anchorCandidates;
   }
@@ -568,7 +669,8 @@ export function parseConversation(
     };
   }
 
-  const messages = applyPattern(body, top.entry, dateCtx);
+  const diag = { unrecognized_headings: [] as string[], date_fallback_count: 0 };
+  const messages = applyPattern(body, top.entry, dateCtx, diag);
 
   // Timezone warning surface (D19).
   let timezone_warning: string | undefined;
@@ -586,6 +688,12 @@ export function parseConversation(
     matched_pattern_id: top.entry.id,
     patterns_scored: patternsScored,
     timezone_warning,
+    // Anchors rescued onto a fallback timestamp; undefined when zero.
+    date_fallback_count: diag.date_fallback_count || undefined,
+    // #4136 — populated unconditionally (NOT behind opts.diagnostic): the
+    // extractor's decline gate depends on it. Undefined when empty.
+    unrecognized_headings:
+      diag.unrecognized_headings.length > 0 ? diag.unrecognized_headings : undefined,
     unmatched_line_count: opts.diagnostic
       ? body
           .split(/\r?\n/)

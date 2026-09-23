@@ -50,7 +50,6 @@ import {
 import { resolveSearchMode, loadSearchModeConfig } from '../../search/mode.ts';
 import { resolveModel } from '../../model-config.ts';
 import { DEFAULT_SYNOPSIS_MODEL } from '../../page-summary.ts';
-import { registerConfigSelectedChatModel } from '../../ai/gateway.ts';
 
 /**
  * Default global concurrency cap for contextual synopsis calls. The public
@@ -168,7 +167,6 @@ export function makeContextualReindexHandler(opts: MakeContextualReindexHandlerO
     const chunkConcurrency = resolveContextualChunkConcurrency();
     const synopsisModel = await resolveContextualSynopsisModel(engine);
     const leaseSettings = resolveContextualSynopsisLeaseSettings(synopsisModel);
-    registerConfigSelectedChatModel(synopsisModel);
 
     const result: ReembedPageResult = await reembedPage({
       engine,
@@ -208,9 +206,10 @@ export function makeContextualReindexHandler(opts: MakeContextualReindexHandlerO
         );
       },
       releaseSynopsisLease: async (lease) => {
-        if (typeof lease === 'number') {
-          await releaseLease(engine, lease);
-        }
+        // acquireLease coerces the id to a number at the seam; a strict
+        // typeof check here used to skip the release when Postgres handed
+        // the BIGSERIAL back as a native BigInt, idling every slot to TTL.
+        if (lease != null) await releaseLease(engine, lease as number);
       },
     });
 

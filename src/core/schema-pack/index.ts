@@ -98,6 +98,8 @@ export {
 
 export {
   loadActivePack,
+  loadResolvedPackByName,
+  resolveLoadedPack,
   resolveActivePackNameOnly,
   __setPackLocatorForTests,
   _resetPackLocatorForTests,
@@ -112,6 +114,16 @@ export {
   validateSchemaPackTrustGate,
   loadActivePackForOp,
 } from './op-trust-gate.ts';
+
+export {
+  loadActivePackForEngine,
+  engineSchemaInput,
+  approvedSchemaIdentity,
+  checkApprovedSchemaForEngine,
+  SchemaApprovalError,
+  type ApprovedSchemaIdentity,
+  type ApprovedSchemaCheck,
+} from './engine-resolution.ts';
 
 export {
   inferLinkTypeFromPack,
