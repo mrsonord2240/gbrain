@@ -65,11 +65,14 @@ export async function runCall(
   const jsonStr = rest[1];
 
   if (!tool) {
-    console.error("Usage: gbrain call [--source <id>] <tool> '<json>'");
+    console.error("Usage: gbrain call [--source <id>] <tool> '<json>' | -   (- reads the JSON from stdin)");
     process.exit(1);
   }
 
-  const params = jsonStr ? JSON.parse(jsonStr) : {};
+  // `-` reads params from stdin: large payloads (skill files, transcripts) overflow the
+  // OS command-line limit when passed inline (Windows fails or crashes past ~16 KB).
+  const raw = jsonStr === '-' ? await Bun.stdin.text() : jsonStr;
+  const params = raw ? JSON.parse(raw) : {};
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('Tool parameters must be a JSON object.');
   // Parse and submit before acquiring PGLite. Keep the generated request ID
   // on the direct path as well, and never reconnect after ambiguous delivery.
