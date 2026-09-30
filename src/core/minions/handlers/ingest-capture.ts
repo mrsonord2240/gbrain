@@ -236,6 +236,60 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
       remote: untrustedPayload,
     };
 
+    // Fork patch (2026-09-29): a managed brain refuses importFromContent's
+    // legacy writer ("direct content import cannot mutate a managed brain"),
+    // so every POST /ingest capture died in the worker. Route through the
+    // put_page operation, which submits to the persistence coordinator.
+    // The same `remote` trust flag applies, so untrusted bodies still have
+    // gate-owned markers stripped. RETIREMENT TRIGGER: drop this branch when
+    // upstream's ingest_capture handles managed brains itself.
+    const [persistence] = await engine.executeRaw<{ enabled: boolean }>(
+      'SELECT enabled FROM persistence_brain WHERE singleton=1',
+    );
+    if (persistence?.enabled === true) {
+      const { operations } = await import('../../operations.ts');
+      const putPage = operations.find(op => op.name === 'put_page');
+      if (!putPage) throw new Error('ingest_capture: put_page operation is missing');
+      // Stable per capture, so a retried job re-reads the same receipt.
+      const h = event.content_hash.replace(/[^0-9a-f]/gi, '').padEnd(32, '0');
+      const requestId = `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+      let out: { chunks?: number; outcome?: { chunks?: number } } | undefined;
+      try {
+      out = await putPage.handler({
+        engine,
+        config: { engine: 'postgres' },
+        sourceId: sourceId ?? 'default',
+        remote: untrustedPayload,
+        dryRun: false,
+        logger: {
+          info: (m: string) => process.stderr.write(`[ingest_capture] ${m}\n`),
+          warn: (m: string) => process.stderr.write(`[ingest_capture] WARN: ${m}\n`),
+          error: (m: string) => process.stderr.write(`[ingest_capture] ERROR: ${m}\n`),
+        },
+      } as never, {
+        slug,
+        content: event.content,
+        force: true,
+        request_id: requestId,
+        source_kind: event.source_kind,
+        source_uri: event.source_uri,
+        ingested_via: 'ingest_capture',
+      }) as typeof out;
+      } catch (err) {
+        // Accepted but not yet committed: the coordinator owns it from here.
+        if ((err as { code?: string })?.code !== 'write_pending') throw err;
+      }
+      return {
+        slug,
+        status: 'imported',
+        chunks: out?.chunks ?? out?.outcome?.chunks ?? 0,
+        untrusted_payload: untrustedPayload,
+        source_kind: event.source_kind,
+        source_uri: event.source_uri,
+        ...(sourceFallback ? { source_fallback: sourceFallback } : {}),
+      };
+    }
+
     let result;
     try {
       result = await importFromContent(engine, slug, event.content, { ...importOpts, sourceId });
