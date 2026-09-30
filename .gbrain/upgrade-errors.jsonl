@@ -1,0 +1,3 @@
+{"ts":"2026-09-29T14:00:35.881Z","phase":"verify-target","from_version":"0.54.1.1","to_version":"0.59.20.0","error":"still running 0.54.1.1 after upgrade","hint":"bun add -g github:garrytan/gbrain#v0.59.20.0"}
+{"ts":"2026-09-29T14:06:11.144Z","phase":"verify-target","from_version":"0.54.1.1","to_version":"0.59.20.0","error":"still running 0.54.1.1 after upgrade","hint":"bun add -g github:garrytan/gbrain#v0.59.20.0"}
+{"ts":"2026-09-29T14:07:39.262Z","phase":"verify-target","from_version":"0.54.1.1","to_version":"0.59.20.0","error":"still running 0.54.1.1 after upgrade","hint":"bun add -g github:garrytan/gbrain#v0.59.20.0"}
