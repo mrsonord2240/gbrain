@@ -23,7 +23,8 @@ export function readBundleFile(path: string, root: string): { bytes: Buffer; mod
   const rel = relative(root, path);
   if (!isAbsolute(path) || path !== resolve(path) || !rel || isAbsolute(rel) || rel.startsWith(`..${sep}`) || rel === '..'
     || !rel.isWellFormed() || rel !== rel.normalize('NFC')
-    || rel.split(sep).length > BUNDLE_FILE_LIMITS.depth || /[\\\x00-\x1f:]/.test(rel)) throw unsafe();
+    // win32: `rel` uses `\` as its separator, so check the characters of each segment.
+    || rel.split(sep).length > BUNDLE_FILE_LIMITS.depth || /[\\\x00-\x1f:]/.test(sep === '\\' ? rel.split(sep).join('/') : rel)) throw unsafe();
   if (realpathSync(root) !== root || !lstatSync(root).isDirectory()) throw unsafe();
   const parts = rel.split(sep);
   let current = root;
@@ -111,17 +112,26 @@ export function assertBundleRecoveryBinding(record: BundleRecoveryRecord, bindin
   }
 }
 
+// win32 st_mode only carries a read-only bit (0o444 vs 0o666); compare the write bit there.
+function sameFileMode(actual: number, expected: number): boolean {
+  return process.platform === 'win32' ? (actual & 0o200) === (expected & 0o200) : actual === expected;
+}
+
 export function bundleFileHash(record: FileRecoveryRecord): string | null {
   const current = readBundleFile(record.path, record.root);
   const hash = current ? sha256(current.bytes) : null;
   const expectedMode = hash === record.beforeHash ? record.mode : record.afterMode ?? record.mode;
-  if (current && expectedMode !== null && current.mode !== expectedMode) throw new OperationError('unexpected_file_bytes', 'A canonical skill file mode changed outside publication.');
+  if (current && expectedMode !== null && !sameFileMode(current.mode, expectedMode)) throw new OperationError('unexpected_file_bytes', 'A canonical skill file mode changed outside publication.');
   return hash;
 }
 
 function flushBundleDirectory(directory: string): void {
-  const fd = openSync(directory, 'r');
-  try { fsyncSync(fd); } finally { closeSync(fd); }
+  // Same tolerance as coordinator.ts / identity.ts: Windows cannot fsync a directory fd.
+  let fd: number | undefined;
+  try { fd = openSync(directory, 'r'); fsyncSync(fd); }
+  catch (error) {
+    if (!(process.platform === 'win32' && ['EISDIR', 'EPERM', 'EINVAL', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? ''))) throw error;
+  } finally { if (fd !== undefined) closeSync(fd); }
 }
 
 export function stageBundleFile(file: MutationFile, record: FileRecoveryRecord): void {
@@ -165,7 +175,8 @@ export function publishStagedBundleFile(record: FileRecoveryRecord, boundary?: (
     if (!stage) throw unsafe();
     const staged = readBundleFile(stage.path, record.root);
     if (!staged || staged.bytes.byteLength !== stage.bytes || sha256(staged.bytes) !== stage.hash
-      || stage.hash !== record.afterHash || staged.mode !== (record.afterMode ?? record.mode)) throw unsafe();
+      || stage.hash !== record.afterHash || (record.afterMode ?? record.mode) === null
+      || !sameFileMode(staged.mode, (record.afterMode ?? record.mode)!)) throw unsafe();
     renameSync(stage.path, record.path);
   }
   boundary?.('file_replaced');

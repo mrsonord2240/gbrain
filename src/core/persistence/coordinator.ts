@@ -66,8 +66,12 @@ function publishFile(file: NonNullable<PreparedMutation['file']>, stagingPath?: 
   } else atomicWriteFileSync(file.path, file.content, { durable: true, stagingPath, afterStagingFlush: () => {
     if (mode !== undefined && mode !== null && stagingPath) {
       chmodSync(stagingPath, mode);
-      const fd = openSync(stagingPath, 'r');
-      try { fsyncSync(fd); } finally { closeSync(fd); }
+      // Windows FlushFileBuffers needs write access; a read-only handle gets EPERM.
+      let fd: number | undefined;
+      try { fd = openSync(stagingPath, 'r'); fsyncSync(fd); }
+      catch (error) {
+        if (!(process.platform === 'win32' && ['EISDIR','EPERM','EINVAL','ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? ''))) throw error;
+      } finally { if (fd !== undefined) closeSync(fd); }
     }
     afterStagingFlush?.();
   } });
