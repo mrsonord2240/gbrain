@@ -25,6 +25,10 @@ import { VERSION as GBRAIN_BINARY_VERSION } from '../version.ts';
 import { schemaVersionHealth } from '../core/schema-version-health.ts';
 import { zeroTotalContradictionsCheck } from '../core/eval-contradictions/run-health.ts';
 import { checkProjectionReadiness } from './doctor/checks/projection-readiness.ts';
+import { checkPersistenceCapacity } from './doctor/checks/persistence-capacity.ts';
+import { checkParkedEffects } from './doctor/checks/parked-effects.ts';
+import { checkPostgresCancellationDriver } from './doctor/checks/postgres-cancellation.ts';
+export { checkPostgresCancellationDriver } from './doctor/checks/postgres-cancellation.ts';
 export { checkProjectionReadiness } from './doctor/checks/projection-readiness.ts';
 // Peeled doctor modules (containment sprint): each is a verbatim move out of
 // this file. doctor.ts re-exports every moved public symbol under its
@@ -98,8 +102,6 @@ export {
 export {
   checkGraphSignalsCoverage,
   checkBrainstormHealth,
-  checkZeEmbeddingHealth,
-  checkProviderSunset,
   checkEmbeddingWidthConsistency,
   checkFactsEmbeddingWidthConsistency,
   checkJunkEntityHubs,
@@ -190,8 +192,6 @@ import {
 import {
   checkGraphSignalsCoverage,
   checkBrainstormHealth,
-  checkZeEmbeddingHealth,
-  checkProviderSunset,
   checkEmbeddingWidthConsistency,
   checkFactsEmbeddingWidthConsistency,
   checkJunkEntityHubs,
@@ -872,6 +872,16 @@ export async function buildChecks(
       checks.push(await connectorsHealthCheck(engine));
     } catch {
       // best-effort; a connectors check failure must never break doctor
+    }
+  }
+
+  // 2g. Dream paid-loop breaker: keys whose submissions keep dying.
+  if (engine) {
+    try {
+      const { dreamPaidLoopCheck } = await import('./doctor/checks/dream-breaker.ts');
+      checks.push(await dreamPaidLoopCheck(engine));
+    } catch (e) {
+      checks.push({ name: 'dream_paid_loop', status: 'warn', message: `Could not count dead dream submissions: ${e instanceof Error ? e.message : String(e)}` });
     }
   }
 
@@ -1879,12 +1889,18 @@ export async function buildChecks(
   // 4. pgvector extension
   progress.heartbeat('pgvector');
   checks.push(await pgvectorCheck(engine));
+  const postgresCancellation = await checkPostgresCancellationDriver(engine);
+  if (postgresCancellation) checks.push(postgresCancellation);
 
   // 4a-bis. #550: pages(source_id, slug) upsert arbiter — when missing, every
   // page write fails brain-wide and the version counter can't see the drift.
   progress.heartbeat('pages_upsert_arbiter');
   checks.push(await pagesUpsertArbiterCheck(engine));
   checks.push(await checkProjectionReadiness(engine));
+
+  // 4a-bis. Managed write capacity (#5470) and parked postcommit effects (#5612).
+  progress.heartbeat('persistence_capacity');
+  checks.push(await checkPersistenceCapacity(engine), await checkParkedEffects(engine));
 
   // 4a-ter. #4613: links_link_source_check shape — a ledger-current brain
   // whose CHECK reverted to the pre-v114 allowlist rejects every kebab
@@ -2189,9 +2205,7 @@ export async function buildChecks(
           } catch { /* table may be missing or fresh; treat as empty */ }
 
           if (totalChunks > 0) {
-            const fix = embeddedCount === 0
-              ? `No embeddings yet — drop the empty schema and re-init at the right dim:\n        gbrain init --force --pglite --embedding-model ${configuredModel} --embedding-dimensions ${configuredDims}`
-              : `Non-empty brain (${embeddedCount} embedded chunks). Migrate cleanly:\n        gbrain migrate embeddings --to ${configuredModel} --dim ${configuredDims}`;
+            const fix = `Existing brain (${totalChunks} chunks, ${embeddedCount} embedded). Keep a verified database backup and preview the brain-wide migration:\n        gbrain migrate embeddings --to ${configuredModel} --dim ${configuredDims} --dry-run\n      After reviewing the plan, replace --dry-run with --yes --max-cost-usd <approved-total>. Missing vectors do not mean the brain is empty. See docs/guides/embedding-migration.md#recovery.`;
 
             checks.push({
               name: 'embedding_provider',
@@ -2244,7 +2258,7 @@ export async function buildChecks(
         const { readContentChunksEmbeddingDim } = await import('../core/embedding-dim-check.ts');
         const colDim = await readContentChunksEmbeddingDim(engine);
         if (colDim.exists && colDim.dims !== null && colDim.dims !== actualDims) {
-          issues.push(`DB dimension mismatch: column is vector(${colDim.dims}) but provider returns ${actualDims}-dim. See docs/embedding-migrations.md for the manual ALTER recipe.`);
+          issues.push(`DB dimension mismatch: column is vector(${colDim.dims}) but provider returns ${actualDims}-dim. See docs/embedding-migrations.md for a verified backup, migration preview and explicitly authorized repair.`);
         }
       } catch { /* column or table missing — fresh brain, fine */ }
 
@@ -2472,11 +2486,6 @@ export async function buildChecks(
     });
   }
 
-  // 8b. v0.41.2.1 embedding_env_override (D9 #9 — uses Check.details, NOT
-  //     Check.issues). Defense in depth for users who bypass ze-switch
-  //     entirely; surfaces on every hourly doctor run when env disagrees
-  //     with DB config. Mirrored in doctorReportRemote() via the shared
-  //     checkEmbeddingEnvOverride() helper.
   progress.heartbeat('embedding_env_override');
   checks.push(await checkEmbeddingEnvOverride(engine));
 
@@ -2665,6 +2674,21 @@ export async function buildChecks(
     checks.push(await staleMentionsCheck(engine));
   } finally {
     staleMentionsHb();
+  }
+  progress.heartbeat('timeline_orphans');
+  const { timelineOrphansCheck } = await import('./doctor/checks/timeline-orphans.ts');
+  checks.push(await timelineOrphansCheck(engine));
+  progress.heartbeat('slug_collisions');
+  const { slugCollisionsCheck } = await import('./doctor/checks/slug-collisions.ts');
+  checks.push(await slugCollisionsCheck(engine));
+
+  // 9d. Wave 2 residual-state signals (#5567, #5525): database-only timeline
+  // rows and derived pages without explicit visibility. Bounded, never throw.
+  progress.heartbeat('timeline_history');
+  {
+    const { timelineHistoryCheck } = await import('./doctor/checks/timeline-history.ts');
+    const { derivedVisibilityCheck } = await import('./doctor/checks/derived-visibility.ts');
+    checks.push(await timelineHistoryCheck(engine, orphanRatioSourceId), await derivedVisibilityCheck(engine, orphanRatioSourceId));
   }
 
   // 10. Integrity sample scan (v0.13 knowledge runtime).
@@ -4037,14 +4061,6 @@ export async function buildChecks(
     // budget so a huge brain never wedges doctor on this check.
     progress.heartbeat('link_resolution_opportunity');
     checks.push(await checkLinkResolutionOpportunity(engine, progress));
-    // v0.36.0.0 (A5): ZE embedding key health + schema/config width consistency.
-    progress.heartbeat('ze_embedding_health');
-    checks.push(await checkZeEmbeddingHealth(engine));
-    // provider_sunset — brain pinned to a provider with an announced
-    // hosted-API shutdown; paste-ready migration hint with the actual
-    // column width. Warn before the date, fail after.
-    progress.heartbeat('provider_sunset');
-    checks.push(await checkProviderSunset(engine));
     progress.heartbeat('embedding_width_consistency');
     checks.push(await checkEmbeddingWidthConsistency(engine));
     // v0.41.15.0 (T6, codex #19/#20) — facts.embedding column drift

@@ -191,18 +191,9 @@ export const SECTIONS: DocSection[] = [
     heading: "AI providers",
     entries: [
       {
-        title: "docs/ai-providers/zeroentropy.md",
-        description:
-          "ZeroEntropy (deprecated; hosted sunset 2026-09-04): the off-ramp for existing brains — migrate embeddings + reranker, self-host continuity, troubleshooting. Do not onboard.",
-        path: "docs/ai-providers/zeroentropy.md",
-        // Setup walkthrough — discoverable in the index, not inlined in the
-        // single-fetch bundle (keeps llms-full.txt under FULL_SIZE_BUDGET).
-        includeInFull: false,
-      },
-      {
         title: "docs/ai-providers/llama-server-reranker.md",
         description:
-          "Local reranker via llama.cpp --reranking: Qwen3-Reranker or self-hosted ZE weights, --alias setup, gbrain config keys, cold-start timeout, budget-cap interaction.",
+          "Local reranker via llama.cpp --reranking: Qwen3-Reranker, --alias setup, gbrain config keys, cold-start timeout, budget-cap interaction.",
         path: "docs/ai-providers/llama-server-reranker.md",
         includeInFull: false,
       },
@@ -221,6 +212,18 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/minions-fix.md",
         description: "Troubleshooting the Minions job queue.",
         path: "docs/guides/minions-fix.md",
+      },
+      {
+        title: "docs/guides/repair.md",
+        description:
+          "`gbrain repair timeline|visibility|safe-chunks`: dry run vs --apply, --source/--limit/--json, resume, capacity stop, thin-client refusal, what each kind fixes and costs.",
+        path: "docs/guides/repair.md",
+      },
+      {
+        title: "docs/guides/write-refusals.md",
+        description:
+          "Refusal reasons (file_database_drift, ambiguous_source_path, physical_root_device_changed, cursor_processing_options_conflict, take_row_collision, invalid_source_uri, queue_capacity, parked effects) with the exact recovery command.",
+        path: "docs/guides/write-refusals.md",
       },
       {
         title: "docs/integrations/reliability-repair.md",
@@ -328,6 +331,7 @@ export const INLINE_TIPS = [
   "`gbrain doctor [--json] [--fast] [--fix]` - built-in health checks.",
   "`gbrain orphans [--json]` - pages with zero inbound wikilinks.",
   "`gbrain repair-jsonb [--dry-run]` - repair v0.12.0 double-encoded JSONB rows.",
+  "`gbrain repair [<kind>] [--apply]` - preview, then fix timeline, visibility and safe-chunk damage doctor reports.",
   "`gbrain upgrade` runs post-upgrade + apply-migrations.",
 ];
 

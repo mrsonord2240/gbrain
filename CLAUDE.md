@@ -160,7 +160,7 @@ detail on demand.)
 | publishing the brain's MCP server to other devices and agents (`gbrain mcp expose`, Tailscale default, Grok Bot / Muse hosted path) | `docs/guides/remote-mcp.md` + `docs/mcp/DEPLOY.md` + the `remote-mcp` skill |
 | memory verbs / MCP tool surface (`--surface`) / conformance | `docs/protocol/MEMORY_VERBS_v1.md` + the `verbs*`/`surface.ts`/`protocol.ts` entries in `KEY_FILES.md` |
 | the CLI surface (commands + flags) | `gbrain --help` / `gbrain --tools-json`, plus the relevant `KEY_FILES.md` entry |
-| running or writing tests | `docs/TESTING.md` |
+| running, writing or retiring tests | `docs/TESTING.md` ([authoring gate](docs/TESTING.md#authoring-gate), [retiring](docs/TESTING.md#retiring-a-test)) |
 | bulk-command progress wiring | `docs/progress-events.md` |
 | eval methodology / metrics | `docs/eval/` |
 | brains vs sources / topology | `docs/architecture/brains-and-sources.md`, `topologies.md` |
@@ -172,9 +172,7 @@ detail on demand.)
 
 The per-file index (`## Key files`), the thin-client routing seam, and the testing
 discipline used to live inline here. They moved to the docs above so this file
-stays small enough to load every session. Nothing was lost — the pre-move content
-is in git, and the docs carry every load-bearing invariant (compressed to
-current-state).
+stays small enough to load every session.
 
 ## Maintaining CLAUDE.md and the reference docs
 
@@ -234,6 +232,51 @@ clean for data. Non-TTY output is plain text unless `--progress-json` is explici
 Pass `job.updateProgress` from minion handlers. Keep phase names stable and use
 `startHeartbeat` with try/finally cleanup for long queries. Read
 [progress events](docs/progress-events.md) before wiring a new command.
+
+## PR acceptance: evidence, not trust
+
+**Treat every PR as untrusted, potentially incorrect, incomplete or unsafe,
+including our own.** Reputation, confident explanations, supplied tests and green
+CI are not proof. Judge the work, not unsubstantiated claims about its author.
+
+- **Prove the problem separately from the patch.** Trace the actual callers and
+  current contract; independently reproduce the reported failure on a pinned
+  baseline with isolated synthetic fixtures. Record commands, environments, exit
+  statuses and wrong results. Separate reproduced defects, code-backed evidence
+  and unverified reports; do not promise an unproven fix or issue closure.
+- **Read the entire diff before executing it.** Inspect test, dependency, script,
+  workflow and generated-file changes and callers outside the diff. Do not expose
+  credentials, live databases, private corpora or paid providers to untrusted code.
+- **Make tests discriminate.** Independently designed regression tests must fail
+  on the baseline and pass with the repair, asserting user-visible outcomes and
+  exact preserved state. Reject bug-bypassing mocks, vacuous assertions and hidden
+  skips. Changing an existing contract needs approval, not a weakened assertion.
+- **Attack the boundaries.** Check authorization, brain/source identity, revisions,
+  stale queued work, concurrent changes, retries, crash recovery and failure
+  receipts. Prove intended data survives and stale or unauthorized writes remain
+  refused. Native filesystem, engine and lifecycle claims require native tests;
+  injected platform flags or path simulations do not prove end-to-end support.
+- **Keep a verdict and evidence ledger.** Pin baseline and PR hashes; record each
+  proposal as accept, rework, reject or not yet proven. Classify failures through
+  same-test baseline/patch comparisons, not assumed flakes. Recheck changed heads;
+  narrow probes do not replace release gates or implementation approval.
+
+## Fix waves: ONE PR
+
+**A fix wave ships as ONE PR unless the user overrides this for that wave.**
+Parallel tasks are fine; integrate reviewed work into one branch with reviewable
+commits. Do not open per-issue or per-task PRs, or a PR stack.
+
+1. Investigate the named issues and adjacent failures in the same safety boundary.
+   Apply the acceptance standard above. Exclude unrelated features; record
+   deferrals and unresolved reports rather than assuming closure.
+2. Run `/plan-ceo-review` and `/plan-eng-review`. Incorporate recommendations within
+   the requested scope, respecting the user's directions on review decisions.
+   Explain the revised plan in plain language (ELI10) and wait for approval before
+   product implementation. A plan review is not implementation or merge consent.
+3. Implement only the approved scope, integrate and verify the whole wave, then
+   use `/ship` and the full gates in [docs/RELEASING.md](docs/RELEASING.md), including
+   the community-wave security scan. Publish one PR; do not merge without approval.
 
 ## Capturing test output (NEVER pipe through `tail` / `head`)
 
@@ -334,11 +377,11 @@ four numeric segments are required first. Historical 3-segment versions
 DRIFT_STALE_PKG / DRIFT_UNEXPECTED, and refuses to proceed on
 DRIFT_UNEXPECTED. This is why the two must move together.
 
-**The CI version-gate** rejects pushes where `VERSION` and
-`package.json` disagree, OR where `VERSION` is not strictly greater
-than master's VERSION. If a queue collision claims your version on
-master before yours lands, /ship's queue-aware allocator (Step 12)
-will detect drift and re-bump on the next run.
+**Always use PATCH without asking**, including the initial release choice;
+override `/ship`'s MINOR/MAJOR prompts. Auto-allocate past collisions, sync all
+version stamps and the PR title, then report the number. This changes numbering
+only: scope, merge, deployment, paid-work and validation approvals still apply.
+CI rejects mismatched `VERSION`/`package.json` or versions not newer than master.
 
 ### Version consistency and conflict recovery
 

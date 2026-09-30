@@ -241,6 +241,8 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   -- #4246 (v133): md5(chunk_text) at embed time. NULL = no embedding or
   -- pre-v133 row (grandfathered by invalidateContentDriftEmbeddings).
   embedded_text_hash TEXT,
+  -- #5553 (v171): embedding-input provenance written with the vector.
+  embedding_input_hash TEXT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- v0.19.0: code chunk metadata (markdown chunks leave NULL).
   language        TEXT,
@@ -329,6 +331,8 @@ CREATE TABLE IF NOT EXISTS tags (
   id      SERIAL PRIMARY KEY,
   page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   tag     TEXT    NOT NULL,
+  -- 'frontmatter' (import-owned, deleted when it leaves the frontmatter), 'added', or NULL (legacy).
+  tag_source TEXT,
   UNIQUE(page_id, tag)
 );
 
@@ -1280,17 +1284,16 @@ CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx
   ON extract_atoms_page_state (source_incarnation, content_hash, page_id) WHERE tombstoned;
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_page_state (page_id);
+-- Durable record that a transcript was synthesized; survives minion_jobs pruning.
+CREATE TABLE IF NOT EXISTS dream_synthesis_completions (
+  source_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, idempotency_key)
+);
 
 `;
 
-/**
- * Return the PGLite schema SQL with embedding vector dim + model name substituted.
- * Defaults come from the AI gateway (v0.36+: zeroentropyai:zembed-1 / 1280d).
- *
- * v0.37.x fix wave: defaults track gateway constants instead of stale v0.13
- * OpenAI literals so the pre-computed `PGLITE_SCHEMA_SQL` constant doesn't
- * size the column to 1536 while the runtime default model emits 1280.
- */
 export function getPGLiteSchema(
   dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
   model: string = DEFAULT_EMBEDDING_MODEL,

@@ -70,11 +70,11 @@ GBrain is keyless. Explain these boundaries before enabling a capability; see
 
 Skip API-key setup for the initial keyless memory path. If the user enables semantic retrieval or paid enrichment, configure the selected provider explicitly. GBrain defaults to the Voyage embedding + reranker stack
 (`voyage:voyage-4` @ 1024d + `voyage:rerank-2.5` — one key covers both); OpenAI is the
-main alternative, chosen at init via `--embedding-model <provider:model>`. ZeroEntropy
-is deprecated (its hosted API shuts down 2026-09-04): init auto-pick and the picker
-exclude it, and every ZE embed/rerank prints a deprecation warning. **Existing brain
-still on ZeroEntropy (or any need to switch embedding/reranker models later)?** Follow
-the playbook at `skills/migrations/v0.46.3.0.md` — one command migrates both.
+main alternative, chosen at init via `--embedding-model <provider:model>`.
+**Need to switch an existing brain's embedding or reranker model?** Follow
+the explicit-consent playbook at `skills/migrations/v0.46.3.0.md`. Preview the
+work and cost, obtain approval, then migrate; an upgrade never converts existing
+vectors or authorizes a paid re-embed.
 
 ```bash
 export VOYAGE_API_KEY=pa-...          # default embedding + reranker (one key covers both)
@@ -504,6 +504,13 @@ See "The onboard surface" below for what the recommendations mean and the
 consent gates around unattended remediation.
 
 ## Upgrade
+
+For v0.60.5.0 and later, confirm a database backup exists before upgrading,
+upgrade every process that writes to the brain, then follow the
+[v0.60.5.0 steps](skills/migrations/v0.60.5.0.md): one full `gbrain doctor`,
+then preview `gbrain repair` and apply only after the user agrees
+([repair guide](docs/guides/repair.md)). For v0.60.6.0, also follow the
+[one-time timeline prune and slug-collision steps](skills/migrations/v0.60.6.0.md).
 
 For v0.53.0.0, follow the
 [mechanical shared-skills migration](skills/migrations/v0.53.0.0.md) on the host,

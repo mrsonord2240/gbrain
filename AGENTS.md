@@ -95,6 +95,11 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   `gbrain db-repair --yes` to apply safe fixes. All three are engine-free — they
   work while the database is down. Full loop:
   [`docs/ENGINES.md`](./docs/ENGINES.md#engine-detection-and-access-repair).
+  Doctor residue (`timeline_history`, `derived_visibility`, unsealed pages):
+  preview `gbrain repair`, then `gbrain repair <kind> --apply` on the brain host
+  after the user agrees ([repair guide](./docs/guides/repair.md)). A refused
+  write names its reason and recovery command
+  ([write refusal reasons](./docs/guides/write-refusals.md)).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
   [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes --no-autopilot-install` (manual migration orchestration without service installation).
@@ -154,12 +159,23 @@ unset) and tears down. Use `bun run ci:local:diff` for the
 diff-aware subset during fast iteration on a focused branch. Requires Docker
 (Docker Desktop / OrbStack / Colima) and `gitleaks` (`brew install gitleaks`).
 
+Fastest path, with a Ubicloud token (`UBICLOUD_API_KEY` or
+`UBICLOUD_API_TOKEN`): `bun run ci:ubicloud` runs the same gate across ten
+ephemeral VMs in about five minutes, uncommitted edits included
+(`ci:ubicloud:diff` for the diff-aware subset). See "Ubicloud fan-out" in
+[`docs/TESTING.md`](./docs/TESTING.md).
+
 Manual path: `bun test` plus the E2E lifecycle described in `./CLAUDE.md` (spin
 up the test Postgres container, run `bun run test:e2e`, tear it down).
 
 Ship via the `/ship` skill, not by hand. The full release + contributor process
 (CHANGELOG voice, version-locations sync, PR conventions, community-PR-wave) lives in
 [`./docs/RELEASING.md`](./docs/RELEASING.md); read it before shipping.
+
+**Always use PATCH without asking**, including the initial release choice;
+override `/ship`'s MINOR/MAJOR prompts. Auto-allocate past collisions, sync all
+version stamps and the PR title, then report the number. This changes numbering
+only: scope, merge, deployment, paid-work and validation approvals still apply.
 
 ## Privacy
 
