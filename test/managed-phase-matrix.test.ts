@@ -361,6 +361,16 @@ const MATRIX: Record<CyclePhase, Entry> = {
       expect((await engine.getPage('people/alice-example', { sourceId }))?.compiled_truth).toContain('Alice founded WidgetCo.');
     },
   },
+  inbox_triage: {
+    config: { 'cycle.inbox_triage.enabled': 'true' },
+    seed: async ({ engine, sourceId }) => put(engine, sourceId, 'inbox/widget-co-capture', page('note', 'Widget Co capture', 'Widget Co is a company that makes widgets.')),
+    reply: () => '{"type":"company","target_slug":"companies/widget-co","confidence":"high","reason":"about a company"}',
+    assert: async ({ engine, sourceId, result }) => {
+      expect(result.details).toMatchObject({ filed: 1, failed: 0 });
+      expect(await committed(engine, sourceId, 'companies/widget-co')).not.toHaveLength(0);
+      expect((await committed(engine, sourceId, 'inbox/widget-co-capture')).at(-1)?.operation).toBe('delete_page');
+    },
+  },
   skillopt: {
     config: { 'cycle.skillopt.enabled': 'true', 'cycle.skillopt.per_skill_cap_usd': '10', 'cycle.skillopt.brain_wide_cap_usd': '10' },
     env: { GBRAIN_SKILLS_DIR: '{root}/../skills' },

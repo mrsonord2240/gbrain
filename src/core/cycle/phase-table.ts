@@ -41,6 +41,7 @@ export const MANAGED_PHASE_TABLE: Readonly<Record<CyclePhase, ManagedPhaseEntry>
   facts_drain: { class: 'writes', reason: 'Queued facts-absorb jobs publish facts through the same coordinated write path as the job worker.' },
   conversation_facts_backfill: { class: 'writes', reason: 'Backfilled conversation facts publish through coordinated writes.' },
   enrich_thin: { class: 'writes', reason: 'Enriched pages publish through the maintenance coordinator.' },
+  inbox_triage: { class: 'writes', reason: 'Filed captures are written and their inbox pages removed through the put_page and delete_page operations, which the coordinator admits.' },
   skillopt: { class: 'no_coordinated_write', reason: 'Writes skill files and proposals outside the brain database.' },
   embed: { class: 'no_coordinated_write', reason: 'Embeddings are a physical projection the canonical writer guard does not cover.' },
   orphans: { class: 'no_coordinated_write', reason: 'Read-only orphan report.' },

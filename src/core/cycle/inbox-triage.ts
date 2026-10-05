@@ -273,8 +273,11 @@ export async function runPhaseInboxTriage(
         tags: filedTags,
       });
 
+      // Managed brains refuse a delete that names no revision; bind it to the
+      // inbox page as classified, read before the filed copy is written.
+      const inboxRevision = (await engine.readPageSnapshot(candidate.slug, { sourceId: opCtx.sourceId }))?.revision;
       await putPageOp.handler(opCtx, { slug: decision.target_slug, content });
-      await deletePageOp.handler(opCtx, { slug: candidate.slug });
+      await deletePageOp.handler(opCtx, { slug: candidate.slug, ...(inboxRevision ? { expected_revision: inboxRevision } : {}) });
 
       filed++;
       details.push({ slug: candidate.slug, action: 'filed', target_slug: decision.target_slug, type: decision.type });
