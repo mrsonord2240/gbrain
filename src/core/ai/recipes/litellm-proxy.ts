@@ -50,7 +50,12 @@ export const litellmProxy: Recipe = {
       models: [],
       supports_tools: true,
       supports_subagent_loop: true,
-      supports_prompt_cache: false,
+      // Fork (2026-10-06): Sam's proxy fronts the Codex Responses backend, which prefix-caches
+      // automatically and reports prompt_tokens_details.cached_tokens (chat_usage_log shows
+      // cache_read_tokens on litellm:gpt-5.6-terra). This flag only gates gbrain's cache-aware
+      // prompt layout and the doctor's cost warning; no cache markers reach the wire on the
+      // openai-compatible path, so it is safe for a non-caching backend too.
+      supports_prompt_cache: true,
       max_context_tokens: 200_000,
       cost_per_1m_input_usd: undefined,
       cost_per_1m_output_usd: undefined,
