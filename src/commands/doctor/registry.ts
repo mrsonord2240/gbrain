@@ -62,6 +62,7 @@ import {
   staleMentionsEntry,
   timelineHistoryEntry,
 } from './checks/graph-health.ts';
+import { extractionDateGroundingEntry } from './checks/ranking-extraction.ts';
 import {
   integrityEntry,
   jsonbIntegrityEntry,
@@ -82,6 +83,7 @@ import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-time
 import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
 import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
 import { syncFreshnessEntry, searchModeEntry } from './checks/sync-search.ts';
+import { gitConvergenceEntry } from './checks/git-convergence.ts';
 import { retrievalFeedbackEntry } from './checks/retrieval-feedback.ts';
 import { autoChronicleEntry } from './checks/auto-chronicle.ts';
 import { factsDrainEntry } from './checks/facts-drain.ts';
@@ -89,6 +91,7 @@ import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
 import { decideHealthEntry } from './checks/decide.ts';
 import { unlinkedFactsEntry } from './checks/unlinked-facts.ts';
 import { edgeValidityEntry } from './checks/edge-validity.ts';
+import { coreMemoryEntry } from './checks/core-memory.ts';
 import { plannerStatsEntry } from './checks/planner-stats.ts';
 import { revisionBackfillEntry } from './checks/revision-backfill.ts';
 import { harnessWiringDoctorEntry } from './checks/harness-wiring.ts';
@@ -137,6 +140,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   orphanRatioEntry,
   staleMentionsEntry,
   timelineHistoryEntry,
+  extractionDateGroundingEntry,
   integrityEntry,
   jsonbIntegrityEntry,
   whoknowsEntry,
@@ -157,6 +161,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   indexAuditEntry,
   imageAssetsEntry,
   syncFreshnessEntry,
+  gitConvergenceEntry,
   decideHealthEntry,
   unlinkedFactsEntry,
   edgeValidityEntry,
@@ -166,6 +171,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   plannerStatsEntry,
   retrievalFeedbackEntry,
   revisionBackfillEntry,
+  coreMemoryEntry,
   searchModeEntry,
 ];
 

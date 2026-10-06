@@ -66,6 +66,7 @@
 
 import type { BrainEngine, NewFact } from '../core/engine.ts';
 import type { Page } from '../core/types.ts';
+import { observationDateFrom, resolveObservationDate, type ObservationDate } from '../core/ai/date-grounding.ts';
 import {
   extractFactsFromTurnWithOutcome,
   isFactsExtractionEnabled,
@@ -379,6 +380,7 @@ import {
   type ParseConversationOpts as OrchestratorParseOpts,
 } from '../core/conversation-parser/parse.ts';
 import { readConversationBodyForParsing } from '../core/conversation-parser/body.ts';
+import { conversationSkip } from '../core/facts/conversation-skip.ts';
 import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
 import { resolveModel, resolveTierDefault } from '../core/model-config.ts';
 import { FAILED_EXIT_CODE } from '../core/exit-codes.ts';
@@ -497,6 +499,31 @@ export function splitIntoSegments(
 // ---------------------------------------------------------------------------
 // Segment rendering with topical/temporal header.
 // ---------------------------------------------------------------------------
+
+/**
+ * Observation date of a conversation segment (date-grounding.ts): the
+ * segment's own timestamp when it came from the transcript itself or the
+ * page's frontmatter date — never the synthetic epoch fallback, and never a
+ * timestamp the parser derived from effective_date (which may be an event
+ * date). Otherwise the page's observation date, or null (unknown).
+ */
+/**
+ * A conversation fact's valid_from: a validated event date the extractor
+ * stated (date-grounding variant) wins; else the segment start, except the
+ * epoch fallback (no trustworthy date → the insert's now() default).
+ */
+function segmentValidFrom(extracted: Date | undefined, startIso: string | undefined): { valid_from?: Date } {
+  if (extracted) return { valid_from: extracted };
+  return startIso && !startIso.startsWith('1970-') ? { valid_from: new Date(startIso) } : {};
+}
+
+export function segmentObservationDate(page: Pick<Page, 'slug' | 'frontmatter' | 'effective_date'>, startIso: string | undefined): ObservationDate | null {
+  const day = startIso?.slice(0, 10);
+  const context = deriveDateContext({ page: page as Page });
+  const explicit = !!day && !day.startsWith('1970-')
+    && (context.source === 'explicit' || context.source === 'frontmatter_date' || day !== context.fallbackDate);
+  return explicit ? observationDateFrom(startIso) : resolveObservationDate({ slug: page.slug, frontmatter: page.frontmatter });
+}
 
 export function renderSegmentForExtraction(
   pageTitle: string,
@@ -1022,20 +1049,32 @@ async function processPage(
       );
     }
   }
-  const gapMinutes = pageSegmentGapMinutes(page);
+  // #5025 / N2: undated time-only turns, a single email or a prose
+  // meeting/email page end in a not-extractable outcome instead of
+  // epoch-dated facts or a rescan every run.
+  const skip = conversationSkip(page, body, parseResult, messages, { llmFallback: Boolean(state.llmFallbackModel), managed: state.managed });
+  const terminalSkip = skip?.durable ? skip : null;
+  if (skip) {
+    process.stderr.write(`[extract-conversation-facts] SKIP ${page.slug}: ${skip.message}\n`);
+    messages = [];
+  }
+  // An email thread is one conversation even when replies are hours apart;
+  // a frontmatter conversation_segment_gap_minutes still wins.
+  const gapMinutes = pageSegmentGapMinutes(page) ??
+    (parseResult.matched_pattern_id === 'email-thread-heading' ? MAX_PAGE_SEGMENT_GAP_MINUTES : undefined);
   const allSegments = splitIntoSegments(messages, { gapMinutes });
   const segments = splitIntoSegments(messages, { gapMinutes, sinceIso });
   if (segments.length === 0) {
     state.result.pages_skipped++;
-    if (!declinedUnrecognizedSpeaker) {
+    if (!declinedUnrecognizedSpeaker && !terminalSkip) {
       if (messages.length === 0) state.result.pages_skipped_unparsed++;
       else if (allSegments.length === 0) state.result.pages_skipped_insufficient_turns++;
       else state.result.pages_skipped_since++;
     }
     if (
       !state.dryRun &&
-      parseResult.phase !== 'no_match' &&
-      allSegments.length === 0 &&
+      (parseResult.phase !== 'no_match' || terminalSkip !== null) &&
+      allSegments.length === 0 && !(skip && !skip.durable) &&
       // #4136 — a decline must stay NON-TERMINAL. The audit row is keyed by
       // a content versionToken and skips the page on every future run; a
       // declined page must retry once the parser learns the label instead.
@@ -1043,9 +1082,9 @@ async function processPage(
       // orphan cleanup below until the page re-extracts.)
       !declinedUnrecognizedSpeaker
     ) {
-      const reason = messages.length === 0
+      const reason = terminalSkip?.reason ?? (messages.length === 0
         ? 'no conversation messages found'
-        : 'fewer than two eligible messages';
+        : 'fewer than two eligible messages');
       if (await snapshotIsCurrent(state.engine, state.sourceId, snapshot)) {
         if (state.managed) {
           await replacePageFacts(state, snapshot, async tx => [
@@ -1121,6 +1160,7 @@ async function processPage(
         source: PER_SEGMENT_SOURCE_PREFIX,
         engine: state.engine,
         abortSignal: state.signal,
+        observationDate: segmentObservationDate(page, seg.startIso),
       });
       if (!extraction.ok) {
         // #3669 — rethrow BudgetExhausted UNWRAPPED. Wrapping it in a plain
@@ -1172,9 +1212,7 @@ async function processPage(
         // Preserve the conversation's valid time instead of defaulting every
         // extracted fact to extraction time. Epoch-anchored parses have no
         // trustworthy date, so they retain the existing now() fallback.
-        ...(seg.startIso && !seg.startIso.startsWith('1970-')
-          ? { valid_from: new Date(seg.startIso) }
-          : {}),
+        ...segmentValidFrom(fact.valid_from, seg.startIso),
         context:
           fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
       }));

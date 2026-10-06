@@ -114,9 +114,12 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'frontmatter_repairable',
   'malformed_path_pages',
   'memory_writeback',
+  'core_memory',
   'grade_confidence_drift',
   'graph_coverage',
   'graph_signals_coverage',
+  // Which extraction prompts resolve relative dates (informational).
+  'extraction_date_grounding',
   'hidden_by_search_policy',
   'image_assets',
   'integrity',
@@ -148,6 +151,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
   'managed_sync_backlog',
   'sync_freshness',
+  // #5063: source checkouts with commits not on their upstream or stale uncommitted changes.
+  'git_convergence',
   'takes_count',
   'takes_weight_grid',
   // #5836: active facts with no entity (invisible to entity recall and the conflict sweep).

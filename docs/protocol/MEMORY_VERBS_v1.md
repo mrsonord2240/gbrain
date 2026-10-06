@@ -273,6 +273,25 @@ near-duplicates may insert; dedup and supersession ride embedding similarity).
   supersedes the old ("X at acme-example" → "X left acme-example").
 - Omitted optional inputs echo as `null`, never absent.
 
+#### remember replaces (additive)
+
+`replaces` (string): the `fact_id` of the fact this new fact replaces. It is a
+caller-directed replacement: it says the old fact is no longer the current one,
+not that the two texts mean the same. Zero model calls; the cosine rule does
+not apply. The target must be an active fact in the same source, with the same
+visibility (world only for remote callers, else `not_found`) and the same
+entity, on the same entity page. Refusals come back as `invalid_params` with a
+code prefix and a `suggestion`: `target_withdrawn` (forgotten facts are not
+replaceable; remember without `replaces`), `target_superseded` (names the fact
+that replaced it), `target_expired`, `replaces_entity_mismatch`,
+`replaces_cross_page` (forget the old fact, then remember), and
+`replaces_duplicate` (another active fact already states the new claim). New
+text equal to the target is `status: duplicate` and changes nothing. On success
+`status` is `superseded`, `superseded_fact_id` names the replaced fact and
+`replaced_by_caller` is `true`; the replaced fact is expired with
+`superseded_by` and its `## Facts` row is struck with `superseded by #N` in
+the same publication. Every `superseded` response carries `superseded_fact_id`.
+
 #### remember entity attribution fields (additive)
 
 Optional response fields; clients must ignore any they do not know.
@@ -286,6 +305,31 @@ Optional response fields; clients must ignore any they do not know.
   check but could not be linked, e.g. its facts fence is malformed). A remote
   caller is never told about an entity it cannot read: that case is `NO_ENTITY`.
 - `hint: string` — present with `warnings`; names the `entity` input.
+
+#### remember items: several facts in one call (additive)
+
+`items` (1 to 20) replaces `fact` for a batch, typically right before
+context compaction. Each item is a fact string or an object with `fact` plus
+optional `entity`, `kind`, `ttl`, `visibility`, `provenance`,
+`infer_entity` and `replaces`; top-level `provenance`,
+`kind`, `ttl`, `visibility` and `infer_entity` are the defaults, so top-level
+`provenance` is optional when every item carries its own. `replaces` names one
+fact, so it goes on its item; passing both `fact` and `items`, or a top-level
+`replaces` with `items`, is `invalid_params`.
+
+Every item is validated before any is written: one invalid item refuses the
+whole call with `items[<i>]` in the message. Each item is then saved as its own
+write with a child `request_id` derived from the call's `request_id` and the
+item index, so replaying the same `request_id` replays each child's outcome and
+writes nothing twice.
+
+Response: `{ protocol_version, request_id, items[], saved, failed, partial,
+hints?, next? }`. Each `items[]` entry is a compact receipt `{ index,
+request_id, status, id?, entity_slug?, warnings?, valid_until?, state? }`
+(`state` and `retry_after_ms` only when the write is not yet committed), or
+`{ index, request_id, status: "failed", error: { code, message } }`. Hints the
+single-fact response would repeat per item appear once in `hints`. `partial: true` means some items saved and some failed; resend
+only the failed items, in a new call with a new `request_id`.
 
 ### entity(name) — read, zero LLM, p99 < 100ms
 
@@ -376,6 +420,22 @@ output_tokens, usd_estimate}, protocol_version }`.
 - No LLM configured ⇒ the protocol error `unavailable` with a fix — never a
   fake answer.
 
+#### synthesize quote check (additive)
+
+Unless the brain owner turns it off (`think.quote_verify false`; on by default),
+every quoted span in a synthesized `answer` is grounded against the evidence
+the answer was composed from (the same page excerpts, takes and graph lines,
+no refetch). An exact match stays; a normalized or near match is replaced with
+the evidence's own words; a quote found in no evidence loses its quotation
+marks and gains `[unverified]`, and the response warns `QUOTE_NOT_IN_EVIDENCE`.
+When the answer contained quotes, the response adds `answer_raw` (as written),
+`quote_check: { grounded, repaired, unverified }` and `unverified_quotes:
+[{ text, reason }]`. Present `answer`, not `answer_raw`, to the user.
+The check is measured not to over-flag: in its held-out run 1.6% of supported
+quotes were wrongly marked (95% upper bound 3.6%). How often it catches a
+made-up quote has not been measured yet, so a quote it leaves in place is
+grounded text it found, not a guarantee against fabrication.
+
 #### synthesize compose status (additive)
 
 Every response additionally carries four ADDITIVE-FOREVER fields (optional;
@@ -425,6 +485,23 @@ already-expired fact returns `expired: false` (success); unknown id ⇒
 `not_found`. Facts are expired with an audit trail, never deleted.
 
 Response: `{ id, expired, reason, protocol_version }`.
+
+#### forget similar_active and semantic_review (additive)
+
+`semantic_review` (boolean, default `true`): `false` keeps this claim out of
+the overnight rewording review, so its text is never sent to a decision
+provider for comparison.
+
+The response carries `similar_active`: `{ state, candidates, semantic_review,
+next }`. `state` is `checked`, `not_checked_no_embedding` or
+`not_checked_pending`. `candidates` lists up to five other active facts about
+the same entity, with the same visibility (world only for remote callers),
+whose embedding is at cosine 0.80 or higher to the withdrawn claim, as
+`{ fact_id, similarity }` (no stored text; zero model calls). `semantic_review`
+is `scheduled`, `off`, `unavailable` or `opted_out`; `next` tells the agent
+what to do. Similarity is not sameness: show the candidates to the user and
+forget one only when the user confirms it restates the withdrawn claim. An
+empty list means no close match was found, not that every rewording is gone.
 
 #### Durable write receipts (additive)
 
@@ -578,9 +655,17 @@ lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
 Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
-degraded_reason?, budget_tokens?, budget_used?, dropped_count? }`. `text` is the
+degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core? }`. `text` is the
 pre-rendered, envelope-wrapped injectable block; with `budget_tokens` it is
 rendered from the packed sets and never exceeds the declared budget.
+
+#### context_pack core memory (additive)
+
+`core: { text, revision, chars_used, chars_limit, pages, truncated }` carries the
+always-loaded core block (owner-designated pages loaded in every session,
+[core memory](../guides/core-memory.md)) when core memory is on and not empty.
+`text` starts with the core block, and core tokens count inside
+`budget_tokens`. `entities` may be omitted to fetch core alone.
 
 ### delta(since?, since_slug?, cursor?, entities?, budget_tokens?, session_id?, include_private?) — read, zero LLM
 
