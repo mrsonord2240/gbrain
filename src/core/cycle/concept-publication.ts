@@ -7,7 +7,9 @@
  * the #5525 order: publish private, bank provenance edges, then promote.
  */
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import { preservedConceptSections, stripPreservedConceptSections } from './concept-sections.ts';
 import type { Page } from '../types.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import { serializeMarkdown, parseMarkdown } from '../markdown.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, replaceOrInsertFactsFence, stripFactsFence } from '../facts-fence.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence, stripTakesFence } from '../takes-fence.ts';
@@ -15,17 +17,23 @@ import { isDbOnly, loadStorageConfig } from '../storage-config.ts';
 import { publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
 import { maintenanceAttribution } from '../persistence/attribution.ts';
-import { existsSync, readFileSync } from 'node:fs';
 import { acquirePageLock } from '../page-lock.ts';
-import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
-import { writeDerivedPageThrough } from './derived-write-through.ts';
+import { derivedFileTarget, writeDerivedPageThrough } from './derived-write-through.ts';
+import { fileDatabaseDriftToken, replaceableFile } from '../facts/file-body-guard.ts';
+import { declareDerivation, deriveTrust, lowerDerivedPage } from '../trust/taint.ts';
+
+/** #5575 I2: the narrative carries the tier of the member atoms its prompt was built from (capped at agent_written). */
+const conceptDerivation = (engine: BrainEngine, sourceId: string, members: readonly string[]) =>
+  deriveTrust(engine, [...new Set(members)].map(slug => ({ table: 'pages' as const, sourceId, slug })), { channel: 'derive:concepts' });
 
 /** Error code for a concept held because republication could lose canonical material. */
 export const CONCEPT_PRESERVATION_CODE = 'concept_preservation_hold';
 /** Codes that mean the page moved under a concurrent writer; the next run retries. */
 export const CONCEPT_DEFERRAL_CODES = new Set(['revision_conflict', 'page_identity_changed']);
+/** Error code for a concept whose database row published but whose file write failed. */
+export const CONCEPT_WRITE_THROUGH_FAILED_CODE = 'concept_write_through_failed';
 /** Codes that hold a concept until an operator imports or repairs its page. */
-export const CONCEPT_HOLD_CODES = new Set(['source_changed', CONCEPT_PRESERVATION_CODE]);
+export const CONCEPT_HOLD_CODES = new Set(['source_changed', CONCEPT_PRESERVATION_CODE, CONCEPT_WRITE_THROUGH_FAILED_CODE]);
 
 function conceptHoldError(message: string): Error { return Object.assign(new Error(message), { code: CONCEPT_PRESERVATION_CODE }); }
 
@@ -38,7 +46,9 @@ function conceptHoldError(message: string): Error { return Object.assign(new Err
  * `db_only` storage tier always wins.
  */
 export async function publishManagedConcept(engine: BrainEngine, authority: MaintenanceAuthority,
-  slug: string, synthesized: Record<string, unknown>, narrative: string, expectedRevision: string | null, brainDir?: string): Promise<string | null> {
+  slug: string, synthesized: Record<string, unknown>, narrative: string, expectedRevision: string | null, brainDir?: string,
+  members?: readonly string[]): Promise<string | null> {
+  const derivation = members ? await conceptDerivation(engine, authority.writer.sourceId, members) : null;
   const snapshot = await engine.readPageSnapshot(slug, { sourceId: authority.writer.sourceId, includeDeleted: true });
   // The narrative was synthesized from the revision read before the model call
   // (or the previous publication's result); an intervening edit wins.
@@ -59,7 +69,7 @@ export async function publishManagedConcept(engine: BrainEngine, authority: Main
     ? composeConceptRepublication(snapshot.page, snapshot.tags, synthesized, narrative)
     : serializeMarkdown(synthesized, narrative, '', { type: 'concept', title, tags: [] });
   const receipt = await publishMaintenancePage(engine, authority, slug, markdown,
-    { expectedRevision: snapshot?.revision ?? null, file: !dbOnly });
+    { expectedRevision: snapshot?.revision ?? null, file: !dbOnly, ...(derivation ? { derivation: declareDerivation(derivation.trust, derivation.inputs) } : {}) });
   return typeof receipt.revision === 'string' ? receipt.revision : null;
 }
 
@@ -91,22 +101,29 @@ export function composeConceptRepublication(page: Pick<Page, 'type' | 'title' | 
  * body written by a model or a synthesis phase, which owns only the prose. Any
  * fence in the replacement is dropped and the original blocks are inserted
  * verbatim, so publication neither expires fence facts nor deletes takes.
- * Throws a hold (`concept_preservation_hold`) when the original fences are
- * ambiguous or the result would not carry exactly the original rows.
+ * Curated `## Facets` / `## Merged` sections (#6161: the record of a concept
+ * merge) are carried the same way. Throws a hold
+ * (`concept_preservation_hold`) when the original fences are ambiguous or the
+ * result would not carry exactly the original rows and sections. A segmented
+ * page refuses with `page_body_segmented`: its fences live in segments.
  */
-export function preserveCanonicalFences(page: Pick<Page, 'compiled_truth' | 'timeline'>, replacement: string): string {
+export function preserveCanonicalFences(page: Pick<Page, 'compiled_truth' | 'timeline' | 'body_storage'>, replacement: string): string {
+  assertInlineBody(page, 'preserveCanonicalFences');
   const hold = conceptPreservationHold(page);
   if (hold) throw conceptHoldError(hold);
   const body = page.compiled_truth ?? '';
-  let compiled = stripTakesFence(stripFactsFence(replacement)).trim();
+  let compiled = stripPreservedConceptSections(stripTakesFence(stripFactsFence(replacement))).trim();
+  const sections = preservedConceptSections(body);
+  if (sections.length) compiled = [compiled, ...sections].join('\n\n');
   const facts = fenceBlock(body, FACTS_FENCE_BEGIN, FACTS_FENCE_END);
   if (facts) compiled = replaceOrInsertFactsFence(compiled, facts).trimEnd();
   const takes = fenceBlock(body, TAKES_FENCE_BEGIN, TAKES_FENCE_END);
   if (takes) compiled = `${compiled}\n\n## Takes\n\n${takes}`;
   const out = parseMarkdown(serializeMarkdown({}, compiled, (page.timeline ?? '').trim(), { type: 'note', title: 'x', tags: [] }), 'page');
   if (JSON.stringify(canonicalRows(out.compiled_truth)) !== JSON.stringify(canonicalRows(body))
+    || JSON.stringify(preservedConceptSections(out.compiled_truth)) !== JSON.stringify(sections)
     || (out.timeline ?? '').trim() !== (page.timeline ?? '').trim()) {
-    throw conceptHoldError('CONCEPT_REPUBLICATION_LOSSY: composed page would not preserve the existing fences or timeline');
+    throw conceptHoldError('CONCEPT_REPUBLICATION_LOSSY: composed page would not preserve the existing fences, curated sections or timeline');
   }
   return compiled;
 }
@@ -153,32 +170,31 @@ export function stripFenceSections(body: string): string {
     .replace(/\n{3,}/g, '\n\n').trim();
 }
 
-/** The page's markdown file, when it has one and write-through is not off: the fence writers write it first. */
-async function conceptFile(engine: BrainEngine, slug: string, sourceId: string): Promise<Pick<Page, 'compiled_truth' | 'timeline'> | null> {
-  if (await isWriteThroughDisabled(engine)) return null;
-  const target = await resolvePageWriteTarget(engine, slug, sourceId);
-  if (!target.ok || !existsSync(target.filePath)) return null;
-  const parsed = parseMarkdown(readFileSync(target.filePath, 'utf-8'), target.filePath);
-  return { compiled_truth: parsed.compiled_truth, timeline: parsed.timeline };
-}
-
 /**
  * Publish one concept page on an unmanaged brain (D-N3). Under the page lock
  * the fence writers take, the page is re-read: when its narrative changed
  * since `baseline` (the narrative the synthesis started from) or another
  * writer took it over, nothing is written and the concept is deferred
- * (`revision_conflict`) to the next run. Otherwise the new narrative is
- * composed with the latest `## Facts` / `## Takes` fences, timeline, tags and
- * frontmatter, so a take or fact appended during synthesis survives. The
- * page's file is rewritten when it already has one (a stale file would
- * otherwise be synced back over the new narrative) or when
- * `cycle.synthesize_concepts.write_through` is on (#5041). `importPage`
- * writes the composed markdown to the database. Returns the narrative now on
- * the page (the next call's baseline).
+ * (`revision_conflict`) to the next run. #6982: when the page's canonical
+ * file exists and holds anything the database lacks (`replaceableFile`: it
+ * equals neither the page nor one of its recent versions, which covers a hand
+ * edit sync has not imported and an unindexed file at a new concept's path),
+ * nothing is written and the concept is deferred (`revision_conflict`, its
+ * message naming the page with `file_database_drift` and the fix).
+ * Otherwise the new narrative is composed with the page's latest `## Facts`
+ * / `## Takes` fences, timeline, tags and frontmatter from the database, so
+ * a take or fact appended during synthesis survives. The page's file is
+ * rewritten when it already has one (a stale file would otherwise be synced
+ * back over the new narrative) or when `cycle.synthesize_concepts.write_through`
+ * is on (#5041). `importPage` writes the composed markdown to the database;
+ * the file write is then bound to the bytes compared under the lock, so an
+ * edit made while the import ran is kept and the concept deferred, and a
+ * failed file write holds the concept (`concept_write_through_failed`).
+ * Returns the narrative now on the page (the next call's baseline).
  */
 export async function publishClassicConcept(engine: BrainEngine, slug: string, sourceId: string,
   synthesized: Record<string, unknown>, narrative: string, baseline: string,
-  opts: { writeThrough: boolean; importPage: (markdown: string) => Promise<unknown> }): Promise<string> {
+  opts: { writeThrough: boolean; importPage: (markdown: string) => Promise<unknown>; members?: readonly string[] }): Promise<string> {
   const lock = await acquirePageLock(slug, { timeoutMs: 5_000 });
   if (!lock) throw Object.assign(new Error('The concept page is locked by another writer.'), { code: 'revision_conflict' });
   try {
@@ -189,12 +205,26 @@ export async function publishClassicConcept(engine: BrainEngine, slug: string, s
       throw Object.assign(new Error('The concept narrative changed during synthesis.'), { code: 'revision_conflict' });
     }
     const title = slug.split('/').pop()!.replace(/-/g, ' ');
-    const file = page ? await conceptFile(engine, slug, sourceId) : null;
+    const resolved = await derivedFileTarget(engine, slug, sourceId);
+    const file = resolved.ok ? await replaceableFile(engine, sourceId, slug, resolved.target.filePath) : null;
+    if (file && !file.ok) {
+      throw Object.assign(new Error(fileDatabaseDriftToken(slug, sourceId, 'before', 'the concept was not published')), { code: 'revision_conflict' });
+    }
     const markdown = page
-      ? composeConceptRepublication({ ...page, ...file }, snapshot!.tags, synthesized, narrative)
+      ? composeConceptRepublication(page, snapshot!.tags, synthesized, narrative)
       : serializeMarkdown(synthesized, narrative, '', { type: 'concept', title, tags: [] });
     await opts.importPage(markdown);
-    if (file || opts.writeThrough) await writeDerivedPageThrough(engine, slug, sourceId);
+    // The import stamps the page by its own channel; the derivation lowers it to the members' taint and records the edges.
+    if (opts.members) await lowerDerivedPage(engine, await conceptDerivation(engine, sourceId, opts.members), sourceId, slug);
+    if (file && (file.expectedFileBytes !== null || opts.writeThrough)) {
+      const written = await writeDerivedPageThrough(engine, slug, sourceId, { expectedFileBytes: file.expectedFileBytes });
+      if (written.skipped === 'file_changed') {
+        throw Object.assign(new Error('The concept file changed while the page was published; the edit was kept.'), { code: 'revision_conflict' });
+      }
+      if (written.error) {
+        throw Object.assign(new Error(`The concept file was not written: ${written.error}`), { code: CONCEPT_WRITE_THROUGH_FAILED_CODE });
+      }
+    }
     return narrative;
   } finally {
     await lock.release();

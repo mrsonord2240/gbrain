@@ -45,6 +45,7 @@ import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { configDir } from '../config.ts';
 import { canonicalLookup } from '../model-pricing.ts';
+import { providerDeclineRecord } from '../setup/local-receipts.ts';
 // Type-only import — erased at compile, so no runtime cycle with
 // model-config.ts (which imports this module for the sync overlay).
 import type { ModelTier } from '../model-config.ts';
@@ -115,6 +116,13 @@ export function parseOpenAIChatId(id: string): ParsedOpenAIChatId | null {
   return { id, family: [Number(m[1]), Number(m[2] ?? 0)], suffix };
 }
 
+/**
+ * Priced for exact metering where a feature names the model (the #6188 fence
+ * repair default), but not eligible as a discovered tier default: one priced
+ * member of a newer family would otherwise become every tier's default.
+ */
+const METERED_ONLY: ReadonlySet<string> = new Set(['gpt-6.1-sol']);
+
 function familyCmp(a: [number, number], b: [number, number]): number {
   return a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1];
 }
@@ -135,7 +143,7 @@ function pickBySuffix(members: ParsedOpenAIChatId[], order: readonly string[]): 
  */
 export function rankOpenAIChatModels(
   ids: string[],
-  priced: (id: string) => boolean = (id) => canonicalLookup(`openai:${id}`) !== undefined,
+  priced: (id: string) => boolean = (id) => canonicalLookup(`openai:${id}`) !== undefined && !METERED_ONLY.has(id),
 ): { tiers: OpenAITierPick | null; newestUnpriced?: string } {
   const parsed = ids.map(parseOpenAIChatId).filter((p): p is ParsedOpenAIChatId => p !== null);
   if (parsed.length === 0) return { tiers: null };
@@ -315,9 +323,11 @@ export interface RefreshOpts {
 /**
  * Refresh the discovery cache from `GET /v1/models`, at most once per TTL.
  * Best-effort by contract: never throws, never blocks longer than
- * FETCH_TIMEOUT_MS, no-ops without a key or with GBRAIN_MODEL_DISCOVERY=off.
- * Call sites: reconfigureGatewayWithEngine (engine connect) and — through
- * it — the jobs worker's per-job gateway refresh.
+ * FETCH_TIMEOUT_MS, no-ops without a key, with GBRAIN_MODEL_DISCOVERY=off, or
+ * when a `gbrain setup` receipt recorded provider use as declined.
+ * Call site: the gateway's discoverBeforeOpenAICall, once per reconfigure,
+ * when an OpenAI-routed call is about to go out (#6607: never on engine
+ * connect, so a brain that never calls OpenAI sends nothing).
  */
 export async function refreshLatestOpenAIModels(opts: RefreshOpts = {}): Promise<void> {
   const disc = process.env.GBRAIN_MODEL_DISCOVERY;
@@ -339,6 +349,10 @@ export async function refreshLatestOpenAIModels(opts: RefreshOpts = {}): Promise
     ? Date.parse(cacheFile?.last_attempt_at ?? '') || 0 : 0;
   const moduleAttempt = _lastAttemptFp === fp ? _lastAttemptAt : 0;
   if (!opts.force && Date.now() - Math.max(moduleAttempt, persistedAttempt) < FAILURE_BACKOFF_MS) return;
+  // A key in the environment is not consent: `gbrain setup` recorded provider
+  // use as declined for this install, so discovery never contacts the account.
+  // An unreadable record fails closed (no request).
+  try { if (providerDeclineRecord()) return; } catch { return; }
 
   if (_refreshInFlight) {
     if (_refreshInFlightFp === fp) return _refreshInFlight;

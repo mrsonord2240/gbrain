@@ -36,6 +36,7 @@
 import type { GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { Effect, Notice } from '../core/agent-output.ts';
+import type { OperationContext } from '../core/ops/contract.ts';
 
 export type CliPhase = 'pre-connect' | 'pre-connect-own-engine' | 'post-connect';
 export type CliThinClientMode = 'none' | 'refuse' | 'route-then-refuse';
@@ -51,6 +52,8 @@ export interface CliDispatchContext {
   cliModuleUrl: string;
   /** Agent contract v1 (A6): CLI notice channel (TTY stderr lines, non-TTY `[AGENT]` block, `--json` `notices`). */
   emitNotice?: (n: Notice) => void;
+  /** The CLI's trusted-local operation context (src/cli.ts makeContext), for a command that submits coordinated writes. */
+  makeContext?: (engine: BrainEngine, params: Record<string, unknown>) => Promise<OperationContext>;
 }
 
 /** One curated flag in a lazy help module (D3). */
@@ -104,10 +107,12 @@ interface CliCommandBase {
   /**
    * A1: the command's target source resolves through the ambient chain
    * (`--source` → GBRAIN_SOURCE → .gbrain-source → …), so a fix naming it
-   * carries `--source <id>` (src/core/fix-routing.ts). Requires consumption
-   * evidence in the generated registry (test/fix-routing.test.ts).
+   * carries `--source <id>` (src/core/fix-routing.ts). `'--source-id'` names that
+   * flag instead for a command whose `--source` is a mode selector (extract:
+   * fs|db). Requires consumption evidence in the generated registry
+   * (test/fix-routing.test.ts).
    */
-  routes_source?: true;
+  routes_source?: true | '--source-id';
   /** D3: lazy curated help module. */
   help?: () => Promise<{ help: CliHelpSpec }>;
 }
@@ -175,6 +180,10 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // selfHelp: `gbrain connect --help` prints its own usage (flags + examples) from runConnect; route
   // around the generic one-line short-circuit.
   { name: 'connect', phase: 'pre-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/connect.ts') },
+  // D8: `gbrain setup <harness>` orchestrates init + harness wiring. Engine-free (a new brain is
+  // created by the `gbrain init` child it runs); thinClient 'none' because it resolves a hosted
+  // target itself and refuses with setup_hosted_connection instead of creating a local brain.
+  { name: 'setup', phase: 'pre-connect', thinClient: 'none', selfHelp: true, json: 'document', load: () => import('./commands/setup.ts') },
   // CLI_ONLY: Agent-bootstrap family (ENG-2 three-touchpoint rule): `bootstrap` + `hook` are
   // ENGINE-FREE (dispatched in handleCliOnly before the connectEngine terminator) and must NEVER
   // enter THIN_CLIENT_REFUSED_COMMANDS. `sweep` is the trusted local sweep entry [CX2-5] and needs
@@ -187,6 +196,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // update cache would spawn a detached network-touching check-update child per prompt and emit
   // UPGRADE_AVAILABLE stderr per turn. NOTE: this path no-ops under NODE_ENV=test, so membership is
   // pinned by a source grep (test/hook-command.serial.test.ts), not a runtime test.
+  // CLI_ONLY (#6530): shared-checkout-safe commit/push/pull; DB-free, pushes with host git credentials, never MCP.
+  { name: 'git', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/git.ts') },
   { name: 'hook', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/hook.ts') },
   // CLI_ONLY: Monthly backup-coverage check (engine via thunk — pre-engine branch, lock-safe).
   // selfHelp: backup ships its own HELP (runBackupCli guard, engine-free — the command dispatches in
@@ -247,7 +258,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // unreachable because the dispatcher's generic short-circuit (printCliOnlyHelp at :204-208) fired
   // before runCapture saw --help. brainstorm + lsd were already in the set; capture was the holdout.
   { name: 'capture', phase: 'pre-connect-own-engine', thinClient: 'none', selfHelp: true, dispatchedBy: 'deferred-persistence', routes_source: true, load: () => import('../commands/persistence-delegate.ts') },
-  { name: 'forget', phase: 'pre-connect-own-engine', thinClient: 'none', dispatchedBy: 'deferred-persistence', load: () => import('../commands/persistence-delegate.ts') },
+  // selfHelp: runForget prints the forget and purge-family usage (#5575 DX-11) before any engine.
+  { name: 'forget', phase: 'pre-connect-own-engine', thinClient: 'none', selfHelp: true, dispatchedBy: 'deferred-persistence', load: () => import('../commands/persistence-delegate.ts') },
   { name: 'call', phase: 'pre-connect-own-engine', thinClient: 'refuse', dispatchedBy: 'deferred-persistence', load: () => import('../commands/persistence-delegate.ts') },
 
   // Post-connect: dispatched by dispatchConnectedCommand after connectEngine(), in master switch order.
@@ -294,7 +306,7 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'sync', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, json: 'document', routes_source: true, load: () => import('./commands/sync.ts') },
   // selfHelp: #3834: extract ships detailed help for its mode-specific flags. Keep the generic
   // CLI-only stub from hiding that contract.
-  { name: 'extract', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, routes_source: true, load: () => import('./commands/extract.ts') },
+  { name: 'extract', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, routes_source: '--source-id', load: () => import('./commands/extract.ts') },
   // selfHelp: v0.41.11.0 — extract-conversation-facts ships its own detailed HELP describing segment
   // splitting + checkpointing + budget caps + the unified types config story. Route around the
   // generic short-circuit.
@@ -349,7 +361,7 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'onboard', phase: 'post-connect', thinClient: 'none', help: () => import('./help/onboard.ts'), load: () => import('./commands/onboard.ts') },
   { name: 'founder', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/founder.ts') },
   { name: 'think', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/think.ts') },
-  { name: 'recall', phase: 'post-connect', thinClient: 'none', routes_source: true, load: () => import('./commands/recall.ts') },
+  { name: 'recall', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/recall.ts') },
   // CLI_ONLY: v0.42.58 (#2035 class, caught by the handleCliOnly reachability sweep): full handler
   // at `case 'notability-eval'` but never dispatchable.
   { name: 'notability-eval', phase: 'post-connect', thinClient: 'none', load: () => import('./commands/notability-eval.ts') },
@@ -363,6 +375,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // CLI_ONLY: Open-loop engine CLI (engine-bound; trusted-local op dispatch).
   { name: 'waiting', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/waiting.ts') },
   { name: 'loops', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/loops.ts') },
+  // CLI_ONLY: pinned questions (C4); trusted-local op dispatch of the questions_* ops.
+  { name: 'questions', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, routes_source: true, load: () => import('./commands/questions.ts') },
   // CLI_ONLY: relationship-contradiction proposals (temporal typed edges); host-local, writes canonical timeline lines.
   { name: 'edge-proposals', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/edge-proposals.ts') },
   // selfHelp: core prints its own usage (commands/core.ts). Always-loaded core memory, docs/guides/core-memory.md.
@@ -379,7 +393,12 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // `code-def`/`code-refs`/`code-callers`/`code-callees` have NO MCP ops in operations.ts:2630-2671;
   // cannot be "fixed by routing" yet
   { name: 'pages', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/pages.ts') },
-  { name: 'quarantine', phase: 'post-connect', thinClient: 'route-then-refuse', load: () => import('./commands/quarantine.ts') },
+  // selfHelp: #6259 router (list, clear, scan); its usage prints before any engine is opened.
+  { name: 'quarantine', phase: 'post-connect', thinClient: 'route-then-refuse', selfHelp: true, load: () => import('./commands/quarantine.ts') },
+  // #5575: memory trust. Observational startup: `trust backfill --dry-run` runs with no migrations and no writes.
+  // W1 belief ledger coverage: enable, disable, status, reconcile, backfill (docs/designs/BELIEF_LEDGER.md section 7).
+  { name: 'beliefs', phase: 'post-connect', thinClient: 'route-then-refuse', selfHelp: true, json: 'document', routes_source: true, load: () => import('./commands/beliefs.ts') },
+  { name: 'trust', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, json: 'document', skipStartupHooks: true, startup: 'observational', load: () => import('./commands/trust.ts') },
   // selfHelp: v0.43 (#2095): watch ships WATCH_HELP (flags + the stdin-turn protocol).
   // thin client: v0.43 (#2095): watch streams against a LOCAL engine; thin clients get the
   // volunteer_context MCP op instead.

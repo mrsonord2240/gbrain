@@ -18,6 +18,7 @@ import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts'
  */
 
 import { createHash } from 'crypto';
+import { load as yamlLoad } from 'js-yaml';
 import { existsSync, readFileSync, readdirSync, copyFileSync, writeFileSync, mkdirSync, lstatSync } from 'fs';
 import { join, relative, resolve, dirname, basename, isAbsolute } from 'path';
 import type { BrainEngine } from './engine.ts';
@@ -30,6 +31,8 @@ import {
   type ParseValidationCode,
   type ParseValidationError,
   type ParseWarningCode,
+  yamlAliasesWithinLimit,
+  yamlBlockError,
 } from './markdown.ts';
 import { isMarkdownFilePath, isSyncable, pruneDir, slugifyPath } from './sync.ts';
 
@@ -150,6 +153,27 @@ export function createFrontmatterBackup(filePath: string, opts: FrontmatterBacku
 // ---------------------------------------------------------------------------
 // autoFixFrontmatter
 // ---------------------------------------------------------------------------
+
+/**
+ * A cosmetic line rewrite is kept only when it reads back as the same value
+ * (#6157). A line that does not parse on its own is a repair target, so the
+ * rewrite is allowed. A line over the alias limit is never rewritten: its
+ * value could expand exponentially when compared.
+ */
+function rewriteKeepsYamlValue(before: string, after: string): boolean {
+  if (!yamlAliasesWithinLimit(before)) return false;
+  let original: unknown;
+  try {
+    original = yamlLoad(before);
+  } catch {
+    return true;
+  }
+  try {
+    return JSON.stringify(yamlLoad(after)) === JSON.stringify(original);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Mechanical auto-repair for the fixable subset of validation codes:
@@ -283,7 +307,9 @@ export function autoFixFrontmatter(
           if (!clean) return "''";
           return clean.includes("'") ? `"${clean}"` : `'${clean}'`;
         });
-        lines[i] = `${prefix}[${reQuoted.join(', ')}]`;
+        const rewritten = `${prefix}[${reQuoted.join(', ')}]`;
+        if (!rewriteKeepsYamlValue(lines[i], rewritten)) continue;
+        lines[i] = rewritten;
         fixedAny = true;
       }
       if (fixedAny) {
@@ -299,7 +325,9 @@ export function autoFixFrontmatter(
 
   // 3. NESTED_QUOTES — rewrite `key: "...inner..."` lines that have 3+ unescaped
   //    double-quotes by switching the outer wrapper to single quotes and
-  //    leaving inner quotes alone.
+  //    leaving inner quotes alone. Only when the closed block fails to parse
+  //    (#6157): valid YAML, such as a block-scalar continuation line shaped
+  //    like `Key: "a", then "b"`, is never rewritten.
   {
     const lines = working.split('\n');
     let firstNonEmpty = -1;
@@ -311,8 +339,10 @@ export function autoFixFrontmatter(
       for (let i = firstNonEmpty + 1; i < lines.length; i++) {
         if (lines[i].trim() === '---') { closeIdx = i; break; }
       }
+      const block = lines.slice(firstNonEmpty + 1, closeIdx).join('\n');
+      const blockParses = closeIdx < lines.length && yamlBlockError(block) === null && yamlAliasesWithinLimit(block);
       let fixedAny = false;
-      for (let i = firstNonEmpty + 1; i < closeIdx; i++) {
+      for (let i = firstNonEmpty + 1; !blockParses && i < closeIdx; i++) {
         const m = lines[i].match(/^(\s*[A-Za-z_][\w-]*\s*:\s*)"(.*)"\s*(.*)$/);
         if (!m) continue;
         const [, prefix, inner, trailing] = m;
@@ -572,6 +602,34 @@ export interface ScanOpts {
    * (post-pruneDir). Production callers don't pass this; the regression
    * suite uses it to assert descent-time pruning directly. */
   visitDir?: (dirPath: string) => void;
+  /** Parse only each file's frontmatter head (`frontmatterScanHead`) when that
+   * provably yields the same findings; the doctor scan sets it. */
+  frontmatterOnly?: boolean;
+}
+
+/**
+ * The prefix of `content` through its closing frontmatter fence line, when
+ * validating that prefix yields exactly the errors, warnings, recovery and
+ * slug of the whole file; otherwise `content` itself. Proven only for the
+ * plain shape every frontmatter reader agrees on: the file starts with a
+ * `---` line (no BOM, blank lines or language selector), no line before the
+ * first `---` close starts with `---`, the close is a bare `---` line after
+ * at least one block line, and the file has no NUL byte (NULL_BYTES reads
+ * the whole file). Everything after the close is body, which the findings
+ * never read.
+ */
+export function frontmatterScanHead(content: string): string {
+  if (!content.startsWith('---') || content.includes('\0')) return content;
+  const first = content.indexOf('\n');
+  if (first < 0 || (first !== 3 && content.slice(0, first) !== '---\r')) return content;
+  for (let start = first + 1, line = 1; ; line++) {
+    const end = content.indexOf('\n', start);
+    if (end < 0) return content;
+    const text = content.slice(start, end);
+    if (text.trim() === '---') return line >= 2 && (text === '---' || text === '---\r') ? content.slice(0, end + 1) : content;
+    if (text.startsWith('---')) return content;
+    start = end + 1;
+  }
 }
 
 /** Timeout-arm winner for the COUNT-vs-deadline race in scanBrainSources.
@@ -788,7 +846,7 @@ function scanOneSource(
       return true; // skip unreadable
     }
     const expectedSlug = slugifyPath(relPath);
-    const parsed = parseMarkdown(content, relPath, { validate: true, expectedSlug });
+    const parsed = parseMarkdown(opts.frontmatterOnly ? frontmatterScanHead(content) : content, relPath, { validate: true, expectedSlug });
     const errs = (parsed.errors ?? []).filter((e) => {
       if (e.code !== 'MISSING_OPEN') return true;
       if (opts.strictMissingOpen) return true;

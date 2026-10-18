@@ -11,6 +11,7 @@
  * regenerate without manual URL rewrites:
  *   LLMS_REPO_BASE=https://raw.githubusercontent.com/fork-org/gbrain/main bun run build:llms
  */
+import { repoBaseOrThrow } from '../src/core/repo-base.ts';
 
 export type DocEntry = {
   title: string;
@@ -30,9 +31,7 @@ export const PROJECT = {
   summary:
     "GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, fat-markdown skills, and one agent operator contract for every error and recommendation. Teaches agents brain ops, ingestion, enrichment, scheduling, identity, and access control.",
   repoUrl: "https://github.com/garrytan/gbrain",
-  rawBaseUrl:
-    process.env.LLMS_REPO_BASE ??
-    "https://raw.githubusercontent.com/garrytan/gbrain/master",
+  rawBaseUrl: repoBaseOrThrow(process.env.LLMS_REPO_BASE, "https://raw.githubusercontent.com/garrytan/gbrain/master"),
 };
 
 export const SECTIONS: DocSection[] = [
@@ -134,13 +133,13 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
-        // Re-inlined: the CLAUDE.md resolver restructure (per-file index moved to
-        // docs/architecture/KEY_FILES.md, link-only) freed ~530KB of bundle
-        // headroom, so this value-explainer rides the single-fetch bundle again.
+        // Link-only: the bundle reached FULL_SIZE_BUDGET; this value-explainer is
+        // the least operational inlined doc, so it gives way to protocol docs.
         title: "docs/what-schemas-unlock.md",
         description:
           "Why schemas matter: 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) + the structural argument for typed page kinds. Read this before pitching schema authoring.",
         path: "docs/what-schemas-unlock.md",
+        includeInFull: false,
       },
       {
         title: "docs/schema-author-tutorial.md",
@@ -163,9 +162,34 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
+        title: "docs/guides/pinned-questions.md",
+        description:
+          "Pinned questions: cited answers kept current from your notes (`gbrain questions pin|list|status|refresh|unpin`, `questions_*` MCP tools), read-time staleness, receipts and blocked reasons, owner-private visibility, consent for paid refresh, the standing_questions phase and the dream.auto_think migration.",
+        path: "docs/guides/pinned-questions.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/guides/live-sync.md",
         description: "Incremental markdown sync setup.",
         path: "docs/guides/live-sync.md",
+      },
+      {
+        title: "docs/guides/on-commit-sync.md",
+        description: "Opt-in on-commit sync in gbrain serve (sync.on_commit) and the per-source commit→searchable/embedded latency.",
+        path: "docs/guides/on-commit-sync.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/shared-checkout-git.md",
+        description:
+          "Committing and pushing when several agents share one brain checkout: `gbrain git commit-push` / `scripts/brain-commit-push.sh` (writer lock, path-scoped commit, in-memory merge, fast-forward-only advance), the outcome table, conflict resolution with --resolve, recovering a stuck rebase, the lock contract for host daemons, and the git commands never to run there.",
+        path: "docs/guides/shared-checkout-git.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/sync-unblock-runbook.md",
+        description: "Operator-agent loop for a managed catch-up on a live checkout: gbrain sync status --json (cursor, committed_last_10m, each hold and the last error with class / safe_actions / needs_human), gbrain sync unblock --apply, and the decision table (page / connection / systemic) behind them.",
+        path: "docs/guides/sync-unblock-runbook.md",
       },
       {
         title: "docs/guides/cron-schedule.md",
@@ -188,6 +212,8 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/quiet-hours.md",
         description: "Notification hold + timezone-aware delivery.",
         path: "docs/guides/quiet-hours.md",
+        // Linked, not inlined: the Wave B PR 2 master merge put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
       },
       {
         title: "docs/guides/scaling-skills.md",
@@ -200,6 +226,13 @@ export const SECTIONS: DocSection[] = [
         description:
           "Life Chronicle automatic event extraction (on by default): what qualifies, per-page cost and daily ceiling, privacy, the receipt -> `gbrain dream --phase chronicle` -> `gbrain day` check, skip/failure codes with fixes, opt-out `gbrain config set auto_chronicle false`, history backfill.",
         path: "docs/guides/life-chronicle.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/dream-patterns.md",
+        description:
+          "Dream patterns phase: settings (min_evidence, subagent timeouts), in-cycle budget sizing from the recorded `dream.patterns.last_run` (first batch, timeout halving, `insufficient_cycle_budget` skip, probe after 3 skips), reset with `gbrain config unset dream.patterns.last_run`.",
+        path: "docs/guides/dream-patterns.md",
         includeInFull: false,
       },
       {
@@ -239,6 +272,12 @@ export const SECTIONS: DocSection[] = [
         title: "docs/mcp/DEPLOY.md",
         description: "MCP server deployment.",
         path: "docs/mcp/DEPLOY.md",
+        // Fix wave 12: 42KB operator deployment runbook. Web index entry
+        // stays; the single-fetch bundle drops it to stay under
+        // FULL_SIZE_BUDGET (wave 12's onboard, dream and memory-verb doc
+        // additions passed 800KB). Operators read it once when deploying;
+        // agents follow the llms.txt link when they need it.
+        includeInFull: false,
       },
       {
         title: "docs/protocol/MEMORY_VERBS_v1.md",
@@ -251,6 +290,13 @@ export const SECTIONS: DocSection[] = [
   {
     heading: "AI providers",
     entries: [
+      {
+        title: "docs/ai-providers/google.md",
+        description:
+          "Google Gemini: GOOGLE_GENERATIVE_AI_API_KEY (GEMINI_API_KEY alias), GOOGLE_GENERATIVE_AI_BASE_URL override for chat, expansion and embeddings (metering proxies, regional gateways), provider_base_urls.google.",
+        path: "docs/ai-providers/google.md",
+        includeInFull: false,
+      },
       {
         title: "docs/ai-providers/llama-server-reranker.md",
         description:
@@ -298,18 +344,27 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/minions-fix.md",
         description: "Troubleshooting the Minions job queue.",
         path: "docs/guides/minions-fix.md",
+        includeInFull: false,
       },
       {
         title: "docs/guides/repair.md",
         description:
           "`gbrain repair <kind>`: dry run vs --apply, --source/--limit/--json, resume, capacity stop, thin-client refusal, what each kind fixes and costs; held files walkthrough (sync holds a broken file, `gbrain repair frontmatter` two-pass preview and apply).",
         path: "docs/guides/repair.md",
+        includeInFull: false,
       },
       {
         title: "docs/guides/write-refusals.md",
         description:
           "Refusal reasons (file_database_drift, ambiguous_source_path, physical_root_device_changed, cursor_processing_options_conflict, take_row_collision, invalid_source_uri, queue_capacity, parked effects) and held-file content refusals (invalid_frontmatter and its reasons, frontmatter_slug_conflict, file_too_large, content_rejected, rename_held, sync_parser_regression) with the exact recovery command. Every refusal's `docs` field links its row directly.",
         path: "docs/guides/write-refusals.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/fence-format.md",
+        description:
+          "Facts and takes fence format, generated from the parser: markers, columns and layouts, allowed values, holders, row-number rules, one valid example per fence, what gbrain fixes by itself and what it never guesses, and the repair gates.",
+        path: "docs/guides/fence-format.md",
         includeInFull: false,
       },
       {

@@ -70,7 +70,7 @@ Each hold record carries `code`, `reason`, `key`, `line`, `message` (location on
 | `invalid_frontmatter` / `needs_interpretation` | Preview with `--include-ambiguous`, show the user each per-file diff, apply only what they approve. |
 | `invalid_frontmatter` / `ambiguous_identity_key` or `ambiguous_protected_key` | Never guess. Show the user the line; they decide the one value (`visibility` decides who can read the page). |
 | `frontmatter_slug_conflict` | Remove the `slug:` line or move the file; the repair proposes removing it under `--include-ambiguous`. |
-| `file_too_large` | Split the file or add it to `sync.exclude`; the limit is fixed. |
+| `file_too_large` | The file is over the fixed page limit (24 MiB for Markdown, 5 MB for code); every page under it is searchable, so never split one that fits. Ask the user to add it to `sync.exclude`, or to split it into files under the limit. A smaller page an MCP transport refused goes by file instead (`docs/guides/memory-boundaries.md#large-page-limits`). |
 | `content_rejected` | The user chose `content_sanity.junk_disposition=reject`; ask before changing it. |
 
 The fix flow (walkthrough with real output: `docs/guides/repair.md#held-files`):
@@ -269,7 +269,7 @@ title: "My "Quoted" Title"
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - `gbrain frontmatter validate` exits 1: errors were found (that is the result, not a crash). Parse `errors_by_code` and report counts per source.
 - Before a fix pass, state how many files will change and get the user's agreement; the fix writes `.bak` backups, and YAML_PARSE errors are not always auto-repairable.

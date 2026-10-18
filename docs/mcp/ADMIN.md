@@ -186,6 +186,15 @@ or bypass consent. Its scope ceiling and redirect validation remain enforced;
 see [DCR](DEPLOY.md#dynamic-client-registration-dcr). If DCR is disabled, manually
 register the client and enter its metadata where that harness supports it.
 
+A self-registered client lands on the `default` source and is marked
+`registered_via = 'dcr'` in `oauth_clients`. At its first consent the owner
+picks the source it reads and writes; the choice is recorded in the grant audit
+(`action: consent`, revision 1). After that the consent screen shows the source
+read-only, and the source changes only through the Agents page or
+`gbrain auth rescope --client`. Clients registered before this marker existed,
+operator-registered clients and `client_credentials` clients never get the
+choice.
+
 ## Inspect clients and edit access
 
 ```bash
@@ -219,6 +228,79 @@ Removed scopes and source/path/operation restrictions apply to subsequent
 requests. Added scopes require a fresh token; refresh cannot widen the original
 token's scope ceiling. Native OAuth clients must reconnect and obtain fresh
 owner approval. TTL changes affect future tokens only.
+
+New `memory-reader`, `memory-writer` and `coding-agent` grants are callable and
+listed on the full surface; their operation snapshot is still the ceiling, so a
+reader still has no write operation. `delegating-agent` grants keep the starter
+surface. Clients granted before this keep their stored surface: no migration or
+repair changes it, and only an explicit `--profile` application regrants it.
+
+### Grants that cannot reach new operations
+
+A grant can be unable to call operations its scopes allow for three proven
+reasons: its operation snapshot excludes them, its stored client surface (the
+pin, for example `starter` on an older profile client) hides them, or the
+server's surface is narrower. The connection itself sees counts, never names,
+in `whoami` (`grant_diagnosis`) and `gbrain://capabilities`; operations outside
+the grant's scopes are never counted. On the host, `gbrain doctor` reports
+`grant_new_ops_available` with each grant's blockers and the operation names.
+
+The connection is also told in band, without asking: the
+`grant_blocked_operations` notice arrives once per session (once per
+(principal, transport session); for a stateless HTTP call with no session id,
+once per (principal, grant revision), so three stateless calls get one notice
+and a rescope is diagnosed afresh). It names the same blockers with counts,
+keeps grant age apart, and its `fix` (`next: tell_user_to_run`) is the preview
+command, then the apply command in `then`, for the owner to run on the host;
+`fix.verify` is this doctor check or `whoami` on the same connection. A
+missing scope is named only on a refused call. When the server surface alone
+blocks, the fix is the read-only doctor check, because no grant change lifts
+it. A result that left out takes a hidden tool serves carries
+`hidden_tool_content`, whose `fix` is the step that connection can take:
+calling `takes_list`, one `request_tools {surface}` widen (within the server
+ceiling, never past an operator pin), or this grant repair
+([connection notices](../guides/repair.md#connection-notices)).
+
+Grant age is reported apart from those blockers. A snapshot written before
+this release carries no record of the operation catalog it was written
+against, so an old profile snapshot and a deliberate restriction look the
+same: such a grant reports "this grant's snapshot excludes N currently eligible
+operations; original intent unknown". Only a snapshot written with catalog
+provenance (new grants, and any later write that sets a new snapshot) is said
+to predate operations. Identically shaped grants get identical output, and
+nothing is widened automatically: ask the user first.
+
+The commands differ by credential type:
+
+```bash
+# Legacy token: preview the operations added since the snapshot, then add the approved ones
+gbrain auth rescope --token NAME --refresh-operations
+gbrain auth rescope --token NAME --refresh-operations --add put_pages
+
+# OAuth client: no refresh; pass the whole new snapshot, plus --surface full when the pin blocks too
+gbrain auth rescope --client CLIENT_ID --operations OP1,OP2,... --surface full --dry-run
+gbrain auth rescope --client CLIENT_ID --operations OP1,OP2,... --surface full
+```
+
+`--refresh-operations` is token-only (a client gets
+`client_refresh_operations_unsupported`). Removing the snapshot instead is a
+separate, disclosed choice, never the default repair: `--operations all` for a
+client (`--reset-default operations` for a token) stores no snapshot, so the
+scopes and surface allow every operation, including ones later upgrades add.
+
+Two exceptions no snapshot change alone covers (the grant diagnosis lists them
+in `prerequisites[]` as `{operation, prerequisite, fix}`):
+
+- Membership operations (`join_brain`, `sync_brain_skills`, `leave_brain`)
+  need explicit approval by name. A grant with no snapshot never reaches them,
+  so the diagnosis counts them as unreachable. On a token with no snapshot,
+  `--refresh-operations` previews them, and `--refresh-operations --add
+  join_brain` writes a snapshot of every operation the scopes allow today plus
+  exactly the added one. Operations later upgrades add then need their own
+  refresh. `--all-new` is refused there; name each membership operation.
+- `confirm_memory` promotes trust only with the `memory_confirm` scope, which
+  the brain owner grants from the local CLI. Admitting it to a snapshot lets
+  its dry-run and no-op paths run, not promotion.
 
 ### Access-token lifetime
 
@@ -481,7 +563,7 @@ registers `gbrain serve --access read-only` as its stdio MCP command.
 
 ```bash
 claude mcp add gbrain -- "$(command -v gbrain)" serve --access read-only
-gbrain serve --surface starter --access read-only
+gbrain serve --surface full --access read-only
 ```
 
 `--access read-only` intersects the selected `--surface` with operations that

@@ -51,6 +51,7 @@ import { currentBrainId, readWorkers } from './worker-registry.ts';
 import { autopilotOperatorPauseMarkerPath, autopilotPaused } from '../autopilot-paths.ts';
 import { registerSignalOwner, triggerCleanupAndExit } from '../process-cleanup.ts';
 import { resolveEnvNumber } from '../env-number.ts';
+import { pidFileContents, processStartStamp } from './supervisor-pid.ts';
 
 export type SupervisorEvent =
   | 'started'
@@ -535,7 +536,8 @@ export function supervisorLockId(queue: string): string {
  *   - `no_lock`  — no live lock holder (nothing to assert).
  *   - `single`   — the live lock holder IS the local pidfile holder. Healthy.
  *   - `mismatch` — a live lock holder differs from the local pidfile holder:
- *                  a second supervisor likely ran with a different --max-rss.
+ *                  a second supervisor likely ran with a different --max-rss. PR #6463: the same pid whose `pidfileHost`
+ *                  (recorded in the PID file at lock time) equals the lock holder's host is `single` despite a drifted `localHost`.
  */
 export function classifySupervisorSingleton(args: {
   lockLive: boolean;
@@ -543,13 +545,13 @@ export function classifySupervisorSingleton(args: {
   lockHolderPid: number | null;
   localHost: string;
   localPid: number | null;
+  pidfileHost?: string | null;
 }): 'no_lock' | 'single' | 'mismatch' {
   if (!args.lockLive || args.lockHolderHost === null || args.lockHolderPid === null) {
     return 'no_lock';
   }
-  if (args.localPid === null) return 'mismatch';
-  const matches = args.lockHolderHost === args.localHost && args.lockHolderPid === args.localPid;
-  return matches ? 'single' : 'mismatch';
+  if (args.localPid === null || args.lockHolderPid !== args.localPid) return 'mismatch';
+  return args.lockHolderHost === args.localHost || (args.pidfileHost != null && args.lockHolderHost === args.pidfileHost) ? 'single' : 'mismatch';
 }
 
 export class MinionSupervisor {
@@ -833,6 +835,7 @@ export class MinionSupervisor {
     // 5. Announce start.
     this.emit('started', {
       supervisor_pid: process.pid,
+      ...processStartStamp('supervisor_start', process.pid),
       // Resolved to absolute at emit time (relative to THIS process's cwd,
       // the only context in which a relative --pid-file was meaningful) so a
       // later reader (e.g. `gbrain doctor`, possibly running from a
@@ -1091,7 +1094,7 @@ export class MinionSupervisor {
       // O_CREAT | O_EXCL | O_WRONLY — fails with EEXIST if the file exists.
       const fd = openSync(this.opts.pidFile, 'wx');
       try {
-        writeSync(fd, String(process.pid));
+        writeSync(fd, pidFileContents());
       } finally {
         closeSync(fd);
       }
@@ -1117,7 +1120,7 @@ export class MinionSupervisor {
         try {
           const fd = openSync(this.opts.pidFile, 'wx');
           try {
-            writeSync(fd, String(process.pid));
+            writeSync(fd, pidFileContents());
           } finally {
             closeSync(fd);
           }
@@ -1225,6 +1228,7 @@ export class MinionSupervisor {
         this.consecutiveWedgedChecks = 0;
         this.emit('worker_spawned', {
           pid: event.pid >= 0 ? event.pid : undefined,
+          ...(event.pid >= 0 ? processStartStamp('pid_start', event.pid) : {}),
           cli_path: this.opts.cliPath,
           ...(event.tini ? { tini: true } : {}),
           ...(this.opts.nice_requested !== undefined ? { nice: this.opts.nice_requested } : {}),
@@ -1245,6 +1249,7 @@ export class MinionSupervisor {
           ? `signal ${event.signal}`
           : `code ${event.code ?? 'null'}`;
         this.emit('worker_exited', {
+          pid: event.pid ?? null,
           code: event.code,
           signal: event.signal,
           reason: exitReason,

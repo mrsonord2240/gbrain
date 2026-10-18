@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync } from '../core/spawn.ts';
 import { readdirSync, lstatSync, existsSync, copyFileSync, mkdirSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -26,7 +26,9 @@ import type { McpSurface } from '../mcp/surface.ts';
 
 /** D2: `--json` writes exactly one document, after whichever branch ran (see init-json.ts). */
 export async function runInit(args: string[]) {
+  const fresh = !existsSync(configPath());
   await runInitBranches(args);
+  if (fresh && existsSync(configPath())) (await import('../core/funnel.ts')).recordFunnelEvent('clean_install');
   if (args.includes('--json')) await flushInitJsonResult();
 }
 
@@ -47,6 +49,7 @@ async function runInitBranches(args: string[]) {
 
   validateInitFlags(args);
   registrationSurface = (await import('../mcp/surface.ts')).parseSurfaceFlag(args) ?? undefined;
+  searchModeChoice = (await import('./init-mode-picker.ts')).searchModeChoiceFromArgs(args, failInitFlag);
 
   const isSupabase = args.includes('--supabase');
   const isPGLite = args.includes('--pglite');
@@ -260,6 +263,7 @@ const INIT_VALUE_FLAGS = new Set([
   '--oauth-client-id',
   '--oauth-client-secret',
   '--surface',
+  '--search-mode',
 ]);
 
 function validateInitFlags(args: string[]) {
@@ -1268,14 +1272,14 @@ export async function initPGLite(opts: {
     // Non-TTY auto-selects; --json emits a structured event.
     const { runModePicker } = await import('./init-mode-picker.ts');
     let searchMode: { mode: SearchModeName; reason: string } | undefined;
-    await runModePicker(engine, { jsonOutput: opts.jsonOutput, onDecision: d => { searchMode = d; } });
+    await runModePicker(engine, { jsonOutput: opts.jsonOutput, ...searchModeChoice, onDecision: d => { searchMode = d; } });
 
     const stats = await engine.getStats();
 
     if (opts.jsonOutput) {
       setInitJsonResult({ status: 'success', engine: 'pglite', path: dbPath, pages: stats.page_count, embedding_check: embedCheck, content: contentReceipt, ...firstRunJson(await firstRunBundle(engine, searchMode, registrationSurface)) });
     } else if (process.env.GBRAIN_IN_AGENT_SETUP === '1') {
-      printInAgentReady(dbPath);
+      printInAgentReady(dbPath, freshContentDatabase);
     } else {
       console.log(`\nBrain ready at ${dbPath}`);
       console.log(`${stats.page_count} pages. Engine: PGLite (local Postgres).`);
@@ -1314,12 +1318,13 @@ const INIT_EMBEDDING_HINT = 'Pick an embedding model whose dimensions match (`gb
  * MEMORY_VERBS v1 quickstart funnel (E3 + D4B + T1 consent). Printed LAST in
  * both init epilogues as the ONE primary action. The copy-next block is
  * three commands (codex DX 9): wire the harness (the readiness
- * `harness_wiring` fix: absolute binary, `--surface starter` or init's `--surface`), save an
+ * `harness_wiring` fix: absolute binary, `--surface full` or init's `--surface`), save an
  * install-check marker (never a made-up fact about the user), and recall it.
  * The demo uses the facts arm only, so it works with NO embedding key [F-B]. Secondary paths (import, migrate) ride a single terse
  * "More:" footer so they never compete with the primary action.
  */
 let registrationSurface: McpSurface | undefined;
+let searchModeChoice: import('./init-mode-picker.ts').SearchModeChoice = {};
 function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boolean } = {}): void {
   const register = harnessRegistrationCommand(registrationSurface);
   console.log('');
@@ -1601,7 +1606,7 @@ export async function initPostgresCore(opts: {
     // PGLite path above — runs AFTER initSchema, idempotent on re-init.
     const { runModePicker: runPostgresModePicker } = await import('./init-mode-picker.ts');
     let searchMode: { mode: SearchModeName; reason: string } | undefined;
-    await runPostgresModePicker(engine, { jsonOutput: opts.jsonOutput, onDecision: d => { searchMode = d; } });
+    await runPostgresModePicker(engine, { jsonOutput: opts.jsonOutput, ...searchModeChoice, onDecision: d => { searchMode = d; } });
 
     const stats = await engine.getStats();
 
@@ -1855,7 +1860,8 @@ OPTIONS
   --chat-model <PROVIDER:MODEL>
                         Default subagent driver (v0.27+)
   --no-embedding        Defer embedding setup (skips the embedding-key check)
-  --surface <verbs|starter|full>  Tool surface the printed harness registration pins (default starter)
+  --surface <verbs|starter|full>  Tool surface the printed harness registration pins (default full)
+  --search-mode <conservative|balanced|tokenmax>  Record the operator's search mode (no first-run ask; an existing brain's mode needs --force)
   --skip-embed-check    Skip the init-time embedding-key validation (config +
                         live test-embed). Also via GBRAIN_INIT_SKIP_EMBED_CHECK=1
 

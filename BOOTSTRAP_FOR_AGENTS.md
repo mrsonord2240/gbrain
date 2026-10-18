@@ -1,4 +1,4 @@
-<!-- gbrain-runbook-stamp: 0.60.94.0 -->
+<!-- gbrain-runbook-stamp: 0.60.304.0 -->
 <!-- This stamp must equal the VERSION file at every release; CI enforces it
      (scripts/check-bootstrap-tag.sh). `gbrain bootstrap status` compares it to
      the installed binary and warns on skew. -->
@@ -91,17 +91,18 @@ registration only with `--mcp-even-if-plugin`.
    Then `gbrain bootstrap status` — it is idempotent and resume-aware; after any
    partial failure, re-run it and continue where it points.
 2. **Engine.** Two lanes; default to the first:
-   - **PGLite (default):** `gbrain init --pglite` (2 seconds, no server). This is
-     the lane that keeps the per-turn hook context injection working — the hook
-     IPC listener is PGLite-only today.
+   - **PGLite (default):** `gbrain init --pglite` (2 seconds, no server). The
+     per-turn hook context injection works whenever a `gbrain serve` for the
+     brain is running.
    - **Postgres-first (harness installs):** `gbrain init --prefer-postgres` walks
      a 5-rung ladder (env URL → Supabase token discovery → local Postgres →
      `--allow-docker` → PGLite floor) for installs that want concurrent
-     connections or multi-machine access. Tradeoff, stated plainly: a Postgres
-     brain gets MCP tools every session plus the pull protocol, but gives up the
-     per-turn hook lane until the engine-uniform listener lands (the degradation
-     matrix in `docs/guides/bootstrap.md` carries the row; INSTALL_FOR_AGENTS.md
-     "Engine preference for harness installs" carries the ladder detail).
+     connections or multi-machine access. A Postgres brain keeps the per-turn
+     hook lane too: the IPC listener is engine-uniform and keys its socket off
+     the connection URL, so the hooks fire whenever a `gbrain serve` for the
+     brain is running, same as PGLite (the degradation matrix in
+     `docs/guides/bootstrap.md` carries the row; INSTALL_FOR_AGENTS.md "Engine
+     preference for harness installs" carries the ladder detail).
 
    Search mode is
    auto-selected silently (conservative when keyless, tokenmax with an
@@ -189,6 +190,35 @@ registration only with `--mcp-even-if-plugin`.
    block below it — the ownership line and the cold-start offer are the two
    things the human must actually understand, not fine print.
 
+<!-- BEGIN multi-agent-rules (identical in AGENTS.md, BOOTSTRAP_FOR_AGENTS.md and INSTALL_FOR_AGENTS.md; bun run check:shared-tree-git) -->
+## Multi-agent rules for a shared brain checkout
+
+Several agents, crons and hooks often commit to one brain checkout on the same
+machine. In such a checkout:
+
+1. **Commit and push with one command, naming your files:**
+   `scripts/brain-commit-push.sh "<msg>" <paths>`, or
+   `gbrain git commit-push -m "<msg>" -- <paths>` when the brain has no helper.
+   It takes the checkout's writer lock, commits only those paths, merges remote
+   commits without touching anyone else's files, and fails loudly if the push
+   does not land.
+2. **Bring remote commits in with `--pull`** (`scripts/brain-commit-push.sh --pull`
+   or `gbrain git commit-push --pull`) at session start and before a batch of writes.
+3. **On a non-zero exit, read the code.** Retry once on `commit_lock_busy`.
+   Stop and relay to the user on `integrate_conflict` (they choose which
+   version wins) and on `writer_coordinator_required` (a managed brain: save
+   pages with `put_page` instead). `pushed_checkout_lagging` is a success.
+<!-- gbrain-allow-shared-tree-git-begin: the forbidden commands, named so agents avoid them -->
+4. **Never run** `git pull --rebase`, `git stash`, `--autostash`, `git add -A`,
+   `git commit -a`, `git reset --hard` or `git push --force` there, and never
+   fall back to them when the command fails. Never delete `.git/rebase-merge`
+   before saving its autostash with `git stash store`.
+<!-- gbrain-allow-shared-tree-git-end -->
+
+Outcomes, conflict recovery, a stuck rebase and the lock contract for host
+daemons: [docs/guides/shared-checkout-git.md](docs/guides/shared-checkout-git.md).
+<!-- END multi-agent-rules -->
+
 ## Machine two
 
 If this workspace was cloned from an existing agent repo (agent.json says
@@ -212,7 +242,7 @@ placeholder). Trust the CLI's detection over your own guesses.
   only repos attached to the session** — a repo created mid-session is NOT
   attached, so `gbrain bootstrap repo` refuses fast in cloud with the flow
   that works. Privacy verification falls back to pure git protocol on its own.
-- **`git push` works only against the session's working branch.** A user PAT
+- **`git push` works only against the session's working branch.** A user PAT <!-- gbrain-allow-shared-tree-git: describes the cloud sandbox's push limit, not a command to run -->
   does not bypass any of this.
 - **Only repo-committed files carry into the next session.** `~/.gbrain`,
   `~/.claude`, and the gitignored `.claude/settings.local.json` evaporate.

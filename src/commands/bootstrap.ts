@@ -146,14 +146,14 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
   attach [--harness H]            Machine two: adopt a cloned agent workspace.
   harness [--harness claude-code|codex|opencode|all] [--url U | --port N] [--source ID]
           [--token-name NAME | --token TOK] [--name MCPNAME] [--project DIR]...
-          [--no-hooks] [--no-capture] [--force] [--status] [--remove] [--refresh-skills] [--yes] [--json]
+          [--no-hooks] [--no-capture] [--force] [--status] [--remove [--dry-run]] [--refresh-skills] [--yes] [--json]
           [--seat <label> | --no-seat]
                                   Wire framework-spawned Claude Code / Codex / opencode
                                   sessions to a RUNNING \`gbrain serve --http\` on this box
                                   (#4043): scoped bearer token, user-scope MCP + headless
                                   pre-approval, lifecycle hooks (user scope, or per --project
                                   dir), codex config block, opencode config entry. No
-                                  agent.json needed. Idempotent; --remove tears it down.
+                                  agent.json needed. Idempotent; --remove tears it down (--dry-run previews).
                                   --source ID: the source the hooks + token bind to
                                   (default: sources.default, else the sole populated
                                   non-default source, else default).
@@ -203,9 +203,10 @@ const SUBCOMMAND_HELP: Record<string, string> = {
     '  under your own account), verify the privacy bit via the API, push.',
   hooks:
     'gbrain bootstrap hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]\n' +
-    '                       [--seat <label> | --no-seat] [--surface verbs|starter|full]\n' +
-    '  Register MCP (--surface starter unless given; a replaced entry keeps its surface) (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).\n' +
-    '  --seat credits captured sessions to this agent seat (kept on re-install; --no-seat clears it; --seat off records none).',
+    '                       [--seat <label> | --no-seat] [--surface verbs|starter|full] [--adopt [--name <server>]]\n' +
+    '  Register MCP (--surface full unless given; a replaced entry keeps its surface) (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).\n' +
+    '  --seat credits captured sessions to this agent seat (kept on re-install; --no-seat clears it; --seat off records none).\n' +
+    '  --adopt (Codex): record the project .codex/config.toml server you manage yourself as the wire evidence after a passing verify; writes no config.',
   verify:
     'gbrain bootstrap verify [--json]\n' +
     '  The whole install contract (round-trip, graph floor, magic moment, scans, hooks smoke). Exit 0 or not done.',
@@ -225,7 +226,7 @@ const SUBCOMMAND_HELP: Record<string, string> = {
   harness:
     'gbrain bootstrap harness [--harness claude-code|codex|opencode|all] [--url U | --port N] [--source ID]\n' +
     '                       [--token-name NAME | --token TOK] [--name MCPNAME] [--project DIR]...\n' +
-    '                       [--no-hooks] [--no-capture] [--force] [--status] [--remove] [--yes] [--json]\n' +
+    '                       [--no-hooks] [--no-capture] [--force] [--status] [--remove [--dry-run]] [--yes] [--json]\n' +
     '                       [--seat <label> | --no-seat]\n' +
     '  Wire framework-spawned Claude Code / Codex / opencode sessions to a RUNNING `gbrain serve --http`\n' +
     '  on this box (#4043). Idempotent; --remove tears it down. (--local is an accepted no-op alias.)\n' +
@@ -1053,6 +1054,18 @@ async function runRepo(ws: string, rest: string[], home: string, runner: ExecRun
   });
 }
 
+/** `hooks --adopt` (#4082): record an operator-managed Codex project connection as the wire evidence; writes no harness config. */
+async function runAdoptHooks(ws: string, rest: string[], home: string): Promise<number> {
+  const harnessFlag = flagValue(rest, '--harness');
+  const harness = isHarness(harnessFlag) ? harnessFlag : harnessFlag ? null : detectHarness();
+  if (!harness) { console.error('--adopt needs the harness — pass --harness codex'); return 2; }
+  if (readManifest(ws).state !== 'initialized') { console.error('not an initialized agent workspace — run `gbrain bootstrap render` first'); return 1; }
+  const { adoptConnection } = await import('../core/bootstrap/adopt-connection.ts');
+  const adopted = adoptConnection(ws, home, harness, flagValue(rest, '--name') ?? undefined);
+  for (const line of adopted.lines) (adopted.code === 0 ? console.log : console.error)(line);
+  return adopted.code;
+}
+
 async function runHooks(
   ws: string,
   rest: string[],
@@ -1755,10 +1768,10 @@ async function runHarness(rest: string[], home: string, runner: ExecRunner, dete
     prompt: promptLine,
     ...harnessDetectDeps(detect),
   };
-  // [X12] --status is READ-ONLY: no home mkdir, no lock — it must work (and
-  // stay side-effect-free) even while an apply/remove holds the mutex.
-  if (flags.status) {
-    return statusHarness(flags, deps);
+  // [X12] --status and --remove --dry-run are READ-ONLY: no home mkdir, no
+  // lock — they must work (and stay side-effect-free) while the mutex is held.
+  if (flags.status || (flags.remove && rest.includes('--dry-run'))) {
+    return flags.status ? statusHarness(flags, deps) : removeHarness(flags, deps);
   }
   ensureHarnessHome(home);
   return withLock(home, async () => {
@@ -2086,7 +2099,7 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
         code = await runRepo(ws, rest, home, runner);
         break;
       case 'hooks':
-        code = await runHooks(ws, rest, home, runner, opts.probeSpawn);
+        code = rest.includes('--adopt') ? await runAdoptHooks(ws, rest, home) : await runHooks(ws, rest, home, runner, opts.probeSpawn);
         break;
       case 'verify':
         code = await runVerify(ws, rest, home);

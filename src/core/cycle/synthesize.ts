@@ -1,8 +1,8 @@
 import { observationDateLine, observationDateRule } from '../ai/date-grounding.ts';
 import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
-import { postprocessManagedSynthesis, withPublishPending } from './synthesize-postprocess.ts';
-import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
+import { reportFileHolds, reverseWriteDreamRefs, writeDreamPageFile } from './derived-write-through.ts';
+import { deferPublishOrThrow, finishDeferredPostprocess, loadCommittedOutputsOrDefer, postprocessManagedSynthesis, withPostprocessConflicts, withPublishPending, type PostprocessConflict, type RetainedOutput } from './synthesize-postprocess.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -53,7 +53,6 @@ import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
  */
 
 import type Anthropic from '@anthropic-ai/sdk';
-import { writeFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
@@ -76,8 +75,8 @@ import { runSubagentsInline, runDrainRenewalTick, percentile, INLINE_LOCK_MS } f
 import { buildManifestContext, buildLinkManifest, type ManifestContext } from './link-manifest.ts';
 import { resolveCycleDate, utcDate } from './cycle-date.ts';
 import { throwIfAborted } from '../abort-check.ts';
-import { stampDreamProvenance } from './dream-provenance.ts';
-import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { stampDreamProvenance, summaryProvenanceLines } from './dream-provenance.ts';
+import { putDerivedPage, summaryDerivation, withTranscriptTaint } from './dream-taint.ts';
 import { findLegacyCompletion, findSynthV2Completion, partitionCompletedSynthesis } from './synthesize-completion.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7), the
@@ -90,13 +89,14 @@ import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscrip
 import { loadStorageConfig, isDbOnly } from '../storage-config.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
-import { validateSourceId } from '../utils.ts';
-import { safeSplitIndex } from '../text-safe.ts';
+import { safeSplitIndex, truncateUtf8 } from '../text-safe.ts';
 import { PAGE_SLUG_SEG } from '../cjk.ts';
 import { withChatPhase, estimateChatCostUsd } from '../ai/chat-usage.ts';
 import { verifyAndRepairDreamPages, normForGrounding, readVerifyEpoch, loadChildWriteEpochs, isDreamOwnedPage, type QuoteVerifyStats, type TranscriptForVerify } from './synthesize-verify.ts';
 import { dreamBreakerRefusal, loadDreamBreaker } from './dream-breaker.ts';
 import { resolveTriageDecide, type TriageDecide, type TriageDecideStats } from './triage-decide.ts';
+import { OperationError } from '../ops/contract.ts';
+import { backoffUntil, recordUnreliableTriage, responseDiagnostic, triageBackoffDetails, TRIAGE_UNRELIABLE_BACKOFF, VerdictCacheWrites, type TriageDiagnostic, type VerdictCacheFailure } from './triage-backoff.ts';
 import { resolveGroundingDecide } from './grounding-decide.ts';
 import { passesTriageGate, rescueConfigOf, DEFAULT_RESCUE_FLOOR, DEFAULT_RESCUE_MIN_SEGMENTS, DEFAULT_RESCUE_CONTENT_TYPES, DEFAULT_RESCUE_CONFIG, type RescueConfig, type RescueVerdictLike } from './triage-rescue.ts';
 
@@ -395,7 +395,8 @@ export async function runPhaseSynthesize(
   // calls keep their own job:* tag — the innermost AsyncLocalStorage phase
   // wins (minions/worker.ts wraps each job), and that is intentional: the
   // authoritative child spend rolls up from minion_jobs token columns below.
-  return withChatPhase('phase:synthesize', () => runPhaseSynthesizeInner(engine, opts));
+  const startedAt = Date.now(); // #6757: outputs an earlier pass deferred finish even when this pass returns before postprocessing
+  return withChatPhase('phase:synthesize', async () => finishDeferredPostprocess(engine, opts, startedAt, await runPhaseSynthesizeInner(engine, opts), loadSynthConfig));
 }
 
 async function runPhaseSynthesizeInner(
@@ -566,7 +567,7 @@ async function runPhaseSynthesizeInner(
       judged: pass.judged,
       cache_hits: pass.cacheHits,
       unreliable: pass.unreliable,
-      deferred: pass.deferred,
+      deferred: pass.deferred, ...triageBackoffDetails(pass.backoff), ...(pass.verdictCacheFailures.length ? { verdict_cache_failures: pass.verdictCacheFailures } : {}),
       degraded: degradedCount,
       below_threshold: pass.reports.filter(r => r.score !== null && !r.worth).length,
       // F6 spend visibility: judge-call tokens for this pass's cache MISSES
@@ -584,9 +585,9 @@ async function runPhaseSynthesizeInner(
       rescue_fired: pass.reports.filter(r => r.rescued === true).length, ...(pass.decide ? { decide: pass.decide } : {}),
     };
     // 3A: a time-boxed cold pass must never read as mass rejection.
-    const deferralSuffix = pass.deferred > 0
+    const deferralSuffix = (pass.deferred > 0
       ? ` (${pass.deferred} not yet triaged — time budget; re-run or use dream retriage)`
-      : '';
+      : '') + (pass.backoff > 0 ? ` (${pass.backoff} in unreliable-verdict backoff — dream retriage --force re-judges)` : '');
 
     // Dry-run stops here: the triage pass ran (scores cached), but no
     // synthesis. Codex finding #8: --dry-run does NOT mean "zero LLM calls";
@@ -910,6 +911,7 @@ async function runPhaseSynthesizeInner(
           oneshot_slug_suffix: chunks.length > 1
             ? `${t.contentHash.slice(0, 6)}-c${i}`
             : t.contentHash.slice(0, 6),
+          oneshot_task_prefixes: [config.reflectionsPrefix, config.originalsPrefix], // #6160: oneshot task shapes
           require_writes: true,
           // #1586: scope every child tool call to the cycle's resolved source
           // so put_page writes land there instead of the hardcoded 'default'.
@@ -1133,11 +1135,11 @@ async function runPhaseSynthesizeInner(
     // (source, slug) row. #1586: refs are stamped with the cycle's resolved
     // source (children write there via SubagentHandlerData.source_id;
     // cycleSourceId is hoisted above the fan-out for the daily cap).
-    // F6 rule-D visibility: track which children actually wrote pages, so a
-    // rescued/passed transcript whose child declined to write (task D) is
-    // distinguishable from a triage miss in the phase telemetry.
+    // F6 rule-D visibility: track which children wrote pages, so a rescued/passed transcript
+    // whose child declined to write (task D) is distinguishable from a triage miss in telemetry.
     const jobsWithPages = new Set<number>();
-    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages), worthProcessing);
+    const committedOutputs = maintenance ? await loadCommittedOutputsOrDefer(engine, maintenance, childIds, { jobRawSource, transcripts: worthProcessing, signal: opts.signal }) : undefined;
+    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages, committedOutputs?.outputs), worthProcessing);
     let finalizedRefs = writtenRefs;
 
     // Grounding gate: verify every page the children wrote (whole page when
@@ -1146,39 +1148,40 @@ async function runPhaseSynthesizeInner(
     // chunks or the markdown body. Fail-open (abort still unwinds); kill
     // switch: dream.synthesize.quote_verify=false.
     let quoteVerifyStats: QuoteVerifyStats | null = null;
-    let publishPending = 0;
+    let publishPending = 0, postprocessConflicts: PostprocessConflict[] = [], postprocessDeferral: Awaited<ReturnType<typeof postprocessManagedSynthesis>>['deferral'] = null;
     const sinceByTranscript = await loadChildWriteEpochs(engine, childIds, jobRawSource, verifySince);
     const grounding = config.quoteVerify ? await resolveGroundingDecide(engine) : undefined;
     if (maintenance) {
       const processed = await postprocessManagedSynthesis(engine, maintenance, writtenRefs, childIds, jobRawSource,
-        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal, grounding });
+        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal, grounding, committedOutputs, meetingTranscriptsDir: config.meetingTranscriptsDir });
       writtenRefs = processed.writtenRefs;
       finalizedRefs = processed.finalizedRefs;
-      publishPending = processed.pending;
+      [publishPending, postprocessConflicts, postprocessDeferral] = [processed.pending, processed.conflicts, processed.deferral];
       quoteVerifyStats = config.quoteVerify ? processed.stats : null;
     } else if (config.quoteVerify && writtenRefs.length > 0) {
       const transcriptsForVerify = new Map<string, TranscriptForVerify>(worthProcessing.map(t => [t.filePath, { content: t.content }]));
       try {
         quoteVerifyStats = await verifyAndRepairDreamPages(engine, writtenRefs, transcriptsForVerify,
-          { since: verifySince, sinceByTranscript, checkedAt: summaryDate, signal: opts.signal, grounding });
+          { since: verifySince, sinceByTranscript, checkedAt: summaryDate, signal: opts.signal, grounding, meetingTranscriptsDir: config.meetingTranscriptsDir });
       } catch (e) {
         throwIfAborted(opts.signal, '[dream] quote verify');
         process.stderr.write(`[dream] quote verify pass failed open: ${e instanceof Error ? e.message : String(e)}\n`);
       }
     }
 
+    if (!maintenance) writtenRefs = await withTranscriptTaint(engine, writtenRefs, worthProcessing, config.meetingTranscriptsDir);
     if (!maintenance) await stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal);
 
     // Dual-write: reverse-render each DB row → markdown file.
-    const reverseWriteCount = maintenance ? (maintenance.binding ? writtenRefs.length : 0)
-      : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
+    const fileHolds: string[] = [];
+    const reverseWriteCount = maintenance ? (maintenance.binding ? writtenRefs.length : 0) : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal, fileHolds);
 
     const summarySlug = buildDreamSummarySlug(config.outputRoot, summaryDate);
     const writtenSlugs = writtenRefs.map(r => r.slug);
     if (SUMMARY_SLUG_RE.test(summarySlug) && !publishPending) {
       const preserveSummary = maintenance && !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
       if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance)
-        .catch((e: unknown) => { if (!acceptedPendingReceipt(e)) throw e; publishPending++; });
+        .then(held => held && fileHolds.push(held), (e: unknown) => { deferPublishOrThrow(e, summarySlug); publishPending++; });
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
@@ -1350,7 +1353,7 @@ async function runPhaseSynthesizeInner(
     const turnsSamples = childOutcomes.filter(
       (o): o is { jobId: number; status: string; turns: number } => typeof o.turns === 'number',
     );
-    return withPublishPending(publishPending, ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
+    return reportFileHolds(withPostprocessConflicts(postprocessConflicts, withPublishPending(publishPending, ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
       transcripts_discovered: transcripts.length,
       transcripts_processed: submittedTranscripts,
       pages_written: writtenSlugs.length,
@@ -1417,10 +1420,10 @@ async function runPhaseSynthesizeInner(
         // child counters + triage pass usage). cost_usd null when unpriced.
         spend: spendBlock,
       },
-    }));
+    }), postprocessDeferral)), fileHolds, 'page');
   } catch (e) {
-    return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL',
-      e instanceof Error ? (e.message || 'synthesize phase threw') : String(e)));
+    return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL', e instanceof Error ? (e.message || 'synthesize phase threw') : String(e),
+      e instanceof OperationError ? e.suggestion : undefined), e instanceof OperationError ? { error_code: e.code } : {});
   } finally {
     if (ownedPrivateQueue) {
       try {
@@ -1986,10 +1989,12 @@ export interface TriageResult {
    *                   could be parsed out of the response. Out-of-range scores
    *                   land here deliberately — clamping would cache a
    *                   fabricated verdict.
-   * runTriagePass skips putDreamVerdict for these so the next cycle re-judges
-   * the transcript instead of permanently trusting a degenerate rejection.
+   * runTriagePass never caches these as a verdict: it writes a backoff marker
+   * (triage-backoff.ts) so the same input is not re-paid every cycle.
    */
   unreliable?: 'truncated' | 'refusal' | 'unparseable';
+  /** Set with `unreliable`: stop reason, length and digest of the response, never its text. */
+  diagnostic?: TriageDiagnostic;
   /**
    * F6: judge-call token usage when the client surfaced it (gateway clients
    * do; legacy SDK-shape mocks may not). Present on degenerate results too —
@@ -2127,8 +2132,10 @@ Quote verbatim; never paraphrase inside "quote".`;
     ? { in: rawUsage.input_tokens, out: rawUsage.output_tokens }
     : undefined;
   const answeredBy = (msg as { answered_by?: string }).answered_by;
-  const withTokens = (r: TriageResult): TriageResult =>
-    ({ ...r, ...(callTokens ? { tokens: callTokens } : {}), ...(answeredBy ? { answeredBy } : {}) });
+  const withTokens = (r: TriageResult): TriageResult => ({
+    ...r, ...(callTokens ? { tokens: callTokens } : {}), ...(answeredBy ? { answeredBy } : {}),
+    ...(r.unreliable ? { diagnostic: responseDiagnostic(stopReasonRaw, text) } : {}),
+  });
   const refused = stopReasonRaw === 'refusal';
   const abnormalStop: TriageResult['unreliable'] | undefined =
     truncated ? 'truncated' : refused ? 'refusal' : undefined;
@@ -2164,7 +2171,7 @@ Quote verbatim; never paraphrase inside "quote".`;
     // buildTriageMapBlock (security review, #4152).
     const collapse = (s: string): string => s.replace(/\s+/g, ' ').trim();
     const contentType = typeof parsed.content_type === 'string'
-      ? collapse(parsed.content_type).toLowerCase().slice(0, 40) || null
+      ? truncateUtf8(collapse(parsed.content_type).toLowerCase(), 40) || null
       : null;
     const segments: TriageSegment[] = Array.isArray(parsed.segments)
       ? parsed.segments
@@ -2173,15 +2180,15 @@ Quote verbatim; never paraphrase inside "quote".`;
             && (s as { quote: string }).quote.trim().length > 0)
           .slice(0, 8)
           .map(s => ({
-            quote: collapse(s.quote).slice(0, 300),
-            ...(typeof s.note === 'string' && s.note.trim() ? { note: collapse(s.note).slice(0, 200) } : {}),
+            quote: truncateUtf8(collapse(s.quote), 300),
+            ...(typeof s.note === 'string' && s.note.trim() ? { note: truncateUtf8(collapse(s.note), 200) } : {}),
           }))
       : [];
     const entities = Array.isArray(parsed.entities)
       ? parsed.entities
           .filter((e): e is string => typeof e === 'string' && e.trim().length > 0)
           .slice(0, 12)
-          .map(e => collapse(e).slice(0, 80))
+          .map(e => truncateUtf8(collapse(e), 80))
       : [];
     const reasons = Array.isArray(parsed.reasons)
       ? parsed.reasons.filter((r): r is string => typeof r === 'string').slice(0, 4)
@@ -2349,8 +2356,10 @@ export interface TriageFileReport {
   reasons: string[];
   cached: boolean;
   unreliable?: string;
-  /** True when the maxMs budget (or shouldStop) expired before this file could be judged. */
+  /** True when the maxMs budget (or shouldStop) expired, or an unreliable-verdict backoff holds, before this file could be judged. */
   deferred?: boolean;
+  /** `triage_unreliable_backoff` when a backoff marker deferred the file (counted in the pass's `backoff`, not `deferred`). */
+  code?: string;
 }
 
 export interface TriagePassResult {
@@ -2362,10 +2371,14 @@ export interface TriagePassResult {
   cacheHits: number;
   unreliable: number;
   deferred: number;
+  /** Files skipped by an unreliable-verdict backoff marker: free, and not a budget deferral. */
+  backoff: number;
   /** F6: summed judge-call usage across cache MISSES this pass (hits are free). */
   tokens: { in: number; out: number };
   /** S7 decide stats, present only when the slot is not off. */
   decide?: TriageDecideStats;
+  /** Verdicts judged this pass that the database refused to cache (GBRA-130 B-6); each still decided this pass. */
+  verdictCacheFailures: VerdictCacheFailure[];
 }
 
 /**
@@ -2388,7 +2401,9 @@ export interface TriagePassResult {
  * Failure contract (byte-compatible with the pre-#4152 sequential loop):
  * a null judge client or an AIConfigError degrades PER TRANSCRIPT (reason
  * entry, nothing cached, phase continues); any other error aborts new pulls,
- * lets in-flight items settle, and rethrows (the phase fails).
+ * lets in-flight items settle, and rethrows (the phase fails). A verdict the
+ * database refuses to cache for one transcript does not stop the pass
+ * (`VerdictCacheWrites`, GBRA-130 B-6).
  *
  * Lock renewal: `yieldDuringPhase` ticks at most once per 30s (single-flight).
  * The cycle lock has its own background refresher (cycle.ts
@@ -2412,12 +2427,14 @@ export async function runTriagePass(
   let cacheHits = 0;
   let unreliableCount = 0;
   let deferredCount = 0;
+  let backoffCount = 0;
   let tokensIn = 0;
   let tokensOut = 0;
 
   let cursor = 0;
   let abortError: unknown = null;
   let stopped = false;
+  const verdictCache = new VerdictCacheWrites();
 
   // Coarse single-flight lock-renewal tick (at most every 30s).
   let lastTick = start;
@@ -2461,7 +2478,8 @@ export async function runTriagePass(
   const processLlm = async (idx: number): Promise<void> => {
     const t = transcripts[idx];
     // Cache lookup is always free — never deferred by the time budget.
-    const cached = cfg.force ? null : await engine.getDreamVerdict(t.filePath, t.contentHash);
+    const existing = await engine.getDreamVerdict(t.filePath, t.contentHash);
+    const cached = cfg.force ? null : existing;
     const cacheValid = cached !== null && isTriageCacheValid(cached, cfg.model, cfg.staleBefore);
     if (cached && cacheValid) {
       cacheHits++;
@@ -2475,6 +2493,15 @@ export async function runTriagePass(
         content_type: cached.content_type,
         reasons: cached.reasons,
         cached: true,
+      };
+      return;
+    }
+    const backedOffUntil = cfg.force ? null : backoffUntil(existing, cfg.model, TRIAGE_VERSION);
+    if (backedOffUntil) {
+      backoffCount++;
+      reports[idx] = {
+        filePath: t.filePath, worth: false, score: null, content_type: null, cached: false, deferred: true, code: TRIAGE_UNRELIABLE_BACKOFF,
+        reasons: [`${TRIAGE_UNRELIABLE_BACKOFF}: the last judge verdict was unreliable; not re-judged before ${backedOffUntil}`],
       };
       return;
     }
@@ -2528,16 +2555,14 @@ export async function runTriagePass(
         tokensOut += triage.tokens.out;
       }
       if (triage.unreliable) {
-        // Degenerate judgement — do NOT write it to dream_verdicts: a cached
-        // rejection is permanent for this content hash, and a triage model
-        // that reliably truncates would silently reject every transcript
-        // forever. Log + skip so the next cycle re-judges.
+        // Degenerate judgement — never cached as a verdict (a cached rejection
+        // is permanent for this content hash). A backoff marker instead keeps
+        // the next cycles from paying to re-judge the same input (#6069).
         unreliableCount++;
-        process.stderr.write(
-          `[dream] triage for ${t.basename} was ${triage.unreliable} ` +
-          `(${triage.reasons.join('; ')}); not caching in dream_verdicts — ` +
-          `next cycle will re-judge ${t.filePath}\n`,
-        );
+        await recordUnreliableTriage(engine, t, triage.unreliable, triage.diagnostic, {
+          existing, keepExisting: existing !== null && isTriageCacheValid(existing, cfg.model),
+          model: cfg.model, triageVersion: TRIAGE_VERSION, aborted: cfg.signal?.aborted === true,
+        });
         reports[idx] = {
           filePath: t.filePath,
           worth: false,
@@ -2555,7 +2580,7 @@ export async function runTriagePass(
       if (triage.answeredBy) {
         process.stderr.write(`[dream] triage for ${t.basename} came from fallback model ${triage.answeredBy}; not caching in dream_verdicts\n`);
       } else {
-        await engine.putDreamVerdict(t.filePath, t.contentHash, {
+        await verdictCache.put(engine, t, {
           worth_processing: triage.worth_processing,
           reasons: triage.reasons,
           score: triage.score,
@@ -2564,7 +2589,7 @@ export async function runTriagePass(
           entities: triage.entities,
           model: cfg.model,
           triage_version: TRIAGE_VERSION,
-        });
+        }, { existing, keepExisting: existing !== null && isTriageCacheValid(existing, cfg.model), signal: cfg.signal });
       }
       byPath.set(t.filePath, {
         worth_processing: triage.worth_processing,
@@ -2629,6 +2654,7 @@ export async function runTriagePass(
     Array.from({ length: Math.min(concurrency, Math.max(1, transcripts.length)) }, () => worker()),
   );
   if (abortError !== null) throw abortError;
+  await verdictCache.backOff(engine, { model: cfg.model, triageVersion: TRIAGE_VERSION, aborted: cfg.signal?.aborted === true });
 
   // Defensive: today every claimed index either sets its report or the pass
   // rethrows above, so no holes can exist — but a future early-exit path
@@ -2649,7 +2675,7 @@ export async function runTriagePass(
     }
   }
 
-  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount, tokens: { in: tokensIn, out: tokensOut }, ...(cfg.decide ? { decide: cfg.decide.stats } : {}) };
+  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount, backoff: backoffCount, tokens: { in: tokensIn, out: tokensOut }, verdictCacheFailures: verdictCache.failures, ...(cfg.decide ? { decide: cfg.decide.stats } : {}) };
 }
 
 // ── Subagent prompt ──────────────────────────────────────────────────
@@ -2752,7 +2778,7 @@ export function buildTriageMapBlock(
     lines.push('- candidate segments:');
     for (let i = 0; i < segments.length; i++) {
       const s = segments[i];
-      lines.push(`  ${i + 1}. "${s.quote.slice(0, 300)}"${s.note ? ` — ${s.note.slice(0, 200)}` : ''}`);
+      lines.push(`  ${i + 1}. "${truncateUtf8(s.quote, 300)}"${s.note ? ` — ${truncateUtf8(s.note, 200)}` : ''}`);
     }
   }
   if (chunkTotal > 1) {
@@ -2893,6 +2919,7 @@ async function collectChildPutPageSlugs(
   // collects the job ids that produced ≥1 put_page write, so the caller can
   // count zero-page children without a second subagent_tool_executions scan.
   outJobsWithPages?: Set<number>,
+  committed: RetainedOutput[] = [], // #6616: canonical slug of a managed child's committed write; unmatched keeps its raw slug
 ): Promise<Array<{ slug: string; source_id: string; raw_source?: string; first_write_at?: Date }>> {
   if (childIds.length === 0) return [];
   // Raw fetch — NO SELECT DISTINCT. Preserves per-child slug duplicates so
@@ -2929,7 +2956,8 @@ async function collectChildPutPageSlugs(
     const jobId = Number(r.job_id);
     outJobsWithPages?.add(jobId);
     const ci = chunkInfo.get(jobId);
-    const slug = ci ? rewriteChunkedSlug(r.slug, ci.hash6, ci.idx) : r.slug;
+    const written = committed.find(o => Number(o.job_id) === jobId && o.input_slug === r.slug)?.request.slug ?? r.slug;
+    const slug = ci ? rewriteChunkedSlug(written, ci.hash6, ci.idx) : written;
     if (!rewritten.has(slug) || rewritten.get(slug) === undefined) {
       rewritten.set(slug, jobRawSource?.get(jobId));
     }
@@ -2946,43 +2974,11 @@ async function collectChildPutPageSlugs(
 
 // ── Reverse-write DB rows → markdown files ───────────────────────────
 
-async function reverseWriteRefs(
-  engine: BrainEngine,
-  brainDir: string,
-  refs: Array<{ slug: string; source_id: string; first_write_at?: Date }>,
-  nativeSourceId = 'default',
-  signal?: AbortSignal,
-): Promise<number> {
-  let count = 0;
-  for (const { slug, source_id, first_write_at } of refs) {
-    throwIfAborted(signal, '[dream] synthesize reverse-write');
-    // v0.32.8 F6: validate source_id is filesystem-safe before any join().
-    validateSourceId(source_id);
-    const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
-    const tags = await engine.getTags(slug, { sourceId: source_id });
-    // #4077: re-check after the row reads — an abort that lands during
-    // getPage/getTags must not reach this ref's file write.
-    throwIfAborted(signal, '[dream] synthesize reverse-write');
-    try {
-      const md = isDreamOwnedPage(page, first_write_at) ? renderPageToMarkdown(page, tags) : serializePageToMarkdown(page, tags);
-      // v0.32.8 F6: foreign-source pages land at brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide. Pages belonging to
-      // the cycle's own source (#1586: brainDir IS that source's checkout —
-      // legacy 'default' when unscoped) stay at brainDir/<slug>.md.
-      const filePath = source_id === nativeSourceId
-        ? join(brainDir, `${slug}.md`)
-        : join(brainDir, '.sources', source_id, `${slug}.md`);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, md, 'utf8');
-      count++;
-    } catch (e) {
-      // Per-slug failures are non-fatal — phase continues.
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`[dream] reverse-write ${slug}@${source_id} failed: ${msg}\n`);
-    }
-  }
-  return count;
+/** Reverse-render each page a child wrote to its markdown file (`reverseWriteDreamRefs`, #6982); holds go to `held`. */
+async function reverseWriteRefs(engine: BrainEngine, brainDir: string, refs: Array<{ slug: string; source_id: string; first_write_at?: Date }>,
+  nativeSourceId = 'default', signal?: AbortSignal, held?: string[]): Promise<number> {
+  return reverseWriteDreamRefs(engine, brainDir, refs, { phase: 'synthesize', nativeSourceId, signal, held,
+    render: (page, tags, ref) => isDreamOwnedPage(page, ref.first_write_at) ? renderPageToMarkdown(page, tags) : serializePageToMarkdown(page, tags) });
 }
 
 /**
@@ -3032,6 +3028,11 @@ export function renderPageToMarkdown(page: Page, tags: string[]): string {
  */
 const SUMMARY_LINK_SAMPLE_LIMIT = 20;
 
+/**
+ * Write the cycle's summary index page: the database row (the prior body kept in page_versions, `putDerivedPage`),
+ * then its file through `writeDreamPageFile` (#6982). Returns the file's `file_database_drift` entry when the file
+ * holds an edit the database lacks and was kept.
+ */
 async function writeSummaryPage(
   engine: BrainEngine,
   brainDir: string,
@@ -3042,7 +3043,7 @@ async function writeSummaryPage(
   sourceId = 'default',
   signal?: AbortSignal,
   maintenance?: MaintenanceAuthority | null,
-): Promise<void> {
+): Promise<string | undefined> {
   throwIfAborted(signal, '[dream] synthesize summary');
   const completed = childOutcomes.filter(c => c.status === 'completed').length;
   const failed = childOutcomes.length - completed;
@@ -3056,8 +3057,8 @@ async function writeSummaryPage(
   if (writtenSlugs.length > 0) {
     // #4337: deterministic, lexicographically sorted sample — small cycles
     // stay fully linked; large cycles list exactly SUMMARY_LINK_SAMPLE_LIMIT
-    // links while keeping exact totals above. The full child set stays
-    // recoverable via per-page provenance frontmatter (pointer below).
+    // links while keeping exact totals above. The provenance section below
+    // names the frontmatter query and what it misses (#6642).
     const sampledSlugs = [...writtenSlugs].sort().slice(0, SUMMARY_LINK_SAMPLE_LIMIT);
     lines.push(
       writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT
@@ -3068,14 +3069,7 @@ async function writeSummaryPage(
       '',
     );
     if (writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT) {
-      lines.push(
-        '## Full output provenance',
-        '',
-        `The complete ${writtenSlugs.length}-page set is recoverable in this source by querying page frontmatter for ` +
-          `\`dream_generated: true\` and \`dream_cycle_date: ${summaryDate}\`, excluding \`${summarySlug}\`. ` +
-          'Every child page carries those provenance fields; this summary intentionally links only the deterministic sample above.',
-        '',
-      );
+      lines.push(...await summaryProvenanceLines(engine, { sourceId, cycleDate: summaryDate, summarySlug, writtenSlugs }));
     }
   }
 
@@ -3087,10 +3081,10 @@ async function writeSummaryPage(
     {
       dream_generated: true,
       dream_cycle_date: summaryDate,
-      // #4337: immutable mirror — reruns preserve the first cycle date via
-      // stampDreamProvenance/renderPageToMarkdown; the summary is per-date so
-      // both keys are simply the summary's own date.
+      // #4337: immutable mirror (reruns keep the first date via stampDreamProvenance); #6773: `created` is the
+      // temporal key lint requires. The summary is per-date, so each key is simply the summary's own date.
       dream_created_cycle_date: summaryDate,
+      created: summaryDate,
       // #1978: deterministic index page — no source document of its own;
       // raw traces live on the listed pages. Explicit exemption keeps the
       // doctor raw_provenance check quiet.
@@ -3102,15 +3096,15 @@ async function writeSummaryPage(
     { type: 'note' as string, title: `Dream cycle ${summaryDate}`, tags: ['dream-cycle'] },
   );
 
-  const { parseMarkdown } = await import('../markdown.ts');
+  const [{ parseMarkdown }, derivation] = await Promise.all([import('../markdown.ts'), summaryDerivation(engine, sourceId, writtenSlugs)]);
   const parsed = parseMarkdown(fullMarkdown);
-  if (!maintenance) await maintenanceTransaction(engine, tx => tx.putPage(summarySlug, {
+  if (!maintenance) await putDerivedPage(engine, derivation, summarySlug, {
     type: parsed.type,
     title: parsed.title,
     compiled_truth: parsed.compiled_truth,
     timeline: parsed.timeline,
     frontmatter: parsed.frontmatter,
-  }, { sourceId }));
+  }, { sourceId, tags: parsed.tags });
 
   const fileWriteRaw = (await engine.getConfig('dream.synthesize.summary_file_write'))?.trim().toLowerCase();
   const fileWriteEnabled = !(fileWriteRaw === 'false' || fileWriteRaw === '0' || fileWriteRaw === 'off');
@@ -3127,7 +3121,7 @@ async function writeSummaryPage(
   if (!fileWriteEnabled || dbOnlyTier) {
     if (maintenance) {
       const snapshot = await engine.readPageSnapshot(summarySlug, { sourceId, includeDeleted: true });
-      await publishMaintenancePage(engine, maintenance, summarySlug, fullMarkdown, { expectedRevision: snapshot?.revision ?? null, file: false });
+      await publishMaintenancePage(engine, maintenance, summarySlug, fullMarkdown, { expectedRevision: snapshot?.revision ?? null, file: false, derivation: derivation.declaration });
     }
     const why = !fileWriteEnabled ? 'dream.synthesize.summary_file_write=off' : 'db_only storage tier';
     process.stderr.write(`[dream] summary file-write skipped (${why}): ${summarySlug} lives in the DB only\n`);
@@ -3136,17 +3130,18 @@ async function writeSummaryPage(
 
   if (maintenance) {
     const snapshot = await engine.readPageSnapshot(summarySlug, { sourceId, includeDeleted: true });
-    await publishMaintenancePage(engine, maintenance, summarySlug, fullMarkdown, { expectedRevision: snapshot?.revision ?? null });
+    await publishMaintenancePage(engine, maintenance, summarySlug, fullMarkdown, { expectedRevision: snapshot?.revision ?? null, derivation: derivation.declaration });
     return;
   }
   try {
-    const filePath = join(brainDir, `${summarySlug}.md`);
-    mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, fullMarkdown, 'utf8');
+    const file = await writeDreamPageFile(engine, brainDir, summarySlug, sourceId, { nativeSourceId: sourceId, markdown: fullMarkdown });
+    if (!file.written && file.held) return file.held;
+    if (!file.written && file.error) process.stderr.write(`[dream] summary file-write failed: ${file.error}\n`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     process.stderr.write(`[dream] summary file-write failed: ${msg}\n`);
   }
+  return undefined;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

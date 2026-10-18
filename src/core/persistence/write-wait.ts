@@ -8,8 +8,10 @@ import { loadConfig, type GBrainConfig } from '../config.ts';
 import { getCliOptions } from '../cli-options.ts';
 import { PENDING_WRITE_EXIT_CODE } from '../exit-codes.ts';
 import { OperationError } from '../ops/contract.ts';
+import { pinRouting, type FixRouting } from '../fix-routing.ts';
 import { admittedPendingReceipt, type WriteReceipt } from './types.ts';
 import { WIRE_WRITE_WAIT_MAX_MS } from './params.ts';
+import { shellQuote } from '../shell-quote.ts';
 
 /** Agent and server callers keep the historical bounded wait. */
 export const AGENT_WRITE_WAIT_MS = 5_000;
@@ -120,9 +122,17 @@ export function writeErrorExitCode(error: unknown, acceptPending: boolean): numb
   return acceptPending ? 0 : PENDING_WRITE_EXIT_CODE;
 }
 
-/** The copy-paste poll command for a pending receipt. */
-export function pollCommand(requestId: string): string {
-  return `gbrain call get_write_request '${JSON.stringify({ request_id: requestId })}'`;
+/**
+ * The copy-paste poll command for a pending receipt (#6255): the same
+ * `gbrain write-request [--brain <id>] -- <request_id>` argv the error
+ * envelope's `fix` carries. A `fix.argv` that reads this receipt wins, so the
+ * two never disagree; otherwise the receipt command is pinned to `routing`.
+ * Each argument is shell-quoted, so the line pastes as the argv it names.
+ */
+export function pollCommand(requestId: string, fix?: { argv?: readonly string[] }, routing?: FixRouting): string {
+  const argv = fix?.argv?.[0] === 'gbrain' && fix.argv[1] === 'write-request' && fix.argv.includes(requestId)
+    ? fix.argv : pinRouting(['gbrain', 'write-request', '--', requestId], routing);
+  return argv.map(shellQuote).join(' ');
 }
 
 /**

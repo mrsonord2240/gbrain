@@ -18,6 +18,8 @@
 #
 # Env overrides:
 #   GBRAIN_VERIFY_TIMEOUT       per-check wallclock cap, seconds (default 120)
+#   GBRAIN_VERIFY_SKIP_TYPECHECK=1  leave typecheck out: test.yml's typecheck job
+#                               runs tsc in parallel under its own measured timeout
 #   GBRAIN_VERIFY_LOG_DIR       where to write per-check logs (default tempdir,
 #                               removed on success and kept on failure)
 #   GBRAIN_TEST_RECEIPT_DIR     also write the verify receipt (X2): one JUnit
@@ -76,6 +78,8 @@ CHECKS=(
   "check:orphan-modules"
   # agent contract v1 (A2): generated docs/guides/error-codes.md matches the registry
   "check:error-codes"
+  # #5575 ENG-16: write-gate detector patterns are bounded and window-safe
+  "check:write-gate-regex"
   # agent contract v1 scanner (B9): shrink-only per-rule baselines
   "check:agent-contract"
   # No-op placeholder assertions (expect(true).toBe(true) and friends) in
@@ -139,6 +143,7 @@ CHECKS=(
   "check:fixture-privacy"
   "check:source-scope-onboard"
   "check:getpage-scope"
+  "check:origin-assignment"
   "check:no-double-retry"
   "check:batch-audit-site"
   "check:engine-dynamic-import"
@@ -160,6 +165,9 @@ CHECKS=(
   # W5 (refactor wave 1): per-function line ratchet over src/**/*.ts (TS AST,
   # ~1.5s); baseline scripts/function-size-baseline.tsv.
   "check:function-size"
+  # GBRA-130: per-item catches that test an error code against a list and
+  # rethrow the rest only shrink; baseline scripts/item-allowlist-catches-baseline.tsv.
+  "check:item-allowlist-catches"
   # EO10 (refactor wave 1): engine-sql/ and schema-migrations/ never import
   # back up into the engine façades or migrate.ts (ESM TDZ cycles).
   "check:layering"
@@ -169,9 +177,21 @@ CHECKS=(
   # #5595/#5475: no fsync of a read-only descriptor outside src/core/fs-durable.ts
   # (Windows refuses it with EPERM).
   "check:durable-flush"
+  # Wave 18b: a missing column/table reads as "pre-migration" only when the
+  # handler names it (isMissingSchemaObject); broad predicates are allowlisted.
+  "check:schema-error-predicates"
+  # #4992: subprocess launches go through src/core/spawn.ts (windowsHide
+  # default); NOT_YET_MIGRATED is a ratchet that only shrinks.
+  "check:windows-hide"
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"
+  # Wave B segmented storage (spec 1.5 layer 4): whole-body page readers only
+  # shrink; baseline scripts/page-body-readers-baseline.tsv.
+  "check:page-body-readers"
+  # Wave B large pages: every content_chunks reader applies the chunk-visibility
+  # predicate or carries a reason; baseline scripts/chunk-visibility-baseline.tsv only shrinks.
+  "check:chunk-visibility"
   # CQ3 / EO17 (refactor wave 1): engine-sql splices only constant text, no
   # composed $n, no expanded IN lists.
   "check:engine-sql-dynamic"
@@ -186,6 +206,10 @@ CHECKS=(
   # W7 (refactor wave 1): workflow phrases the wave retired stay out of the
   # docs agents follow (CLAUDE.md, AGENTS.md, CONTRIBUTING.md, docs/, skills/).
   "check:retired-phrases"
+  # #6530: skills, recipes, templates, docs, plugin trees and agent docs never
+  # teach git pull --rebase, stash, autostash, repo-wide add/commit, reset
+  # --hard or a bare/force push for a shared brain checkout (~0.5s).
+  "check:shared-tree-git"
   "check:schema-migration-order"
   "check:structural-manifest"
   # Every generated artifact's freshness in one place (GBRA-47 B8); its Fix
@@ -210,6 +234,11 @@ SOLO_CHECKS=(
   # Budget: 30 s wall clock (scripts/guard-self-test.sh BUDGET_SECONDS).
   "check:guard-self-test"
 )
+if [ "${GBRAIN_VERIFY_SKIP_TYPECHECK:-}" = "1" ]; then
+  KEPT=()
+  for c in "${CHECKS[@]}"; do [ "$c" = "typecheck" ] || KEPT+=("$c"); done
+  CHECKS=("${KEPT[@]}")
+fi
 ALL_CHECKS=("${CHECKS[@]}" "${SOLO_CHECKS[@]}")
 
 if [ "${#CHECKS[@]}" -eq 0 ]; then
@@ -293,13 +322,22 @@ spawn_check() {
       bun run "$c" > "$LOG_FILE" 2>&1 &
       pid=$!
       # The watchdog owns no caller pipes (an orphaned sleep holding stdout
-      # stalled spawnSync callers for the whole $TIMEOUT) and its TERM trap
-      # takes its sleep down with it, closing the window where pkill -P runs
-      # before the sleep is forked.
-      ( trap 'kill "$nap" 2>/dev/null; exit 0' TERM
-        sleep "$TIMEOUT" & nap=$!
-        wait "$nap" && kill -TERM "$pid" 2>/dev/null && \
-          sleep 5 && kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+      # stalled spawnSync callers for the whole $TIMEOUT). Each of its sleeps
+      # runs through `nap`: on TERM the watchdog kills that sleep and waits for
+      # it, so the sleep is gone before the watchdog exits and before the
+      # `wait "$cap_pid"` below returns. A TERM that lands between forking a
+      # sleep and recording its pid only sets `stop`, acted on once the pid is
+      # known (bash 3.2 has no signal masking).
+      ( nap() {
+          stop=
+          trap 'stop=1' TERM
+          sleep "$1" & n=$!
+          trap 'kill "$n" 2>/dev/null; wait "$n" 2>/dev/null; exit 0' TERM
+          if [ -n "$stop" ]; then kill "$n" 2>/dev/null; wait "$n" 2>/dev/null; exit 0; fi
+          wait "$n"
+        }
+        nap "$TIMEOUT" && kill -TERM "$pid" 2>/dev/null && \
+          nap 5 && kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
       cap_pid=$!
       wait "$pid" 2>/dev/null
       # Capture the check's exit code from ITS `wait`, before any watchdog

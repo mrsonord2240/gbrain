@@ -2128,11 +2128,11 @@ describeBoth('Engine parity — traverseGraph / traversePaths (D7)', () => {
       'tg/b>tg/a:cycle-back@1',
       'tg/a>tg/b:cycle-fwd@2',
     ]);
-    // 'both' emits every touched edge in its natural direction; the cycle
-    // pair shows at depth 1 and again from b's frontier at depth 2.
+    // 'both' emits every touched edge once, in its natural direction, one
+    // hop past its shallower walked endpoint: the cycle pair at depth 1 only.
     expect(edgeShape(await pgEngine.traversePaths('tg/a', { depth: 2, direction: 'both' }))).toEqual([
       'tg/a>tg/b:cycle-fwd@1', 'tg/b>tg/a:cycle-back@1',
-      'tg/a>tg/b:cycle-fwd@2', 'tg/b>tg/a:cycle-back@2', 'tg/b>tg/c:step@2', 'tg/b>tg/x:xsrc@2',
+      'tg/b>tg/c:step@2', 'tg/b>tg/x:xsrc@2',
     ]);
   });
 
@@ -2476,6 +2476,42 @@ describeBoth('Engine parity — open_loops loops-store round-trip', () => {
     expect(pg.openAfterCount).toBe(0);
     expect(pg.doneAfterCount).toBe(1);
   });
+
+  async function lookupById(eng: BrainEngine) {
+    const { upsertOpenLoop, closeOpenLoop, listOpenLoops } = await import(
+      '../../src/core/loops/loops-store.ts'
+    );
+    await eng.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('lpid-a', 'lpid-a'), ('lpid-b', 'lpid-b') ON CONFLICT (id) DO NOTHING`,
+      [],
+    );
+    const row = await upsertOpenLoop(eng, {
+      sourceId: 'lpid-a',
+      dedupKey: 'thread:eeee000000000001:unanswered_inbound',
+      loopType: 'unanswered_inbound',
+      counterpartyEmail: 'erin@example.com',
+      summary: 'Reply owed to erin@example.com',
+      evidence: [{ message_id: 'eeee000000000001', quote: 'Any update?' }],
+      threadId: 'eeee000000000001',
+      detector: 'deterministic_thread',
+    });
+    await closeOpenLoop(eng, 'lpid-a', row.id, 'dropped', 'parity-lookup');
+    const hit = await listOpenLoops(eng, { sourceIds: ['lpid-a'], loopId: row.id });
+    return {
+      hitIds: hit.map((r) => r.id === row.id),
+      hitStatus: hit[0]?.status,
+      otherSource: (await listOpenLoops(eng, { sourceIds: ['lpid-b'], loopId: row.id })).length,
+      statusMismatch: (await listOpenLoops(eng, { sourceIds: ['lpid-a'], loopId: row.id, status: 'open' })).length,
+      beyondInt4: (await listOpenLoops(eng, { sourceIds: ['lpid-a'], loopId: 2 ** 40 })).length,
+    };
+  }
+
+  test('loopId lookup finds a closed row inside its source and nothing outside, on both engines', async () => {
+    const pg = await lookupById(pgEngine);
+    const pglite = await lookupById(pgliteEngine);
+    expect(pg).toEqual(pglite);
+    expect(pg).toEqual({ hitIds: [true], hitStatus: 'dropped', otherSource: 0, statusMismatch: 0, beyondInt4: 0 });
+  });
 });
 
 describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
@@ -2564,6 +2600,8 @@ describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
       bySession: texts(await eng.listFactsBySession(SRC, SESSION)),
       dupRecency: texts(await eng.findCandidateDuplicates(SRC, ENTITY, 'ttl lapsed fact')),
       dupEmbedding: texts(await eng.findCandidateDuplicates(SRC, EMB_ENTITY, 'ttl embed lapsed', { embedding: emb, embeddingModel })),
+      dupKeyword: (await eng.findCandidateDuplicates(SRC, ENTITY, 'ttl lapsed future fact', { k: 5, arm: 'keyword' })).map(r => r.fact),
+      dupKeywordEmbedding: texts(await eng.findCandidateDuplicates(SRC, EMB_ENTITY, 'ttl embed lapsed', { embedding: emb, embeddingModel, arm: 'keyword' })),
       history: texts(await eng.listFactsByEntity(SRC, ENTITY, { activeOnly: false })),
       supersessions: texts(await eng.listSupersessions(SRC)),
       health: {
@@ -2588,6 +2626,10 @@ describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
     expect(pg.dupRecency).toEqual(activeEntity);
     // Lapsed row is not a dedup candidate → a re-stated fact re-inserts fresh.
     expect(pg.dupEmbedding).toEqual(['ttl embed live']);
+    // C2 keyword arm: same active-row filters, ranked by shared terms (most shared first).
+    expect(pg.dupKeyword[0]).toBe('ttl future fact');
+    expect([...pg.dupKeyword].sort()).toEqual(activeEntity);
+    expect(pg.dupKeywordEmbedding).toEqual(['ttl embed live']);
     // History (activeOnly:false) still shows every row.
     expect(pg.history).toEqual([
       'ttl durable fact', 'ttl future fact', 'ttl lapsed fact',

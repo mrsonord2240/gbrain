@@ -62,13 +62,18 @@
 import { basename } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { importFromContent } from '../import-file.ts';
+import { transcriptsDerivation } from './dream-taint.ts';
+import { derivedMaintenanceTransaction } from '../trust/taint.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { throwIfAborted } from '../abort-check.ts';
-import type { Page } from '../types.ts';
 import { materializedHistoryRanges, prepareCanonicalProjections } from '../persistence/canonical-projections.ts';
+import { normalizePageFences } from '../fence-repair/import-step.ts';
 import { prepareAutomaticLinks } from '../persistence/links-preparation.ts';
 import { isAutoLinkEnabled } from '../link-extraction.ts';
 import { resolveCycleDate, utcDate } from './cycle-date.ts';
+import { attributionChecksEnabled } from './attribution-checks.ts';
+import { resolveVerifyPrior } from './synthesize-verify-epochs.ts';
+export { readVerifyEpoch, loadChildWriteEpochs, loadPreRunRevision, isDreamOwnedPage, resolveVerifyPrior } from './synthesize-verify-epochs.ts';
 
 /** Minimum quoted-span inner length considered a "quote" (shorter spans are
  * scare quotes / titles, not transcript quotations). */
@@ -148,6 +153,8 @@ export interface QuoteVerifyStats {
   number_not_in_source: number;
   /** A speaker's decision or commitment whose numbers/dates only another speaker stated (#5425). */
   decision_misattributed: number;
+  /** A sentence whose grounded quote a later user turn took back on the same number or date (#5425 [UC4]; `dream.attribution_checks`). */
+  superseded_in_source: number;
   skipped_no_transcript: number;
   /** Pages where read-back or write-back failed (fail-open, logged). */
   errors: number;
@@ -171,6 +178,7 @@ export function emptyQuoteVerifyStats(): QuoteVerifyStats {
     speaker_mismatch: 0,
     number_not_in_source: 0,
     decision_misattributed: 0,
+    superseded_in_source: 0,
     skipped_no_transcript: 0,
     errors: 0,
   };
@@ -182,7 +190,8 @@ export function emptyQuoteVerifyStats(): QuoteVerifyStats {
  * buildTriageMapBlock's quote filter via the mapless `normForGrounding`).
  *
  * Folds: whitespace runs → single space, curly quotes/apostrophes → straight,
- * unicode dashes → '-', case → lower. `map[i]` = index in the ORIGINAL string
+ * unicode dashes → '-', case → lower; markdown inline markup (`*`, backticks,
+ * `~~`) is skipped (`foldSkipSet`). `map[i]` = index in the ORIGINAL string
  * of the character that produced `norm[i]`, so any match in normalized space
  * maps back to a VERBATIM original slice (outside-voice amendment: without
  * the map, "replace with verbatim span" would not be verbatim).
@@ -210,7 +219,7 @@ export function normalizeForGrounding(s: string, opts: { tolerant?: boolean } = 
 function foldForGrounding(s: string, withMap: boolean, tolerant = false): { norm: string; map: number[] } | string {
   const out: string[] = [];
   const map: number[] = [];
-  const skip = tolerant ? bracketMask(s) : null;
+  const skip = foldSkipSet(s, tolerant);
   let pendingSpace = false;
   // Iterate by CODE POINT (for..of), not code unit: a surrogate pair
   // lowercases as a pair (Deseret 𐐀 → 𐐨) but never half by half, so a
@@ -266,6 +275,37 @@ function bracketMask(s: string): Set<number> | null {
   }
   for (let i = 0; i < s.length; i++) if (s[i] === '[' || s[i] === ']') skip.add(i);
   return skip;
+}
+
+/**
+ * Code-unit offsets the fold skips: markdown inline markup (every `*`, every
+ * backtick, and `~` in a `~~` run) in both modes, so `**sync**`, `` `sync` ``
+ * and `sync` read alike; plus `bracketMask` in tolerant mode. `_` is kept:
+ * it is too common in identifiers and paths.
+ */
+function foldSkipSet(s: string, tolerant: boolean): Set<number> | null {
+  const brackets = tolerant ? bracketMask(s) : null;
+  if (!/[*`]|~~/.test(s)) return brackets;
+  const skip = brackets ?? new Set<number>();
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '*' || ch === '`' || (ch === '~' && (s[i - 1] === '~' || s[i + 1] === '~'))) skip.add(i);
+  }
+  return skip;
+}
+
+/**
+ * `s` without the inline markup `foldSkipSet` skips in strict mode. A source
+ * slice that differs from a quote only by these marks says the quote's exact
+ * words, so it grounds as exact rather than splicing in a `**` the slice may
+ * leave unbalanced.
+ */
+function withoutInlineMarkup(s: string): string {
+  const skip = foldSkipSet(s, false);
+  if (!skip) return s;
+  let out = '';
+  for (let i = 0; i < s.length; i++) if (!skip.has(i)) out += s[i];
+  return out;
 }
 
 /** A source slice as a reader sees it, ready to sit inside a quotation: link syntax reduced to the link text, inner double quotes as single. */
@@ -516,20 +556,31 @@ export function numericFacts(text: string): Set<string> {
 /** A turn that opens by accepting the previous turn's proposal. */
 const ACCEPTANCE_RE = /^\W*(?:yes|yep|yeah|sure|ok(?:ay)?|agreed|sounds good|perfect|great|do (?:it|that)|go ahead|let'?s do (?:it|that)|approved)\b/i;
 
-function numbersBySpeaker(content: string, turns: SpeakerTurn[]): Map<string, Set<string>> {
+/**
+ * What each speaker stated, by speaker key: the tokens `extract` finds in the
+ * speaker's own turns, plus those of a turn by someone else that the speaker
+ * explicitly accepted in the very next turn (#5425: "yes, do that" makes the
+ * assistant's numbers the user's). `numbersBySpeaker` is the numeric form;
+ * `propose-takes-attribution.ts` passes its own token extractor.
+ */
+export function statedBySpeaker(content: string, turns: SpeakerTurn[], extract: (text: string) => Iterable<string>): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
-  let previous: { key: string; numbers: Set<string> } | null = null;
+  let previous: { key: string; tokens: Set<string> } | null = null;
   turns.forEach((turn, i) => {
     const text = content.slice(turn.labelEnd, turns[i + 1]?.labelStart ?? content.length);
     const key = speakerKey(turn.speaker);
-    const numbers = numericFacts(text);
+    const tokens = new Set(extract(text));
     const own = out.get(key) ?? new Set<string>();
-    for (const n of numbers) own.add(n);
-    if (previous && previous.key !== key && ACCEPTANCE_RE.test(text)) for (const n of previous.numbers) own.add(n);
+    for (const n of tokens) own.add(n);
+    if (previous && previous.key !== key && ACCEPTANCE_RE.test(text)) for (const n of previous.tokens) own.add(n);
     out.set(key, own);
-    previous = { key, numbers };
+    previous = { key, tokens };
   });
   return out;
+}
+
+function numbersBySpeaker(content: string, turns: SpeakerTurn[]): Map<string, Set<string>> {
+  return statedBySpeaker(content, turns, numericFacts);
 }
 
 /** Prepare one transcript for verification. */
@@ -678,7 +729,8 @@ function groundQuoteSpan(inner: string, t: GroundedTranscript, near: boolean): G
     const [start, end] = normalized[0];
     const replacement = shown(t.content.slice(start, end));
     if (replacement.length === 0) return { status: 'none', reason: 'not_found' };
-    return replacement === inner ? { status: 'exact', spans: normalized } : { status: 'normalized', replacement, spans: normalized };
+    const same = replacement === inner || withoutInlineMarkup(replacement) === withoutInlineMarkup(inner);
+    return same ? { status: 'exact', spans: normalized } : { status: 'normalized', replacement, spans: normalized };
   }
 
   // Rung 3: near match. Anchor on word trigrams from the quote; score
@@ -772,8 +824,8 @@ const NUMERIC_CLAIM_RES: Array<{ re: RegExp; key: (m: RegExpMatchArray) => strin
   { re: /\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\b\d{4,}\b/g, key: m => [canonNumber(Number.parseFloat(m[0].replace(/,/g, '')))] },
 ];
 
-/** Numeric and date claims in `text`, each once, with its canonical keys. */
-function numericClaims(text: string): Array<{ raw: string; claim: string; keys: string[] }> {
+/** Numeric and date claims in `text` (currency, scaled amounts, percents, dates, 4+ digit numbers), each once, with its canonical keys. */
+export function numericClaims(text: string): Array<{ raw: string; claim: string; keys: string[] }> {
   const out: Array<{ raw: string; claim: string; keys: string[] }> = [];
   const seen = new Set<string>();
   const covered: Array<[number, number]> = [];
@@ -795,10 +847,13 @@ function numericClaims(text: string): Array<{ raw: string; claim: string; keys: 
  * Numeric and date claims in `text` that no source states. `text` must
  * already be masked (code, links) and have grounded quotes blanked. A claim
  * is supported when any of its canonical keys appears among a source's
- * numbers, or its normalized text occurs in a source or its file name.
+ * numbers or in `exemptNumericKeys` (facts the writer's prompt supplied,
+ * such as `date:<cycle date>`), or its normalized text occurs in a source or
+ * its file name.
  */
-export function unsupportedNumericClaims(text: string, sources: GroundedSource[]): string[] {
+export function unsupportedNumericClaims(text: string, sources: GroundedSource[], exemptNumericKeys?: ReadonlySet<string>): string[] {
   return numericClaims(text)
+    .filter(({ keys }) => !keys.some(k => exemptNumericKeys?.has(k)))
     .filter(({ claim, keys }) => !sources.some(src =>
       keys.some(k => src.numbers.has(k)) || src.norm.includes(claim) || src.nameNorm.includes(claim)))
     .map(({ raw }) => raw);
@@ -810,7 +865,7 @@ const DECISION_RE = /\b(?:decid(?:e|ed|es)|agree(?:d|s)?|accept(?:ed|s)?|approv(
 /** A unit that records a proposal, a refusal or a negation is not asserting agreement. */
 const PROPOSAL_OR_REFUSAL_RE = /\b(?:(?:suggest|propos|recommend|offer|advis|declin|reject|refus)\w*|turned down|instead|rather than|not|no|never)\b|n't\b/i;
 /** A bare year names when, not what was decided; it is never attributed. */
-const YEAR_KEY_RE = /^(?:19|20|21)\d\d$/;
+export const YEAR_KEY_RE = /^(?:19|20|21)\d\d$/;
 
 /**
  * #5425: numbers and dates in a decision claim that some speaker stated but
@@ -827,6 +882,42 @@ function misattributedDecisionClaims(text: string, attribution: string, sources:
     .filter(({ keys }) => !keys.every(k => YEAR_KEY_RE.test(k)))
     .filter(({ keys }) => statedBy(keys, () => true) && !statedBy(keys, sp => speakers.includes(sp)))
     .map(({ raw }) => raw);
+}
+
+/** A user sentence that takes something back: a negation or a correction word. */
+const NEGATION_RE = /\b(?:not|no|never|nope|instead|rather than|scratch that|forget (?:it|that)|cancel\w*|drop(?:ped)? (?:it|that)|no longer|changed (?:my|our) mind|withdr\w+|retract\w*|revers\w+|wrong|incorrect|correction)\b|n't\b/i;
+const SENTENCE_SPLIT_RE = /(?<=[.!?])\s+|\n+/;
+
+/**
+ * #5425 [UC4] `superseded_in_source`: the numbers and dates a unit carries
+ * that a user turn later in the same transcript, after the turn the unit's
+ * grounded quote came from, takes back in a sentence that negates and names
+ * that same number or date. Only `user` turns count (role-labelled
+ * transcripts), only the sentence holding both the negation and the number,
+ * never a bare year, so a later sentence that merely repeats a number, or
+ * negates a different one, supersedes nothing.
+ */
+function supersededClaims(text: string, grounded: Array<{ source: GroundedSource; start: number }>): string[] {
+  const claims = numericClaims(text).filter(({ keys }) => !keys.every(k => YEAR_KEY_RE.test(k)));
+  if (claims.length === 0) return [];
+  const out: string[] = [];
+  for (const { source, start } of grounded) {
+    if (source.turns.length === 0) continue;
+    const from = turnIndexAt(source.turns, start);
+    for (let i = from + 1; i < source.turns.length; i++) {
+      const turn = source.turns[i];
+      if (speakerKey(turn.speaker) !== 'user') continue;
+      const turnText = source.content.slice(turn.labelEnd, source.turns[i + 1]?.labelStart ?? source.content.length);
+      for (const sentence of turnText.split(SENTENCE_SPLIT_RE)) {
+        if (!NEGATION_RE.test(sentence)) continue;
+        const stated = numericFacts(sentence);
+        for (const { raw, keys } of claims) {
+          if (keys.some(k => stated.has(k)) && !out.some(o => o.startsWith(`${raw} `))) out.push(`${raw} was later taken back by the user: ${clip(sentence.trim(), 120)}`);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 const LIST_MARKER_RE = /^(?:[-*+]|\d+[.)]|>|#{1,6})[ \t]+/;
@@ -878,7 +969,7 @@ export function claimUnits(body: string, spans: Array<{ start: number; end: numb
   return units;
 }
 
-export type ClaimFailure = 'quote_not_in_source' | 'quote_crosses_speakers' | 'speaker_mismatch' | 'number_not_in_source' | 'decision_misattributed';
+export type ClaimFailure = 'quote_not_in_source' | 'quote_crosses_speakers' | 'speaker_mismatch' | 'number_not_in_source' | 'decision_misattributed' | 'superseded_in_source';
 
 export interface QuarantinedClaim {
   text: string;
@@ -905,7 +996,7 @@ export interface BodyVerification {
   quarantined: QuarantinedClaim[];
   provenance: QuoteProvenance[];
   failures: Record<ClaimFailure, number>;
-  /** New units that pass only because they carry no quote, number or attribution (System One S8 checks these). */
+  /** Substantive new units that pass the mechanical checks, with their final quote repairs (System One S8 checks these). */
   groundingUnits: string[];
 }
 
@@ -990,10 +1081,12 @@ function clip(s: string, n = PROVENANCE_TEXT_CHARS): string {
  * their speaker attribution only (no number, date or decision checks), for
  * writers whose prose legitimately derives numbers from its sources.
  */
-export function verifyBody(body: string, sources: GroundedSource[], opts: { priorNorm?: string; checks?: 'all' | 'quotes' } = {}): BodyVerification {
+export function verifyBody(body: string, sources: GroundedSource[], opts: { priorNorm?: string; checks?: 'all' | 'quotes'; exemptNumericKeys?: ReadonlySet<string>;
+  /** #5425 [UC4]: also quarantine `superseded_in_source` units (`dream.attribution_checks`; off: no change). */
+  supersession?: boolean } = {}): BodyVerification {
   const { spans, unbalanced } = extractQuoteSpans(body);
   const masked = maskNonProse(body);
-  const failures: Record<ClaimFailure, number> = { quote_not_in_source: 0, quote_crosses_speakers: 0, speaker_mismatch: 0, number_not_in_source: 0, decision_misattributed: 0 };
+  const failures: Record<ClaimFailure, number> = { quote_not_in_source: 0, quote_crosses_speakers: 0, speaker_mismatch: 0, number_not_in_source: 0, decision_misattributed: 0, superseded_in_source: 0 };
   const edits: Array<{ start: number; end: number; text: string }> = [];
   const quarantined: QuarantinedClaim[] = [];
   const provenance: QuoteProvenance[] = [];
@@ -1021,6 +1114,7 @@ export function verifyBody(body: string, sources: GroundedSource[], opts: { prio
     const fail = (reason: ClaimFailure, detail: string) => { failures[reason]++; unitFailures.push({ reason, detail }); };
     const unitEdits: typeof edits = [];
     const unitProvenance: QuoteProvenance[] = [];
+    const grounded: Array<{ source: GroundedSource; start: number }> = [];
     for (const sp of unitSpans) {
       quotes++;
       const g = groundAcross(sp.inner, sources);
@@ -1047,15 +1141,17 @@ export function verifyBody(body: string, sources: GroundedSource[], opts: { prio
         span: result.spans[0],
         speaker: speakers[0] ?? null,
       });
+      grounded.push({ source, start: result.spans[0][0] });
     }
     const unquoted = blank(masked.slice(u.start, u.end), quoteRanges);
     // Quotes-only mode (answers that legitimately compute numbers): no number or decision checks.
-    const numbers = opts.checks === 'quotes' ? [] : unsupportedNumericClaims(unquoted, sources);
+    const numbers = opts.checks === 'quotes' ? [] : unsupportedNumericClaims(unquoted, sources, opts.exemptNumericKeys);
     for (const n of numbers) fail('number_not_in_source', n);
     if (numbers.length === 0 && opts.checks !== 'quotes') {
       for (const n of misattributedDecisionClaims(unquoted, attribution, sources, [...mentioned.keys()])) {
         fail('decision_misattributed', `${[...mentioned.values()].join(', ')}: ${n} was stated only by another speaker`);
       }
+      if (opts.supersession) for (const n of supersededClaims(masked.slice(u.start, u.end), grounded)) fail('superseded_in_source', n);
     }
 
     if (unitFailures.length > 0) {
@@ -1064,7 +1160,17 @@ export function verifyBody(body: string, sources: GroundedSource[], opts: { prio
     } else {
       edits.push(...unitEdits);
       provenance.push(...unitProvenance);
-      if (unitSpans.length === 0 && mentioned.size === 0 && isGroundingCandidate(body, u.start, unquoted)) groundingUnits.push(text);
+      // Mechanical evidence validates a quote or number, not the interpretation
+      // around it, so S8 judges every substantive new passing unit, attributed
+      // and numeric ones and labels around valid quotes included. It sees the
+      // final quote repairs: its quarantine reducer removes units by exact text.
+      if (isGroundingCandidate(body, u.start, masked.slice(u.start, u.end))) {
+        let repaired = text;
+        for (const e of [...unitEdits].sort((a, b) => b.start - a.start)) {
+          repaired = repaired.slice(0, e.start - u.start) + e.text + repaired.slice(e.end - u.start);
+        }
+        groundingUnits.push(repaired);
+      }
     }
   }
 
@@ -1077,12 +1183,11 @@ export function verifyBody(body: string, sources: GroundedSource[], opts: { prio
 /** Units shorter than this many words (labels, headings, fragments) are not claims S8 judges. */
 const MIN_GROUNDING_UNIT_WORDS = 5;
 
-/** A passing unit with no number, not a heading, long enough to be a claim. */
-function isGroundingCandidate(body: string, start: number, unquoted: string): boolean {
+/** A passing prose unit, not a heading, long enough to be a claim. */
+function isGroundingCandidate(body: string, start: number, prose: string): boolean {
   const lineStart = body.lastIndexOf('\n', start - 1) + 1;
   if (/^[ \t]*#{1,6}[ \t]/.test(body.slice(lineStart, start + 1))) return false;
-  if (numericFacts(unquoted).size > 0) return false;
-  return (unquoted.match(/\p{L}[\p{L}'-]*/gu) ?? []).length >= MIN_GROUNDING_UNIT_WORDS;
+  return (prose.match(/\p{L}[\p{L}'-]*/gu) ?? []).length >= MIN_GROUNDING_UNIT_WORDS;
 }
 
 /** Drop REMOVED markers and the empty list items / blank runs they leave, keeping the body's trailing newline. */
@@ -1119,7 +1224,7 @@ function recordList<T>(fm: Record<string, unknown> | undefined, key: string, pic
  */
 export interface VerifiedDreamPage extends VerifiablePage {
   changed: boolean;
-  /** New units that pass only for lack of a quote, number or attribution, per body (S8 input). */
+  /** Substantive new units that pass the mechanical checks, per body (S8 input). */
   groundingUnits: Array<{ body: 'compiled_truth' | 'timeline'; text: string }>;
 }
 
@@ -1132,15 +1237,23 @@ export interface GroundingPass {
   apply(page: VerifiedDreamPage, sources: GroundedSource[], subject: string, checkedAt: string): Promise<VerifiedDreamPage>;
 }
 
+/**
+ * Verify both bodies of one dream page. `checkedAt` is the cycle date the
+ * synthesis prompt gave the child as today's date, so a page stating that ISO
+ * date is not flagged `number_not_in_source`; every other date still is.
+ */
 export function verifyDreamPage(
   page: VerifiablePage,
   sources: GroundedSource[],
-  opts: { prior: VerifiablePage | null; checkedAt: string },
+  opts: { prior: VerifiablePage | null; checkedAt: string;
+    /** #5425 [UC4]: `attributionChecksEnabled(engine)`; absent or false leaves the output unchanged. */
+    supersession?: boolean },
   stats: QuoteVerifyStats,
 ): VerifiedDreamPage {
   const priorNorm = opts.prior ? normForGrounding(`${opts.prior.compiled_truth}\n${opts.prior.timeline ?? ''}`) : undefined;
-  const truth = verifyBody(page.compiled_truth ?? '', sources, { priorNorm });
-  const timeline = verifyBody(page.timeline ?? '', sources, { priorNorm });
+  const exemptNumericKeys = new Set([`date:${opts.checkedAt}`]);
+  const truth = verifyBody(page.compiled_truth ?? '', sources, { priorNorm, exemptNumericKeys, supersession: opts.supersession });
+  const timeline = verifyBody(page.timeline ?? '', sources, { priorNorm, exemptNumericKeys, supersession: opts.supersession });
   stats.pages_checked++;
   for (const r of [truth, timeline]) {
     stats.quotes_total += r.quotes;
@@ -1227,78 +1340,6 @@ export function quarantineUnits(
   return { compiled_truth: compiled, timeline, frontmatter, changed: true, groundingUnits: page.groundingUnits.filter(u => !removed.has(clip(u.text, 2000))) };
 }
 
-/** Database clock reading taken before a run's writes; pages created at or
- * after it are the run's own, earlier pages are verified by diff. */
-export async function readVerifyEpoch(engine: BrainEngine): Promise<Date> {
-  const rows = await engine.executeRaw<{ now: unknown }>('SELECT now() AS now');
-  return new Date(rows[0]?.now as string);
-}
-
-/**
- * Per-transcript write epochs: the earliest creation time of the child jobs
- * that synthesized each transcript. A resumed or coalesced child created in
- * an earlier run keeps its original epoch, so the pages it wrote then still
- * count as its own. Transcripts without a job row fall back to `fallback`.
- */
-export async function loadChildWriteEpochs(
-  engine: BrainEngine,
-  childIds: number[],
-  jobRawSource: Map<number, string>,
-  fallback: Date,
-): Promise<Map<string, Date>> {
-  const out = new Map<string, Date>();
-  for (const path of jobRawSource.values()) out.set(path, fallback);
-  if (!childIds.length) return out;
-  const rows = await engine.executeRaw<{ id: number | string; created_at: unknown }>(
-    'SELECT id, created_at FROM minion_jobs WHERE id = ANY($1::int[])', [childIds]);
-  for (const row of rows) {
-    const path = jobRawSource.get(Number(row.id));
-    const at = new Date(row.created_at as string);
-    if (!path || Number.isNaN(at.getTime())) continue;
-    if (at < (out.get(path) ?? fallback)) out.set(path, at);
-  }
-  return out;
-}
-
-/**
- * The revision of a page as it stood before `since`: the first version
- * snapshot taken at or after `since` (writes snapshot the prior state before
- * overwriting). Null when nothing overwrote the page since then.
- */
-export async function loadPreRunRevision(engine: BrainEngine, slug: string, sourceId: string, since: Date): Promise<VerifiablePage | null> {
-  const rows = await engine.executeRaw<{ compiled_truth: string; timeline: string | null; frontmatter: unknown }>(
-    `SELECT pv.compiled_truth, pv.timeline, pv.frontmatter
-       FROM page_versions pv JOIN pages p ON p.id = pv.page_id
-      WHERE p.slug = $1 AND p.source_id = $2 AND pv.snapshot_at >= $3::timestamptz
-      ORDER BY pv.snapshot_at ASC, pv.id ASC LIMIT 1`,
-    [slug, sourceId, since.toISOString()],
-  );
-  const row = rows[0];
-  if (!row) return null;
-  const fm = typeof row.frontmatter === 'string' ? JSON.parse(row.frontmatter) : row.frontmatter;
-  return { compiled_truth: row.compiled_truth ?? '', timeline: row.timeline ?? '', frontmatter: (fm ?? {}) as Record<string, unknown> };
-}
-
-/**
- * C-8: dream output is a page a child created (or one already stamped). A page
- * that existed before the child's first write keeps its own identity. Refs
- * without a first-write time (legacy callers) count as dream output.
- */
-export function isDreamOwnedPage(page: Pick<Page, 'created_at' | 'frontmatter'>, firstWriteAt?: Date): boolean {
-  if (!firstWriteAt || page.frontmatter?.dream_generated === true) return true;
-  return new Date(page.created_at).getTime() >= firstWriteAt.getTime();
-}
-
-/**
- * The verification scope of one written page: null prior for a page created
- * at or after `since`, the pre-run revision for an older page, or 'unchanged'
- * when an older page has no revision since then.
- */
-export async function resolveVerifyPrior(engine: BrainEngine, page: Pick<Page, 'slug' | 'created_at'>, sourceId: string, since: Date): Promise<VerifiablePage | null | 'unchanged'> {
-  if (new Date(page.created_at).getTime() >= since.getTime()) return null;
-  return (await loadPreRunRevision(engine, page.slug, sourceId, since)) ?? 'unchanged';
-}
-
 /**
  * Orchestrator entry: verify every page this phase's children wrote.
  * Sources are the transcripts of every child that wrote the page (a page
@@ -1312,10 +1353,13 @@ export async function verifyAndRepairDreamPages(
   engine: BrainEngine,
   refs: Array<{ slug: string; source_id: string; raw_source?: string; first_write_at?: Date }>,
   transcriptsByPath: Map<string, TranscriptForVerify>,
-  opts: { since: Date; sinceByTranscript?: Map<string, Date>; checkedAt?: string; signal?: AbortSignal; grounding?: GroundingPass },
+  opts: { since: Date; sinceByTranscript?: Map<string, Date>; checkedAt?: string; signal?: AbortSignal; grounding?: GroundingPass;
+    /** #5575 I2: transcripts under it are third-party speech (dream-taint.ts). */
+    meetingTranscriptsDir?: string | null },
 ): Promise<QuoteVerifyStats> {
   const stats = emptyQuoteVerifyStats();
   const checkedAt = opts.checkedAt ?? await resolveCycleDate(engine).catch(() => utcDate());
+  const supersession = await attributionChecksEnabled(engine);
   const pages = new Map<string, { slug: string; source_id: string; paths: string[]; first_write_at?: Date }>();
   for (const ref of refs) {
     const key = `${ref.source_id} ${ref.slug}`;
@@ -1352,11 +1396,14 @@ export async function verifyAndRepairDreamPages(
       if (prior === 'unchanged') { stats.skipped_unchanged++; continue; }
       if (prior) stats.preexisting_diffed++;
       const sources = ref.paths.map(sourceFor);
-      const mechanical = verifyDreamPage(page, sources, { prior, checkedAt }, stats);
+      const mechanical = verifyDreamPage(page, sources, { prior, checkedAt, supersession }, stats);
       const verified = opts.grounding ? await opts.grounding.apply(mechanical, sources, `page:${ref.source_id}:${ref.slug}`, checkedAt) : mechanical;
       if (verified.changed) {
         const tags = await engine.getTags(ref.slug, { sourceId: ref.source_id });
         const next = { ...page, compiled_truth: verified.compiled_truth, timeline: verified.timeline, frontmatter: verified.frontmatter };
+        // #6188: Tier 1 normalizes a fixable fence before the verified body is compiled and written.
+        const fences = await normalizePageFences(engine, { sourceId: ref.source_id, slug: ref.slug, page: next });
+        if (fences) Object.assign(next, fences.page);
         const md = serializePageToMarkdown(next, tags);
         // The children's put_page projected timeline, facts, takes and links
         // from the unverified body; re-project from the verified body in the
@@ -1369,10 +1416,13 @@ export async function verifyAndRepairDreamPages(
         const links = await isAutoLinkEnabled(engine) ? await prepareAutomaticLinks(engine, ref.slug, parsed, ref.source_id) : undefined;
         // noEmbed: the phase-end embed sweep backfills. Provenance fields
         // null → engine COALESCE keeps the first-write record intact.
-        await importFromContent(engine, ref.slug, md, {
-          noEmbed: true, remote: false, sourceId: ref.source_id,
-          beforeCommit: async tx => { await project(tx); await links?.apply(tx); },
-        });
+        // #5575 I2: the repaired page and its re-projected rows are written at
+        // the tier of the transcripts it was synthesized from, with its edges.
+        const derivation = await transcriptsDerivation(engine, ref.paths.map(path => ({ filePath: path, content: transcriptsByPath.get(path)!.content })), opts.meetingTranscriptsDir);
+        await derivedMaintenanceTransaction(engine, derivation, async tx => ({ result: await importFromContent(tx, ref.slug, md, {
+          noEmbed: true, remote: false, preserveGateMarkers: true, sourceId: ref.source_id,
+          beforeCommit: async inner => { await project(inner); await links?.apply(inner); },
+        }), rows: [{ table: 'pages' as const, id: page.id, sourceId: ref.source_id }] }));
         stats.pages_repaired++;
       }
     } catch (e) {

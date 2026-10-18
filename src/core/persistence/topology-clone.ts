@@ -11,8 +11,9 @@ import { isOwnedClone } from '../sources-ops.ts';
 import { parseSourceConfig } from '../sources-load.ts';
 import type { SourceLifecycleInput } from './source-lifecycle.ts';
 import type { TopologyCloneRecovery } from './topology-clone-model.ts';
-import { compactStoredManifest, getWorktreeBinding, humanManifestProgress, worktreeManifest } from './ownership.ts';
-import { localHostId, persistenceHome } from './identity.ts';
+import { compactStoredManifest, getWorktreeBinding, humanManifestProgress, storedManifestScope, worktreeManifest } from './ownership.ts';
+import { localHostId } from './identity.ts';
+import { resolveCoordinationLock } from './coordination-lock.ts';
 import { acquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { canonicalFilesystemPath, recordManagedRoots } from './root-registry.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
@@ -85,7 +86,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
       {fix:writerStatusFix(input.sourceId)});
     const reservedIdentity=readPhysicalRootReservation(target);
     const worktreeId=currentBinding?.worktree_id??reservedIdentity?.worktreeId??randomUUID();
-    const coordination=currentBinding?.coordination_path??reservedIdentity?.coordinationPath??join(persistenceHome(),'locks',`${worktreeId}.lock`);
+    const coordination=resolveCoordinationLock(target,worktreeId,{reservation:reservedIdentity?.coordinationPath,binding:currentBinding?.coordination_path}).path;
     let newLock:NativeLockHandle|null=null;
     if(!bindings.some(binding=>binding.worktree_id===worktreeId)){newLock=await acquireNativeLock(coordination!,{timeoutMs:5000});if(!newLock)throw opError('writer_lock_unavailable','The new clone coordination lock is busy.',
       `Another gbrain process holds the coordination lock for ${target}, so source ${input.sourceId} was not cloned. Run the command again once that process has finished.`,
@@ -130,7 +131,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
             {fix:writerStatusFix(input.sourceId)});
         const recovery:TopologyCloneRecovery={version:1,kind:'clone',phase:'reserved',operation:input.operation as 'add'|'reclone',sourceId:input.sourceId,
           incarnation,worktreeId,ownerHostId:localHostId(),ownerEpoch:String(currentBinding?.owner_epoch??preparedOwner?.owner_epoch??1),target,stage,aside,
-          beforeHash:before?.digest??null,afterHash:null,manifest,canonicalStamp,checkpoint:source?.last_commit??null,sourceRemoteUrl:source?.config.remote_url as string??null,input,cloneBudget:0};
+          beforeHash:before?.digest??null,afterHash:null,manifest,...(manifest?{hashScope:storedManifestScope(manifest)}:{}),canonicalStamp,checkpoint:source?.last_commit??null,sourceRemoteUrl:source?.config.remote_url as string??null,input,cloneBudget:0};
         recovery.cloneBudget=reserved-oldBytes-Buffer.byteLength(JSON.stringify(recovery))-65_536;
         if(recovery.cloneBudget<65_536)throw opError('request_too_large','The old checkout leaves insufficient configured recovery space for a staged clone.',
           `The current checkout of source ${input.sourceId} (${oldBytes} bytes) uses nearly all of the ${reserved}-byte recovery capacity, so nothing was cloned. Ask the user to raise persistence.limits.worktree_recovery_bytes and persistence.limits.brain_recovery_bytes (more disk reserved for recovery), then run the ${input.operation} again.`,
@@ -167,12 +168,12 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
         });
         await (hooks.clone??cloneTopologyCheckout)(url,recovery.stage,recovery.cloneBudget);
         const stageBytes=await topologyDirectoryBytes(recovery.stage,recovery.cloneBudget);
-        const candidate=worktreeManifest(recovery.stage,{progress:humanManifestProgress()});
+        const candidate=worktreeManifest(recovery.stage,{progress:humanManifestProgress(),scope:recovery.hashScope});
         if(recovery.manifest&&candidate.digest!==recovery.manifest.digest)throw opError('writer_manifest_mismatch','The cloned checkout differs from the verified canonical manifest, including deletions.',
           `A fresh clone from the remote does not match source ${input.sourceId}'s canonical content exactly (including deletions), so the clone is rolled back and the original kept. Make sure every canonical commit is pushed to the remote, then run gbrain sources reclone ${input.sourceId} again under a new request id.`,
           {fix:writerStatusFix(input.sourceId)});
         flushTopologyTree(recovery.stage);flushTopologyDirectory(dirname(recovery.stage));
-        recovery.afterHash=candidate.digest;recovery.phase='prepared';recovery.manifest={...candidate,canonical_stamp:recovery.canonicalStamp};
+        recovery.afterHash=candidate.digest;recovery.hashScope=candidate.scope??'tree';recovery.phase='prepared';recovery.manifest={...candidate,canonical_stamp:recovery.canonicalStamp};
         if(oldBytes+stageBytes+Buffer.byteLength(JSON.stringify(recovery))+65_536>Number(admission.recovery_bytes))
           throw opError('request_too_large','The complete staged clone and recovery metadata exceed the reserved capacity.',
             `The cloned repository (${stageBytes} bytes) plus the old checkout exceed the ${admission.recovery_bytes}-byte recovery reservation, so the clone is rolled back. Ask the user to raise persistence.limits.worktree_recovery_bytes and persistence.limits.brain_recovery_bytes, then run the ${input.operation} again under a new request id.`,

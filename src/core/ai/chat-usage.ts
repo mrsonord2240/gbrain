@@ -30,7 +30,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { canonicalLookup } from '../model-pricing.ts';
+import { canonicalLookup, priceAtPromptSize } from '../model-pricing.ts';
 import { priceFor, type PricingOverrides } from '../budget/reservation-cost.ts';
 
 export interface ChatUsageRecord {
@@ -127,10 +127,13 @@ export function estimateChatCostUsd(
     cache_write_tokens?: number;
   },
 ): number | null {
-  const p = canonicalLookup(model);
-  if (!p) return null;
+  const row = canonicalLookup(model);
+  if (!row) return null;
   const cacheRead = usage.cache_read_tokens ?? 0;
   const cacheWrite = usage.cache_write_tokens ?? 0;
+  // #6448 item 1: the prompt size that selects a long-prompt tier is the
+  // whole prompt — uncached input plus both cache buckets.
+  const p = priceAtPromptSize(row, usage.input_tokens + cacheRead + cacheWrite);
   return (
     (usage.input_tokens * p.input +
       usage.output_tokens * p.output +
@@ -142,7 +145,11 @@ export function estimateChatCostUsd(
 
 /**
  * Called by gateway.chat() at its success boundary. Never throws; the sink
- * runs fire-and-forget with errors swallowed.
+ * runs fire-and-forget with errors swallowed. `usage` is the gateway's
+ * `ChatResult.usage` (AI SDK convention): `input_tokens` is the TOTAL input,
+ * and the cache read/write counts are subsets of it, so the call is priced as
+ * (input - cache) at the input rate plus each cache bucket at its own rate,
+ * never the cache tokens a second time on top of the total.
  */
 export function recordChatUsage(input: {
   model: string;
@@ -160,13 +167,14 @@ export function recordChatUsage(input: {
   const pricedMeter = meter && meter.cost_usd !== undefined ? meter : null;
   if (!sink && !pricedMeter) return;
   try {
-    const cost_usd = estimateChatCostUsd(input.model, input.usage);
+    const { input_tokens, output_tokens, cache_read_tokens = 0, cache_write_tokens = 0 } = input.usage;
+    const uncached = Math.max(0, input_tokens - cache_read_tokens - cache_write_tokens);
+    const cost_usd = estimateChatCostUsd(input.model, { ...input.usage, input_tokens: uncached });
     if (pricedMeter) {
       const price = priceFor(input.model, 'chat', pricedMeter.pricing_overrides);
-      const { input_tokens, output_tokens, cache_read_tokens = 0, cache_write_tokens = 0 } = input.usage;
       const meterCost = price === null ? null
         : price.source === 'table' && cost_usd !== null ? cost_usd
-        : ((input_tokens + cache_read_tokens + cache_write_tokens) * price.pricing.input + output_tokens * price.pricing.output) / 1_000_000;
+        : (input_tokens * price.pricing.input + output_tokens * price.pricing.output) / 1_000_000;
       if (meterCost === null) pricedMeter.unpriced_calls = (pricedMeter.unpriced_calls ?? 0) + 1;
       else pricedMeter.cost_usd = (pricedMeter.cost_usd ?? 0) + meterCost;
     }

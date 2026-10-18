@@ -29,6 +29,7 @@ import { isValidSourceId } from '../source-id.ts';
 import { executeRawJsonb, type SqlQuery } from '../sql-query.ts';
 import { TOKEN_ID_RE } from '../token-mint.ts';
 import { isUndefinedColumnError } from '../utils.ts';
+import { requiresExplicitApproval } from '../ops/execution-prerequisites.ts';
 import {
   GrantError, LEGACY_GRANT_AXES, grantFromTokenRow, permissionsMirror, tokenGrantColumnValues, tokenGrantFromColumns,
   tokenGrantFromPermissions, validatePrincipalGrant, TOKEN_GRANT_COLUMNS, type LegacyGrantAxis, type PrincipalGrant,
@@ -74,7 +75,11 @@ export interface RescopeTokenResult {
   revision: { before: number; after: number };
   /** Axes that were drifted (deny-all) before this call. */
   drift: LegacyGrantAxis[];
-  refresh?: { available: string[]; added: string[]; unregistered: string[] };
+  /**
+   * `materialized`: the token had no operation snapshot (#6663). Adding writes one: every operation its scopes
+   * allow today plus the added ones, so operations later upgrades add need their own refresh.
+   */
+  refresh?: { available: string[]; added: string[]; unregistered: string[]; materialized?: true };
 }
 
 const csvOrNone = (value: string): string[] =>
@@ -257,16 +262,21 @@ async function rescopeInTransaction(tx: BrainEngine, args: RescopeTokenArgs): Pr
   }
   let refresh: RescopeTokenResult['refresh'];
   if (args.refreshOperations) {
-    const granted = base.allowedOperations;
-    if (granted === null) {
-      throw new GrantError('invalid_grant', `Token ${label} has no operation snapshot, so it already reaches every operation its scopes allow; nothing to refresh`);
+    // #6663 (D17): a token with no snapshot reaches every operation its scopes allow except the membership
+    // operations, which need explicit approval. Refreshing it materializes exactly that reachable set and
+    // adds only the operations --add names, so nothing narrows today and no other membership op is approved.
+    const materialized = base.allowedOperations === null;
+    const granted = base.allowedOperations ?? grantable.filter(op => !requiresExplicitApproval(op));
+    if (materialized && args.allNew) {
+      throw new GrantError('invalid_grant', `Token ${label} has no operation snapshot; --all-new would approve every membership operation at once. `
+        + `Preview with gbrain auth rescope ${'id' in args.target ? `--id ${args.target.id}` : `--token ${args.target.name}`} --refresh-operations, then name each one with --add`);
     }
     const available = grantable.filter(op => !granted.includes(op));
     const added = args.allNew ? available : args.add ?? [];
     const notAvailable = added.filter(op => !available.includes(op));
     if (notAvailable.length) throw new GrantError('invalid_grant', `Not a new operation for this token: ${notAvailable.join(', ')} (run --refresh-operations alone to preview)`);
     if (added.length) next.allowedOperations = [...granted, ...added];
-    refresh = { available, added, unregistered: granted.filter(op => !all.has(op)) };
+    refresh = { available, added, unregistered: granted.filter(op => !all.has(op)), ...(materialized ? { materialized: true } : {}) };
   }
   const opsEdited = args.operations !== undefined || Boolean(refresh?.added.length);
   validatePrincipalGrant({
@@ -348,7 +358,8 @@ export async function resolveTokenGrant(sql: SqlQuery, row: Record<string, unkno
   try {
     const [converted] = await sql`
       UPDATE access_tokens SET source_grant = ${kind}, source_id = ${write}, federated_read = ${reads}::text[],
-        allowed_operations = ${ops}::text[], takes_holders = ${holders}::text[], grant_revision = grant_revision + 1
+        allowed_operations = ${ops}::text[], takes_holders = ${holders}::text[], grant_revision = grant_revision + 1,
+        last_used_at = now()
       WHERE id IN (SELECT id FROM access_tokens WHERE id = ${String(row.id)}::uuid AND source_grant IS NULL FOR UPDATE SKIP LOCKED)
       RETURNING *
     `;
@@ -357,6 +368,26 @@ export async function resolveTokenGrant(sql: SqlQuery, row: Record<string, unkno
     // Read-only role or transient failure: authorize with the identical in-memory conversion.
   }
   return grant;
+}
+
+/**
+ * Debounced, fire-and-forget `last_used_at` write for a token row the auth
+ * paths just read (once per token per 60 s; SKIP LOCKED so a lock held
+ * elsewhere never parks a pool slot, #5730). A row still on the legacy shape
+ * is left to `resolveTokenGrant`, whose conversion records first use itself:
+ * a touch holding that row's lock made every concurrent conversion skip it
+ * (SKIP LOCKED), so a burst of first reads could leave it unconverted (#6230).
+ */
+export function touchTokenLastUsed(sql: SqlQuery, row: Record<string, unknown>): Promise<unknown> {
+  const id = String(row.id);
+  const touch = 'source_grant' in row
+    ? sql`UPDATE access_tokens SET last_used_at = now()
+        WHERE id IN (SELECT id FROM access_tokens WHERE id = ${id}::uuid AND source_grant IS NOT NULL
+          AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds') FOR UPDATE SKIP LOCKED)`
+    : sql`UPDATE access_tokens SET last_used_at = now()
+        WHERE id IN (SELECT id FROM access_tokens WHERE id = ${id}::uuid
+          AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds') FOR UPDATE SKIP LOCKED)`;
+  return Promise.resolve(touch).catch(() => { /* fire-and-forget */ });
 }
 
 /** A bare `auth rescope <name>`: a token name, an OAuth client id, or a client name. Both kinds matching refuses. */

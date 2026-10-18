@@ -157,6 +157,7 @@ for _e2e_var in $(env | grep -oE '^(CONDUCTOR_|MCP_|OPENCLAW_|HERMES_|GROK_|OPEN
     GBRAIN_TEST_DB) ;;  # explicit schema-reset opt-in for service hosts; schema-drift still requires a test-shaped DB name
     GBRAIN_PGBOUNCER_URL|GBRAIN_PGBOUNCER_DIRECT_URL|GBRAIN_CI_REQUIRE_PGBOUNCER) ;; # explicit pooler test target and execution requirement
     GBRAIN_PGBOUNCER_E2E_URL|GBRAIN_PGBOUNCER_E2E_DB) ;; # backend-matrix pooled target (scripts/e2e-backend-matrix.txt)
+    GBRAIN_SUPAVISOR_URL) ;; # #6543 explicit Supavisor transaction-pooler target for the live pooler suites
     GBRAIN_TEST_WAIT_MULTIPLIER) ;;  # coverage deadline multiplier read by test/helpers/wait-for.ts — keep
     GBRAIN_TEST_REQUIRE_COMPILE) ;;  # bootstrap-compiled-binary opt-in: a failed compile fails instead of skipping
     GBRAIN_E2E_FILE_TIMEOUT) ;;  # per-file cap override — read AFTER this scrub, so it must survive it
@@ -446,9 +447,9 @@ for f in "${files[@]}"; do
   # word-splitting into extra gtimeout arguments or breaking the 4x math.
   case "$file_timeout" in ''|*[!0-9]*) file_timeout=180 ;; esac
   case "$f" in
-    */skills.test.ts|*/serve-http-multi-agent.test.ts|*/graduation-cli.test.ts|*/graduation-clients.test.ts|*/graduation-faults.test.ts|*/graduation-copy.test.ts|*/graduation-legacy-copy.test.ts) file_timeout=$((file_timeout * 4)) ;;
-    # One graduation per custody and rollback boundary (~30 SIGKILL-and-resume cases of ~15 s each).
-    */graduation-crash.test.ts) file_timeout=$((file_timeout * 10)) ;;
+    # graduation-crash-*: one graduation per custody or rollback boundary (5-6 SIGKILL-and-resume cases of ~16 s per file).
+    # large-pages-export: five 20 MiB imports per engine on the string path (~240 s on 4 cores, ~340 s on a loaded gate VM).
+    */large-pages-export.test.ts|*/skills.test.ts|*/serve-http-multi-agent.test.ts|*/graduation-cli*.test.ts|*/graduation-crash-*.test.ts|*/graduation-faults.test.ts|*/graduation-copy.test.ts|*/graduation-legacy-copy.test.ts) file_timeout=$((file_timeout * 4)) ;;
   esac
   if command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT_CMD="gtimeout $file_timeout"

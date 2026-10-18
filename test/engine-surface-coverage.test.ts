@@ -37,7 +37,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { configureGateway } from '../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 const DIM = 1536;
 
@@ -50,19 +50,21 @@ const INTERFACE_METHODS: readonly string[] = [
   // Lifecycle
   'connect', 'disconnect', 'reconnect', 'initSchema', 'transaction', 'transactionDirect', 'registerBeforeDisconnect', 'withReservedConnection',
   // Pages CRUD
-  'getPage', 'readPageSnapshot', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
+  'getPage', 'readPageSnapshot', 'readPageSnapshotsBatch', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'findDuplicatePages', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
   'softDeletePage', 'softDeletePages', 'restorePage', 'purgeDeletedPages', 'listPages', 'resolveSlugs', 'getAllSlugs',
   'listAllPageRefs', 'listAllSources', 'updateSourceConfig', 'listPrefixSampledPages', 'listCorpusSample',
   // Search
-  'searchKeyword', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
+  'searchKeyword', 'countKeywordPages', 'searchKeywordPages', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
   // Chunks
-  'upsertChunks', 'getChunks', 'getChunkWindows', 'countStaleChunks', 'sumStaleChunkChars', 'setPageEmbeddingSignature',
+  'upsertChunks', 'getChunks', 'getChunkPage', 'getChunkWindows', 'countStaleChunks', 'sumStaleChunkChars', 'setPageEmbeddingSignature',
   'invalidateStaleSignatureEmbeddings', 'invalidateContentDriftEmbeddings', 'listStaleChunks',
-  'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'deleteChunks',
+  'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'readEmbeddingStateCounts', 'listEmbeddingStateRows', 'deleteChunks',
   // Extraction watermark
   'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch', 'markPagesAttendanceBlocked',
+  // #6454 stale reserved frontmatter keys
+  'countStaleFrontmatterKeyPages', 'listStaleFrontmatterKeyPages', 'stripStaleFrontmatterKeys',
   // Links + graph
-  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
+  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'replaceDerivedLinksBatch', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
   'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'relationalChainHop', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
   'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
@@ -98,7 +100,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'refreshPageBody', 'updatePageContextualRetrievalState', 'migrateFactsToCanonical',
   // Config + migration + raw SQL
   'getConfig', 'setConfig', 'unsetConfig', 'listConfigKeys', 'runMigration',
-  'getChunksWithEmbeddings', 'executeRaw', 'executeRawDirect',
+  'getChunksWithEmbeddings', 'executeRaw', 'executeRawDirect', 'keywordBoundedRead',
   // v0.46.28-34 master waves (classified at the test-gap-wave merge):
   // #3980 bulk config read, #3776 takes-embedding update, #3674 scoped
   // link removal.
@@ -112,6 +114,9 @@ const INTERFACE_METHODS: readonly string[] = [
   // Salience + anomaly + enrich
   'batchLoadEmotionalInputs', 'setEmotionalWeightBatch', 'getRecentSalience', 'listEnrichCandidates',
   'findAnomalies',
+  // Wave B segmented page bodies (src/core/engine-sql/page-body.ts; covered by test/large-pages/ and test/engine-sql-page-body.test.ts)
+  'allocateBodyOccurrenceIds', 'stageSegmentTexts', 'readSegmentTexts', 'stageManifestRows', 'readManifest', 'stageSegmentChunks',
+  'createSegmentedPageShell', 'flipBodyGeneration', 'openBodyStaging', 'setBodyStagingState', 'sweepSegments',
 ];
 
 /**
@@ -356,6 +361,7 @@ describe('uncovered-method smokes (seeded PGLite)', () => {
 
   afterAll(async () => {
     await engine.disconnect();
+    resetGateway(); // R5: restore the preload baseline for later files in this shard
   });
 
   test('kind discriminator (readonly instance property, not on the prototype)', () => {

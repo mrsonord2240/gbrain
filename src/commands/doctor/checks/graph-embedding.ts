@@ -10,6 +10,8 @@ import { pricingSetCommand } from '../../../core/budget/no-pricing.ts';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { checkError } from '../check-fix.ts';
+import { isConnectorSourceKind } from '../../../core/persistence/connector-identity.ts';
+import { isCrossSourceLinksEnabled } from '../../../core/link-extraction.ts';
 
 /**
  * v0.40.4 graph_signals_coverage doctor check.
@@ -459,6 +461,9 @@ export async function checkJunkEntityHubs(
       source_id: string | null;
       edges: number;
       chunks: number;
+      connector_page: boolean;
+      source_kind: string | null;
+      canonical_twin_source: string | null;
     }>(
       `WITH edge_counts AS (
          SELECT page_id, COUNT(*)::int AS edges FROM (
@@ -474,9 +479,17 @@ export async function checkJunkEntityHubs(
          FROM content_chunks
          GROUP BY page_id
        )
-       SELECT p.slug, p.source_id, ec.edges, COALESCE(cc.chunks, 0)::int AS chunks
+       SELECT p.slug, p.source_id, ec.edges, COALESCE(cc.chunks, 0)::int AS chunks,
+              (p.frontmatter ->> 'google_contact_id') IS NOT NULL AS connector_page,
+              s.config ->> 'kind' AS source_kind,
+              (SELECT t.source_id FROM pages t LEFT JOIN sources ts ON ts.id = t.source_id
+                WHERE t.slug = p.slug AND t.source_id <> p.source_id AND t.deleted_at IS NULL
+                  AND (t.frontmatter ->> 'google_contact_id') IS NULL
+                  AND COALESCE(ts.config ->> 'kind', '') NOT IN ('google', 'github')
+                ORDER BY (t.source_id = 'default') DESC, t.source_id LIMIT 1) AS canonical_twin_source
        FROM edge_counts ec
        JOIN pages p ON p.id = ec.page_id AND p.deleted_at IS NULL
+       LEFT JOIN sources s ON s.id = p.source_id
        LEFT JOIN chunk_counts cc ON cc.page_id = ec.page_id
        WHERE COALESCE(cc.chunks, 0) <= $2
          AND COALESCE(p.frontmatter ->> 'junk_hub_exempt', 'false') <> 'true'
@@ -493,25 +506,69 @@ export async function checkJunkEntityHubs(
       };
     }
 
-    const list = rows
-      .map(r => `  ${r.slug}${(r.source_id ?? 'default') !== 'default' ? ` [${r.source_id}]` : ''} — ${r.edges} edges, ${r.chunks} chunk(s)`)
-      .join('\n');
-    return {
-      name: 'junk_entity_hubs',
-      status: 'warn',
-      message:
-        `${rows.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
-        `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${list}\n` +
+    const line = (r: typeof rows[number]) => `  ${r.slug}${(r.source_id ?? 'default') !== 'default' ? ` [${r.source_id}]` : ''} — ${r.edges} edges, ${r.chunks} chunk(s)`;
+    // #6158: a connector's own contact page (re-rendered by the connector) collects its source's
+    // mention links by design (the own-source twin wins); it is not an extractor-minted entity.
+    const isConnector = (r: typeof rows[number]) => r.connector_page || isConnectorSourceKind(r.source_kind);
+    const hubs = rows.filter(r => !isConnector(r));
+    const twins = rows.filter(isConnector);
+    const parts: string[] = [];
+    if (hubs.length > 0) {
+      parts.push(
+        `${hubs.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
+        `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${hubs.map(line).join('\n')}\n` +
         `Review each page and merge/delete deliberately (nothing is auto-deleted). ` +
         `New accretion is already gated: enrichEntity refuses generic single-token mints and ` +
         `buildGazetteer drops single-generic-token person titles. If a page is an intentional thin ` +
-        `hub/index page, opt it out with junk_hub_exempt: true in frontmatter.`,
+        `hub/index page, opt it out with junk_hub_exempt: true in frontmatter.`);
+    }
+    // #6158 / #4845 (W14 P4.5): the remedies are real now. With
+    // link_resolution.cross_source on, the mention pass binds a name in the
+    // connector's source to the canonical twin instead of the stub (the stub
+    // yields; by-mention.ts), and a Google source added with --contacts-dir
+    // keeps its contact pages out of people/ altogether.
+    const crossSource = twins.length > 0 ? await isCrossSourceLinksEnabled(engine) : false;
+    const withTwin = twins.filter(r => r.canonical_twin_source !== null).length;
+    if (twins.length > 0) {
+      parts.push(
+        `${twins.length} connector contact page(s) with >${edgeThreshold} edges:\n${twins.map(line).join('\n')}\n` +
+        `These are not junk: a connector renders each contact as its own page, and mentions in that source link to it ` +
+        `before a page of the same name elsewhere unless link_resolution.cross_source is on. ` +
+        `${withTwin} of them ${withTwin === 1 ? 'has' : 'have'} a canonical twin in another source. ` +
+        (crossSource
+          ? `cross_source is on, so the next mention pass (gbrain extract --stale, or autopilot) re-binds those mentions to the twin; ` +
+            `edges already on the stub move as the pass reaches each page.`
+          : `Run gbrain config set link_resolution.cross_source true, then gbrain extract --stale: mentions in the connector source ` +
+            `bind to the twin from then on. `) +
+        `To keep a Google source's contacts out of people/ entirely, add it with --contacts-dir contacts (g_contacts_dir). ` +
+        `Frontmatter edits do not stick (the connector re-renders the page) and gbrain has no merge command.`);
+    }
+    const verify = { argv: ['gbrain', 'doctor', '--only', 'junk_entity_hubs', '--json'] };
+    const twinFix = twins.length === 0 ? {} : crossSource
+      ? { fix: { argv: ['gbrain', 'extract', '--stale'], consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Runs the mention pass, which binds names in the connector source to their canonical twin now that cross_source is on.', verify } }
+      : { fix: { argv: ['gbrain', 'config', 'set', 'link_resolution.cross_source', 'true'], consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Lets a mention resolve to a same-name page in another source; a connector contact stub then yields to its canonical twin on the next mention pass (gbrain extract --stale).',
+        user_message: 'Mentions in your Gmail source bind to the connector\'s own contact stubs instead of your real person pages. Turn on cross-source link resolution so they bind to the real pages?', verify } };
+    return {
+      name: 'junk_entity_hubs',
+      status: 'warn',
+      message: parts.join('\n'),
+      ...twinFix,
       details: {
-        hubs: rows.map(r => ({
+        hubs: hubs.map(r => ({
           slug: r.slug,
           source_id: r.source_id ?? 'default',
           edges: r.edges,
           chunks: r.chunks,
+        })),
+        connector_twins: twins.map(r => ({
+          slug: r.slug,
+          source_id: r.source_id ?? 'default',
+          edges: r.edges,
+          chunks: r.chunks,
+          canonical_twin: r.canonical_twin_source ? r.slug : null,
+          canonical_twin_source: r.canonical_twin_source,
         })),
       },
     };

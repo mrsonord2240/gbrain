@@ -65,6 +65,7 @@ import {
   multiSourceDriftCheck,
   multiSourceDriftNotVerified,
 } from './schema-pack-checks.ts';
+import { managedPersistenceEnabled } from '../../core/persistence/ownership.ts';
 import { brainScorePlanFix, checkError } from './check-fix.ts';
 import type { RenderContext } from '../../core/agent-output.ts';
 
@@ -308,7 +309,7 @@ export async function doctorReportRemote(
         engine,
         nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
       );
-      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'remote'));
+      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'remote', await managedPersistenceEnabled(engine).catch(() => false)));
     }
   } catch (e) {
     // Best-effort, but the check reports that it verified nothing (#5432).
@@ -373,7 +374,7 @@ export async function doctorReportRemote(
   // safe on the thin-client/remote path — remote operators on checkout-less
   // Postgres brains are exactly who can't otherwise see the extraction backlog.
   // Brain-wide here (remote --source scoping is a separate TODO, like orphan_ratio).
-  checks.push(await checkLinksExtractionLag(engine));
+  checks.push(await checkLinksExtractionLag(engine, { remote: true }));
 
   // #4576 (related gap): extract_atoms_backlog was absent from the
   // thin-client surface, so an MCP-only caller couldn't see the backlog at
@@ -436,7 +437,7 @@ export async function doctorReportRemote(
   checks.push(await checkProjectionReadiness(engine, {
     sourceIds: opts.sourceIds,
     excludePrivate: await resolveExcludePrivatePages(engine, opts.remote),
-  }, { resident: engine.kind === 'pglite' && opts.remote === true }));
+  }, { resident: engine.kind === 'pglite' && opts.remote === true, remote: opts.remote === true }));
 
   // issue #1777 — hidden_by_search_policy: chunked pages withheld from default
   // search by the hard-exclude prefix policy. Pure SQL COUNT, safe on the

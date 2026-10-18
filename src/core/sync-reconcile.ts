@@ -3,9 +3,10 @@
  * gate) + sync deadline/stall resolution (#1633, #1950). Peeled out of
  * src/commands/sync.ts (containment sprint C13-C14) as a pure move.
  */
-import { execFileSync } from 'child_process';
+import { execFileSync } from './spawn.ts';
 import { parseDurationSeconds } from './sync-concurrency.ts';
 import { resolveStallAbortSecondsFromEnv } from './stall-env.ts';
+import { gitChildEnv } from './git-env.ts';
 
 /**
  * #2828 full-sync reconcile safety-valve thresholds. A reconcile that would
@@ -88,7 +89,7 @@ export function listEverCommittedPaths(repoPath: string): Set<string> | null {
       'git',
       ['-C', repoPath, '-c', 'core.quotepath=off', 'log', '--all', '--no-renames',
         '--diff-filter=A', '--format=', '--name-only'],
-      { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
+      { env: gitChildEnv(), encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
     );
   } catch {
     return null;
@@ -224,6 +225,21 @@ export function syncWatchdogPlan(args: string[], res: HardDeadlineResolution): {
       (res.progressWindowMs ? `; extends while the sync keeps progressing (stops after ${Math.round(res.progressWindowMs / 1000)}s without progress)` : '') +
       '; disable with --no-hard-deadline\n',
   };
+}
+
+/**
+ * #6278: the `gbrain sync` arguments (after `sync`) that resume a managed cursor
+ * with its stored processing and cursor options, so a follow-up printed by a
+ * hold, `sources retry-held` or doctor keeps `--no-embed` and friends instead
+ * of starting a second cursor. `syncResumeCommand` quotes them.
+ */
+export function managedSyncResumeArgs(input: { sourceId: string; processingOptions?: { noEmbed?: boolean; noExtract?: boolean; noSchemaPack?: boolean } | null;
+  syncOptions?: { full?: boolean; workingTree?: boolean; srcSubpath?: string | null; exclude?: string[]; includeHidden?: string[]; strategy?: string | null } | null;
+  repoPath?: string | null }): string[] {
+  const p = input.processingOptions ?? {}, c = input.syncOptions ?? {};
+  return ['--source', input.sourceId, '--no-pull', ...(input.repoPath ? ['--repo', input.repoPath] : []), ...(p.noEmbed ? ['--no-embed'] : []), ...(p.noExtract ? ['--no-extract'] : []),
+    ...(p.noSchemaPack ? ['--no-schema-pack'] : []), ...(c.full ? ['--full'] : []), ...(c.workingTree ? ['--working-tree'] : []), ...(c.srcSubpath ? ['--src-subpath', c.srcSubpath] : []),
+    ...(c.exclude ?? []).flatMap(pattern => ['--exclude', pattern]), ...(c.includeHidden ?? []).flatMap(pattern => ['--include-hidden', pattern]), ...(c.strategy ? ['--strategy', c.strategy] : [])];
 }
 
 /**

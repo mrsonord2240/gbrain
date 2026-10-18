@@ -22,6 +22,7 @@ import { readdirSync, statSync, lstatSync, existsSync } from 'fs';
 import { join, relative, dirname } from 'path';
 import { isAborted } from '../core/abort-check.ts';
 import { parseMarkdown, type ParseValidationCode } from '../core/markdown.ts';
+import { parseDateLoose } from '../core/effective-date.ts';
 import {
   assessContentSanity,
   type OperatorLiteral,
@@ -35,10 +36,12 @@ import { loadActivePack } from '../core/schema-pack/load-active.ts';
 import { loadActivePackForLocalEngine } from '../core/schema-pack/best-effort.ts';
 import { safeCliToken, sanitizeTypeForDisplay, storedTypeMissesPack, type TypeUsagePack } from '../core/schema-pack/type-usage.ts';
 import { parseLineGrammar } from '../core/line-grammar.ts';
+import { stripCodeBlocks } from '../core/markdown-code.ts';
 import { pathToSlug } from '../core/sync.ts';
 import { isManagedBrain } from '../core/cycle/phase-table.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../core/persistence/prepared-maintenance.ts';
 import { fileMatchesSnapshot, prepareFileTarget } from '../core/persistence/page-prepare.ts';
+import { scannerSlugRootMode, scannerSourcePath } from '../core/write-through.ts';
 import { heldFileDiagnostic, writeFailureDiagnostic } from '../core/persistence/verb-errors.ts';
 import { loadActivePackForEngine } from '../core/schema-pack/engine-resolution.ts';
 import { OperationError, opError } from '../core/ops/contract.ts';
@@ -53,11 +56,11 @@ export interface LintIssue {
   rule: string;
   message: string;
   fixable: boolean;
-  /** The stable machine code: a managed-brain repair that waits, or a listed file removed before lint read it. */
-  code?: 'managed_write_pending' | 'file_removed_during_scan';
-  /** Why it waits: the coordinator refusal's reason (`file_database_drift`, `held_file`, `canonical_file_missing`, ...), `revision_changed` or `not_indexed`. */
+  /** The stable machine code: a repair that was not applied (`managed_write_pending` from a managed brain's coordinator, `fix_not_writable` when the file refused the write), or a listed file removed before lint read it (`file_removed_during_scan`). */
+  code?: 'managed_write_pending' | 'fix_not_writable' | 'file_removed_during_scan';
+  /** Why: the coordinator refusal's reason (`file_database_drift`, `held_file`, `canonical_file_missing`, ...), `revision_changed`, `not_indexed`, or the lowercased errno (`eacces`, `eperm`, `erofs`). */
   reason?: string;
-  /** The coordinator refusal's own next step, rendered for the CLI; lint never adds one of its own. */
+  /** The next step, rendered for the CLI: the coordinator refusal's own fix, or the owner's permission fix. */
   fix?: RenderedAction;
   docs?: string;
 }
@@ -84,16 +87,51 @@ const FRONTMATTER_FIXABLE: ReadonlySet<ParseValidationCode> = new Set<ParseValid
 
 // ── LLM artifact patterns ──────────────────────────────────────────
 
+// Anchored to the start of the page body (no `g`/`m` flags): an LLM prepends
+// a preamble to its output, so a line further down that merely begins
+// "Sure! Here is..." (a quoted reply, a transcript turn) is real content.
 const LLM_PREAMBLES = [
-  /^Of course\.?\s*Here is (?:a |the )?(?:detailed |comprehensive |updated )?(?:brain )?page[^.\n]*\.?\s*\n*/gim,
-  /^Certainly\.?\s*Here is[^.\n]*\.?\s*\n*/gim,
-  /^Here is (?:a |the )?(?:detailed |comprehensive |updated )?(?:brain )?page[^.\n]*\.?\s*\n*/gim,
-  /^I've (?:created|updated|written|prepared) (?:a |the )?(?:detailed |comprehensive )?(?:brain )?page[^.\n]*\.?\s*\n*/gim,
-  /^Sure(?:!|,)?\s*Here (?:is|are)[^.\n]*\.?\s*\n*/gim,
-  /^Absolutely\.?\s*Here[^.\n]*\.?\s*\n*/gim,
+  /^Of course\.?\s*Here is (?:a |the )?(?:detailed |comprehensive |updated )?(?:brain )?page[^.\n]*\.?\s*\n*/i,
+  /^Certainly\.?\s*Here is[^.\n]*\.?\s*\n*/i,
+  /^Here is (?:a |the )?(?:detailed |comprehensive |updated )?(?:brain )?page[^.\n]*\.?\s*\n*/i,
+  /^I've (?:created|updated|written|prepared) (?:a |the )?(?:detailed |comprehensive )?(?:brain )?page[^.\n]*\.?\s*\n*/i,
+  /^Sure(?:!|,)?\s*Here (?:is|are)[^.\n]*\.?\s*\n*/i,
+  /^Absolutely\.?\s*Here[^.\n]*\.?\s*\n*/i,
 ];
 
+const LEADING_FRONTMATTER = /^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/;
+const LEADING_MARKDOWN_FENCE = /^```(?:markdown|md)[ \t]*\r?\n/;
+
+/**
+ * The leading LLM preamble run (stacked preamble lines) at a body start: the
+ * top of the file, right after a leading frontmatter block, or right after a
+ * whole-page ```markdown wrapper, leading blank lines skipped. Returns the
+ * [start, end) span to remove, or null. Detection and repair both use it.
+ */
+function findLeadingPreamble(content: string): { start: number; end: number } | null {
+  const skipBlank = (i: number) => i + (/^\s*/.exec(content.slice(i))?.[0].length ?? 0);
+  const anchors = [0, LEADING_FRONTMATTER.exec(content)?.[0].length, LEADING_MARKDOWN_FENCE.exec(content)?.[0].length]
+    .filter((a): a is number => a !== undefined).map(skipBlank);
+  for (const start of anchors) {
+    let end = start;
+    for (let guard = 0; guard < 16; guard++) {
+      const hit = LLM_PREAMBLES.map(p => p.exec(content.slice(end))).find(m => m && m[0].length > 0);
+      if (!hit) break;
+      end += hit[0].length;
+    }
+    if (end > start) return { start, end };
+  }
+  return null;
+}
+
 // ── Rules ──────────────────────────────────────────────────────────
+
+/**
+ * #5433: frontmatter keys that count as temporal provenance for the
+ * `missing-created` rule. `created` first for the legacy name; the rest are
+ * what effective-date resolution and the native serializer actually write.
+ */
+const TEMPORAL_KEYS = ['created', 'event_date', 'date', 'published', 'captured_at', 'ingested_at'] as const;
 
 /**
  * Per-call options for `lintContent`. Tests pass content-sanity opts
@@ -147,21 +185,23 @@ export function lintContent(content: string, filePath: string, opts: LintContent
   }
 
   // Rule: line-grammar near-misses (a relation or fact line that will not be
-  // read as written). Read-only; the fix is in each message.
+  // read as written). Read-only; the fix is in each message. Syntax-only: a
+  // file check reads no brain settings or schema pack, so it never implies an
+  // edge will be stored; `gbrain get <slug> --grammar-diagnostics` is the
+  // effective check against the brain.
   for (const d of parseLineGrammar(content).diagnostics) {
-    issues.push({ file: filePath, line: d.line, rule: 'line-grammar', message: `${d.message} (${d.reason})`, fixable: false });
+    issues.push({ file: filePath, line: d.line, rule: 'line-grammar',
+      message: `${d.message} (${d.reason}; syntax-only check: run \`gbrain get <slug> --grammar-diagnostics\` for what the brain reads)`, fixable: false });
   }
 
-  // Rule: LLM preamble artifacts
-  for (const pattern of LLM_PREAMBLES) {
-    pattern.lastIndex = 0;
-    if (pattern.test(content)) {
-      issues.push({
-        file: filePath, line: 1, rule: 'llm-preamble',
-        message: 'LLM preamble artifact detected (e.g., "Of course! Here is...")',
-        fixable: true,
-      });
-    }
+  // Rule: LLM preamble artifacts (only a leading run; see findLeadingPreamble)
+  const preamble = findLeadingPreamble(content);
+  if (preamble) {
+    issues.push({
+      file: filePath, line: content.slice(0, preamble.start).split('\n').length, rule: 'llm-preamble',
+      message: 'LLM preamble artifact detected (e.g., "Of course! Here is...")',
+      fixable: true,
+    });
   }
 
   // Rule: Wrapping code fences (```markdown ... ```)
@@ -178,17 +218,17 @@ export function lintContent(content: string, filePath: string, opts: LintContent
     });
   }
 
-  // Rule: Placeholder dates. #3958: skip lines inside fenced code blocks —
-  // a page DOCUMENTING date formats (```\ncreated: YYYY-MM-DD\n```) is not a
-  // page with an unfilled placeholder. Both ``` and ~~~ fences toggle.
-  let inFence = false;
+  // Rule: Placeholder dates. #3958/#6133: code is not a placeholder — a page
+  // DOCUMENTING date formats (```\ncreated: YYYY-MM-DD\n``` or `YYYY-MM-DD`)
+  // is not a page with an unfilled one. stripCodeBlocks masks fenced blocks
+  // and inline spans in place, so line numbers stay exact.
+  // #6538: in the body, a YYYY-MM-DD token followed by `-word`, `.ext` or `/` is a filename/path template
+  // (`YYYY-MM-DD-topic.md`), not an unfilled date; frontmatter stays strict.
+  const prose = stripCodeBlocks(content).split('\n');
+  const frontmatterLines = content.startsWith('---') ? lines.indexOf('---', 1) : -1;
   for (let i = 0; i < lines.length; i++) {
-    if (/^\s{0,3}(```|~~~)/.test(lines[i])) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
-    if (lines[i].match(/\bYYYY-MM-DD\b/) || lines[i].match(/\bXX-XX\b/) || lines[i].match(/\b\d{4}-XX-XX\b/)) {
+    const datePlaceholder = i <= frontmatterLines ? /\bYYYY-MM-DD\b/ : /\bYYYY-MM-DD\b(?![-./][A-Za-z0-9]|\/)/;
+    if (prose[i].match(datePlaceholder) || prose[i].match(/\bXX-XX\b/) || prose[i].match(/\b\d{4}-XX-XX\b/)) {
       issues.push({
         file: filePath, line: i + 1, rule: 'placeholder-date',
         message: `Placeholder date found: ${lines[i].trim().slice(0, 60)}`,
@@ -227,17 +267,17 @@ export function lintContent(content: string, filePath: string, opts: LintContent
           fixable: false,
         });
       }
-      if (!fm.match(/^created:/m)) {
-        // #3958: when the page's own frontmatter carries a capture timestamp
-        // (captured_at / ingested_at), `--fix` can promote it to `created` —
-        // mark the finding fixable so the operator knows --fix will heal it.
-        const promotable = /^(?:captured_at|ingested_at):/m.test(fm);
+      // #5433: the native serializer never writes `created` and effective-date
+      // resolution reads event_date / date / published, so any parseable
+      // temporal key is provenance enough. The rule name stays for consumers;
+      // it is never fixable (ingest time is not creation time, see #3958).
+      // A block YAML could not read is already a frontmatter-yaml-parse finding.
+      const yamlUnreadable = parsed.errors?.some(e => e.code === 'YAML_PARSE') ?? false;
+      if (!yamlUnreadable && !TEMPORAL_KEYS.some(key => parseDateLoose(parsed.frontmatter[key]) !== null)) {
         issues.push({
           file: filePath, line: 1, rule: 'missing-created',
-          message: promotable
-            ? 'Frontmatter missing required field: created (promotable from captured_at/ingested_at)'
-            : 'Frontmatter missing required field: created',
-          fixable: promotable,
+          message: `Frontmatter has no parseable date under any of: ${TEMPORAL_KEYS.join(', ')}`,
+          fixable: false,
         });
       }
     }
@@ -263,19 +303,24 @@ export function lintContent(content: string, filePath: string, opts: LintContent
     }
   }
 
-  // Rule: Empty/stub sections
+  // Rule: Empty/stub sections. #6257: headings and section boundaries are
+  // found in the code-masked text (a `## ` line inside a fence is not a
+  // section); the body and title are read from the original at the same
+  // offsets, so a section whose body is only a code block is not empty.
+  const masked = prose.join('\n');
   const sectionPattern = /^##\s+(.+)$/gm;
   let sectionMatch;
-  while ((sectionMatch = sectionPattern.exec(content)) !== null) {
+  while ((sectionMatch = sectionPattern.exec(masked)) !== null) {
     const sectionStart = sectionMatch.index + sectionMatch[0].length;
-    const nextSection = content.indexOf('\n## ', sectionStart);
+    const nextSection = masked.indexOf('\n## ', sectionStart);
     const sectionBody = content.slice(sectionStart, nextSection > 0 ? nextSection : undefined).trim();
 
     if (sectionBody === '' || sectionBody === '[No data yet]' || sectionBody === '*[To be filled by agent]*') {
       const lineNum = content.slice(0, sectionMatch.index).split('\n').length;
+      const title = content.slice(sectionStart - sectionMatch[1].length, sectionStart);
       issues.push({
         file: filePath, line: lineNum, rule: 'empty-section',
-        message: `Empty section: ## ${sectionMatch[1]}`,
+        message: `Empty section: ## ${title}`,
         fixable: false,
       });
     }
@@ -356,11 +401,16 @@ export function lintContent(content: string, filePath: string, opts: LintContent
 }
 
 /**
- * #3958: promote `captured_at:` (preferred) or `ingested_at:` to `created:`
- * when the frontmatter has no `created:` of its own. The value is copied
- * verbatim (quoting preserved) and inserted directly below the source line.
- * No-op when there is no frontmatter, `created:` already exists, or neither
- * capture field is present. Pure + exported for tests.
+ * @deprecated #5433: no longer part of `fixContent`. Ingest time is when a
+ * file entered the brain, not when its content was created, and the cycle's
+ * lint phase ran this on every native page, diverging the file from the DB
+ * row that serialized it. Kept for callers who promote explicitly.
+ *
+ * Promotes `captured_at:` (preferred) or `ingested_at:` to `created:` when
+ * the frontmatter has no `created:` of its own. The value is copied verbatim
+ * (quoting preserved) and inserted directly below the source line. No-op
+ * when there is no frontmatter, `created:` already exists, or neither
+ * capture field is present.
  */
 export function promoteCreatedFromCapture(content: string): string {
   if (!content.startsWith('---')) return content;
@@ -378,20 +428,13 @@ export function promoteCreatedFromCapture(content: string): string {
 export function fixContent(content: string): string {
   let fixed = content;
 
-  // Fix LLM preambles
-  for (const pattern of LLM_PREAMBLES) {
-    pattern.lastIndex = 0;
-    fixed = fixed.replace(pattern, '');
-  }
+  // Fix LLM preambles: only the leading run at a body start.
+  const preamble = findLeadingPreamble(fixed);
+  if (preamble) fixed = fixed.slice(0, preamble.start) + fixed.slice(preamble.end);
 
   // Fix wrapping code fences
   fixed = fixed.replace(/^```(?:markdown|md)\s*\n/, '');
   fixed = fixed.replace(/\n```\s*$/, '');
-
-  // #3958: missing-created is fixable when the page's own frontmatter
-  // carries a capture timestamp. Runs after the fence unwrap so a wrapped
-  // page's frontmatter is visible to the promotion.
-  fixed = promoteCreatedFromCapture(fixed);
 
   // Clean up excessive blank lines left by fixes
   fixed = fixed.replace(/\n{3,}/g, '\n\n');
@@ -594,9 +637,10 @@ export interface LintResult {
   /** #5180: where fixes went — the worktree (legacy), the persistence
    *  coordinator (managed brain), or nowhere (report-only / dry-run). */
   write_path: 'filesystem' | 'coordinator' | 'none';
-  /** #5180: fixes a managed brain could not publish this run (the file has
-   *  no indexed page, or the page changed mid-scan); each is reported as a
-   *  non-fixable `managed-write-pending` issue and retried next cycle. */
+  /** Fixes not applied this run: a managed brain could not publish them (#5180:
+   *  no indexed page, or the page changed mid-scan; `managed-write-pending`),
+   *  or the file refused the write (`fix-not-writable`). Each is a non-fixable
+   *  issue and is retried on the next run. */
   fix_pending: number;
   /** The first MAX_PENDING_ISSUES of those issues with their code, reason and fix. */
   pending_issues: LintIssue[];
@@ -619,6 +663,32 @@ function removedDuringScanIssue(file: string, target: string): LintIssue {
     fix: renderAction({ argv: ['gbrain', 'lint', target], consent: [], actor: 'agent', requires_exclusive: false,
       why: 'Lists the tree again and lints the files present now.' }, cliRenderContext()),
     docs: docsUrl(ERROR_CATALOGUE.file_removed_during_scan.docs) };
+}
+
+const UNWRITABLE_CODES: ReadonlySet<string> = new Set(['EACCES', 'EPERM', 'EROFS']);
+
+/**
+ * Write one filesystem lint fix. A file the process may not write (EACCES,
+ * EPERM, EROFS: permissions or a read-only mount) is left unchanged and
+ * returned as a non-fixable `fix-not-writable` issue so the rest of the tree
+ * is still linted; any other write error propagates.
+ */
+function writeLintFixOrRefusal(page: string, relPath: string, fixed: string): LintIssue | null {
+  try {
+    writeSourceFileSync(page, fixed);
+    return null;
+  } catch (e) {
+    const errno = (e as NodeJS.ErrnoException | null)?.code;
+    if (typeof errno !== 'string' || !UNWRITABLE_CODES.has(errno)) throw e;
+    const envelope = toAgentError(opError('fix_not_writable', `fix not applied: ${relPath} is not writable (${errno}); the file was left unchanged.`,
+      'Make the file writable by the user running gbrain, or pass its directory or file name to `gbrain lint --exclude` (for the cycle, add it to `cycle.lint_exclude` with `gbrain config set`), then lint again.', {
+        why: 'Lint repairs files in place, and this file refused the write (its permissions or a read-only mount).',
+        fix: { consent: [], actor: 'user', requires_exclusive: false, why: 'Only the file owner can change its permissions or mount.',
+          user_message: `Make ${relPath} writable for gbrain, or exclude it from lint.` },
+      }), { transport: 'cli', command: 'lint', render: cliRenderContext() });
+    return { file: relPath, line: 1, rule: 'fix-not-writable', fixable: false, code: 'fix_not_writable', reason: errno.toLowerCase(),
+      message: envelope.message, ...(envelope.fix ? { fix: envelope.fix } : {}), docs: docsUrl(ERROR_CATALOGUE.fix_not_writable.docs) };
+  }
 }
 
 function refusalReason(error: OperationError): string {
@@ -660,7 +730,8 @@ async function publishLintFix(engine: BrainEngine, authority: MaintenanceAuthori
   const scanned = existsSync(page) ? readSourceFileSync(page, 'utf-8') : null;
   const fixed = scanned === null ? null : fixContent(scanned);
   if (scanned === null ? !authority.binding : fixed === scanned) return null;
-  if (authority.binding && (scanned === null || !await fileMatchesSnapshot(engine, slug, scanned, snapshot, activePack))) {
+  const importPath = async () => scannerSourcePath(root, page, await scannerSlugRootMode(engine, sourceId, root));
+  if (authority.binding && (scanned === null || !await fileMatchesSnapshot(engine, slug, scanned, snapshot, importPath, activePack))) {
     const current = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
     if (current?.revision !== snapshot.revision) return pendingIssue(relPath, slug, 'revision_changed', changedWhileLinting(sourceId, slug));
     try {
@@ -818,11 +889,16 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
           }
         } else {
           assertSourceFilesystemActive();
-          writeSourceFileSync(page, fixed);
-          if (commitFixes) {
-            commitWriteThroughFile(repoProbe, page, relative(repoProbe, page).replace(/\.md$/u, ''));
+          const unwritable = writeLintFixOrRefusal(page, relPath, fixed);
+          if (unwritable) {
+            issues.push(unwritable);
+            totalIssues++;
+            fixPending++;
+            if (pendingIssues.length < MAX_PENDING_ISSUES) pendingIssues.push(unwritable);
+          } else {
+            if (commitFixes) commitWriteThroughFile(repoProbe, page, relative(repoProbe, page).replace(/\.md$/u, ''));
+            fixCount = fixable;
           }
-          fixCount = fixable;
         }
         totalFixed += fixCount;
       }

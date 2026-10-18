@@ -55,6 +55,10 @@ describe('CANONICAL_PRICING — table integrity', () => {
     expect(CANONICAL_PRICING['anthropic:claude-sonnet-5-5']).toMatchObject({ input: 2.0, output: 10.0, cache_read: 0.2 });
   });
 
+  test('gpt-6.1-sol present at its $2/$10 list rate (the fence repair default meters exactly, #6188)', () => {
+    expect(CANONICAL_PRICING['openai:gpt-6.1-sol']).toMatchObject({ input: 2.0, output: 10.0 });
+  });
+
   test('Fable 5 present at $10/$50', () => {
     expect(CANONICAL_PRICING['anthropic:claude-fable-5']).toMatchObject({ input: 10.0, output: 50.0 });
   });
@@ -93,6 +97,30 @@ describe('CANONICAL_PRICING — table integrity', () => {
       expect(p.cache_read).toBeCloseTo(p.input * mult, 10);
       expect(p.cache_write).toBeCloseTo(p.input * ANTHROPIC_CACHE_WRITE_5M_MULT, 10);
     }
+  });
+
+  // #6448 item 1: a long-prompt tier is an UPPER tier (every rate at or above
+  // the base row) with a positive threshold, and an anthropic: tier derives
+  // its cache rates from ITS input rate with the same multipliers as the row.
+  test('every long_prompt tier is finite, above its base row, and derives its cache rates like the row', () => {
+    let tiers = 0;
+    for (const [key, p] of Object.entries(CANONICAL_PRICING)) {
+      const tier = p.long_prompt;
+      if (!tier) continue;
+      tiers++;
+      expect(Number.isFinite(tier.threshold_tokens) && tier.threshold_tokens > 0).toBe(true);
+      expect(tier.input).toBeGreaterThanOrEqual(p.input);
+      expect(tier.output).toBeGreaterThanOrEqual(p.output);
+      if (key.startsWith('anthropic:')) {
+        const mult = ANTHROPIC_CACHE_READ_MULT_OVERRIDES[key] ?? ANTHROPIC_CACHE_READ_MULT;
+        expect(tier.cache_read).toBeCloseTo(tier.input * mult, 10);
+        expect(tier.cache_write).toBeCloseTo(tier.input * ANTHROPIC_CACHE_WRITE_5M_MULT, 10);
+      } else {
+        expect(tier.cache_read).toBeUndefined();
+        expect(tier.cache_write).toBeUndefined();
+      }
+    }
+    expect(tiers).toBeGreaterThanOrEqual(1); // Haiku 5.5
   });
 
   test('every cache-read multiplier override names a canonical row with matching cache_read', () => {
