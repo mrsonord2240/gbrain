@@ -283,6 +283,24 @@ export function resolveMaxLifetimeSeconds(
 }
 
 /**
+ * Pool idle timeout in seconds (default 20). Every reconnect repeats the TLS
+ * handshake, auth and the postgres.js type-catalog fetch, so a long-running
+ * service polling slower than the timeout pays that egress again and again:
+ *
+ *   GBRAIN_POOL_IDLE_TIMEOUT_S=300   # keep idle connections for 5 min
+ *   GBRAIN_POOL_IDLE_TIMEOUT_S=0     # never close idle connections
+ *
+ * Invalid values fall back to the default. The env param is injectable so
+ * tests never mutate process.env.
+ */
+export function resolveIdleTimeoutSeconds(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const parsed = Number(env.GBRAIN_POOL_IDLE_TIMEOUT_S);
+  return env.GBRAIN_POOL_IDLE_TIMEOUT_S && Number.isInteger(parsed) && parsed >= 0 ? parsed : 20;
+}
+
+/**
  * Session-level GUCs applied to every new backend connection. Prevents
  * orphan pgbouncer sessions from holding locks or running queries
  * indefinitely when the postgres.js client disconnects mid-transaction
@@ -502,7 +520,7 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
     const timeouts = resolveSessionTimeouts();
     const opts: Record<string, unknown> = {
       max: resolvePoolSize(),
-      idle_timeout: 20,
+      idle_timeout: resolveIdleTimeoutSeconds(),
       connect_timeout: resolveUrlConnectTimeout(url),
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
       max_lifetime: resolveMaxLifetimeSeconds(),

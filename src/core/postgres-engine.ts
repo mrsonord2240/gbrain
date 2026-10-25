@@ -412,7 +412,7 @@ export class PostgresEngine implements BrainEngine {
       const timeouts = db.resolveSessionTimeouts();
       const opts: Record<string, unknown> = {
         max: size,
-        idle_timeout: 20,
+        idle_timeout: db.resolveIdleTimeoutSeconds(),
         connect_timeout: db.resolveUrlConnectTimeout(url),
         // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
         max_lifetime: db.resolveMaxLifetimeSeconds(),

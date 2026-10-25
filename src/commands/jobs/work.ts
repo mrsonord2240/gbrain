@@ -188,9 +188,13 @@ export async function runJobsWork({ args, engine, queue }: JobsCommandContext): 
     }
   }
 
+  // GBRAIN_WORKER_POLL_MS (1 s to 5 min) slows the idle claim loop; each tick
+  // is several queries, which a hosted database bills as egress.
+  const pollMs = Number(process.env.GBRAIN_WORKER_POLL_MS);
+  const pollInterval = Number.isInteger(pollMs) && pollMs >= 1000 && pollMs <= 300_000 ? pollMs : undefined;
   const worker = new MinionWorker(engine, {
     queue: queueName, concurrency, maxRssMb, healthCheckInterval,
-    jobIsolation, childCliInvocation, childTiniPath,
+    jobIsolation, childCliInvocation, childTiniPath, pollInterval,
   });
   try {
     await registerBuiltinHandlers(worker, engine);
