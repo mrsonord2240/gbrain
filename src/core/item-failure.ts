@@ -25,6 +25,7 @@ import { OperationError, opError } from './ops/contract.ts';
 import { CODES } from './error-registry.ts';
 import { acceptedPendingReceipt } from './persistence/accepted-pending.ts';
 import { providerItemRefusal } from './ai/errors.ts';
+import { quotesPath } from './retry-matcher.ts';
 
 /** Every per-item loop that isolates its items, with the inventory row it fixes (reports/GBRA-130-inventory.md). */
 export const ISOLATE_SITES = {
@@ -78,6 +79,7 @@ export const RUN_SCOPED_CODES: ReadonlySet<string> = new Set([
   'permission_denied', 'schema_owner_required', 'scope_denied', 'config', 'auth', 'connector_holds_exhausted', 'transfer_in_progress', 'disk_full',
   'invalid_token', 'insufficient_scope', 'trusted_local_only', 'requires_local_engine', 'not_owner_host', 'host_identity_mismatch',
   'recovery_required', 'cancelled', 'persistence_restart_required', 'writer_regrant_required', 'writer_manifest_rescope_required',
+  'connection_inherited_read_only',
 ]);
 
 /** Item codes that fail the same way until the item changes. Every other item code is transient. */
@@ -93,6 +95,7 @@ function sqlstateFailure(state: string): { code: string; scope: 'run' | 'item'; 
     || state.startsWith('58') || state.startsWith('XX')) return { code: 'database_contention', scope: 'run', class: 'transient' };
   if (state === '42P01' || state === '42703' || state === '42883') return { code: 'schema_behind', scope: 'run', class: 'transient' };
   if (state === '42501') return { code: 'permission_denied', scope: 'run', class: 'transient' };
+  if (state === '25006') return { code: 'connection_inherited_read_only', scope: 'run', class: 'transient' };
   if (state.startsWith('28')) return { code: 'auth', scope: 'run', class: 'transient' };
   if (state === '57014') return { code: 'statement_timeout', scope: 'item', class: 'transient' };
   if (state === '55P03') return { code: 'lock_timeout', scope: 'item', class: 'transient' };
@@ -101,6 +104,8 @@ function sqlstateFailure(state: string): { code: string; scope: 'run' | 'item'; 
 }
 
 const RUN_ERRNOS = new Set(['ENOSPC', 'EMFILE', 'ENFILE', 'EROFS', 'EDQUOT']);
+/** A database socket or driver connection that went away (the codes the connection text below names); a child process's ETIMEDOUT or EPIPE stays the item's. */
+const ITEM_CONNECTION_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'CONNECTION_CLOSED', 'CONNECTION_ENDED', 'CONNECTION_DESTROYED']);
 const ITEM_ERRNOS = new Set(['EACCES', 'EPERM', 'ENOENT', 'ELOOP', 'EISDIR', 'ENOTDIR', 'ENAMETOOLONG', 'EILSEQ']);
 const RUN_ERROR_NAMES: Record<string, string> = { AbortError: 'aborted', LockStolenError: 'lock_stolen', BudgetExhausted: 'budget_exhausted' };
 /** A model or embedding provider's own failure (the gateway's error classes, an HTTP fetch that failed): never the database connection; a provider outage trips the breaker. */
@@ -118,7 +123,8 @@ function classifyOne(error: unknown): ClassifiedItemFailure | null {
   if (error instanceof OperationError) {
     const code = String(error.code === 'storage_error' && error.writeError ? error.writeError : error.canonicalCode);
     const requestId = error.writeRequest?.request_id ?? null;
-    if (RUN_SCOPED_CODES.has(code) || (code === 'storage_error' && error.detail === 'database_contention')) {
+    if (code === 'storage_error' && error.detail === 'database_contention') return { code: 'database_contention', scope: 'run', class: 'transient', message, requestId };
+    if (RUN_SCOPED_CODES.has(code)) {
       return { code, scope: 'run', class: 'transient', message, requestId };
     }
     const registryClass = (CODES as Record<string, { class: string }>)[code]?.class;
@@ -130,13 +136,15 @@ function classifyOne(error: unknown): ClassifiedItemFailure | null {
     if (sql) return { ...sql, message, requestId: null };
   }
   if (typeof raw === 'string' && RUN_ERRNOS.has(raw)) return { code: 'disk_full', scope: 'run', class: 'transient', message, requestId: null };
+  if (typeof raw === 'string' && ITEM_CONNECTION_CODES.has(raw)) return { code: 'connection_lost', scope: 'run', class: 'transient', message, requestId: null };
   if (typeof raw === 'string' && ITEM_ERRNOS.has(raw)) return { code: 'unreadable_item', scope: 'item', class: 'content', message, requestId: null };
   const refusal = providerItemRefusal(error);
   if (refusal) return { code: refusal, scope: 'item', class: 'content', message, requestId: null };
   if ((typeof name === 'string' && AI_ERROR_NAMES.has(name)) || /^fetch failed\b/i.test(message)) {
     return { code: 'provider_error', scope: 'item', class: 'transient', message, requestId: null };
   }
-  if (/ECONNRESET|ECONNREFUSED|connection (terminated|ended|closed)|Connection terminated|socket hang up/i.test(message)) {
+  // GBRA-133 S-65/S-70: connection text is read only from an uncoded error naming no path; a coded error was decided above.
+  if (raw === undefined && !quotesPath(message) && /ECONNRESET|ECONNREFUSED|connection (terminated|ended|closed)|Connection terminated|socket hang up/i.test(message)) {
     return { code: 'connection_lost', scope: 'run', class: 'transient', message, requestId: null };
   }
   return null;

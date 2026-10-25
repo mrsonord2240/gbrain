@@ -147,6 +147,7 @@ CHECKS=(
   "check:no-double-retry"
   "check:batch-audit-site"
   "check:engine-dynamic-import"
+  "check:file-url-pathname"
   "check:grok-pin"
   "check:opencode-pin"
   "check:pin-doc-privacy"
@@ -186,6 +187,9 @@ CHECKS=(
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"
+  # GBRA-161: derived-retire writers only shrink; reviewed ceilings in
+  # docs/architecture/derived-census.tsv.
+  "check:derived-census"
   # Wave B segmented storage (spec 1.5 layer 4): whole-body page readers only
   # shrink; baseline scripts/page-body-readers-baseline.tsv.
   "check:page-body-readers"
@@ -211,12 +215,19 @@ CHECKS=(
   # --hard or a bare/force push for a shared brain checkout (~0.5s).
   "check:shared-tree-git"
   "check:schema-migration-order"
+  # A since: 'TBD' BEHAVIOR_CHANGES row never ships: refused on a stamped tree
+  # (VERSION has a CHANGELOG header and differs from origin/master's) and on master.
+  "check:behavior-since"
+  # CHANGELOG.md keeps every release heading origin/master has (a cut file is refused).
+  "check:changelog-headings"
   "check:structural-manifest"
   # Every generated artifact's freshness in one place (GBRA-47 B8); its Fix
   # line is `bun run regen:all`, the same code path that regenerates them.
   "check:regen-all"
   # v0.50.5.0 security wave: compiled binaries must not autoload a cwd bunfig.toml.
   "check:compile-autoload"
+  # The vendored postgres driver's three copies equal pinned upstream plus its patch (networked; a recorded skip offline).
+  "check:vendor-postgres"
 )
 
 # ──────────────────────────────────────────────────────────────────────────

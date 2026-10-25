@@ -3,15 +3,16 @@
  * baseline-commit self-heal, and path-containment guards. Peeled out of
  * src/commands/sync.ts (containment sprint C13-C14) as a pure move.
  */
-import { realpathSync } from 'fs';
+import { lstatSync, realpathSync } from 'fs';
 import { execFileSync } from './spawn.ts';
-import { isAbsolute, join, relative, sep } from 'path';
+import { execFileBounded } from './bounded-child-exec.ts';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { resolveSlugForPath, DEFAULT_SOURCE_ID } from './sync.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 import { invalidateGitListingCache, knownOutsideGitRepo, noteGitFailure } from './git-visible-files.ts';
 import { hasUnresolvedDbOnlyDeclaration, loadStorageConfig } from './storage-config.ts';
-import { gitChildEnv } from './git-env.ts';
+import { GIT_READ_ENV, gitChildEnv } from './git-env.ts';
 
 /**
  * v0.32.7 CJK wave (codex post-merge F4): resolve a slug by `pages.source_path`
@@ -290,6 +291,11 @@ function noteGitCommand(args: string[]): void {
   if (!READ_ONLY_GIT.has(args[0] ?? '')) invalidateGitListingCache();
 }
 
+/** `GIT_READ_ENV` for a read-only subcommand (no optional index lock), nothing for one that writes. */
+function readOnlyEnv(args: string[]): NodeJS.ProcessEnv {
+  return READ_ONLY_GIT.has(args[0] ?? '') ? GIT_READ_ENV : {};
+}
+
 /**
  * Shell out to git with a generous maxBuffer.
  *
@@ -318,12 +324,36 @@ export function git(
 ): string {
   noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, configs), {
-    env: gitChildEnv(),
+    env: gitChildEnv(readOnlyEnv(args)),
     encoding: 'utf-8',
     timeout: timeoutMs,
     maxBuffer: 100 * 1024 * 1024,
     ...(silenceStderr ? { stdio: ['ignore', 'pipe', 'pipe'] as const } : {}),
   }).trim();
+}
+
+/**
+ * GBRA-133 2b.3: `git()` without blocking the event loop, for the classic sync a resident (serve, the jobs worker,
+ * autopilot) runs in-process on a commit. Same invocation, environment, timeout and buffer. A failure rejects like
+ * `execFileSync` throws (`status`, `signal`, `stdout`, `stderr`), and git's stderr reaches this process's stderr unless
+ * silenced, as `execFileSync` passes it through. `raw` keeps the output untrimmed (NUL-delimited listings).
+ */
+export async function gitAsync(
+  repoPath: string,
+  args: string[],
+  { configs = [], timeoutMs = 30000, silenceStderr = false, raw = false }: { configs?: string[]; timeoutMs?: number; silenceStderr?: boolean; raw?: boolean } = {},
+): Promise<string> {
+  noteGitCommand(args);
+  const r = await execFileBounded('git', buildGitInvocation(repoPath, args, configs), {
+    env: gitChildEnv(readOnlyEnv(args)), timeout: timeoutMs, maxBuffer: 100 * 1024 * 1024,
+  });
+  if (r.stderr && !silenceStderr) process.stderr.write(r.stderr);
+  if (r.error) {
+    const code = (r.error as { code?: unknown }).code;
+    throw Object.assign(new Error(r.error.message), { status: typeof code === 'number' ? code : null, signal: r.error.signal ?? null,
+      code, stdout: r.stdout, stderr: r.stderr });
+  }
+  return raw ? r.stdout : r.stdout.trim();
 }
 
 /**
@@ -336,7 +366,7 @@ export function git(
 export function gitRawOutput(repoPath: string, args: string[]): string {
   noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, []), {
-    env: gitChildEnv(),
+    env: gitChildEnv(readOnlyEnv(args)),
     encoding: 'utf-8',
     timeout: 30000,
     maxBuffer: 100 * 1024 * 1024,
@@ -363,11 +393,23 @@ export function discoverGitRoot(inputPath: string): string {
     if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
     return git(inputPath, ['rev-parse', '--show-toplevel'], [], 30000, { silenceStderr: true });
   } catch (error) {
-    noteGitFailure(inputPath, error);
-    throw new Error(
-      `Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`,
-    );
+    throw notAGitRepository(inputPath, error);
   }
+}
+
+/** `discoverGitRoot` without blocking the event loop (GBRA-133 2b.3). */
+export async function discoverGitRootAsync(inputPath: string): Promise<string> {
+  try {
+    if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
+    return await gitAsync(inputPath, ['rev-parse', '--show-toplevel'], { silenceStderr: true });
+  } catch (error) {
+    throw notAGitRepository(inputPath, error);
+  }
+}
+
+function notAGitRepository(inputPath: string, error: unknown): Error {
+  noteGitFailure(inputPath, error);
+  return new Error(`Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`);
 }
 
 /**
@@ -616,11 +658,15 @@ export function isWithinRoot(
 /**
  * #774 NAV-1 TOCTOU: true only if filePath realpath-resolves inside gitRoot.
  * Guards symlink escape at the per-file level (a committed symlink whose
- * target lives outside the repo), not just at scope entry.
+ * target lives outside the repo), not just at scope entry. GBRA-133 S-4: a
+ * leaf that is not a symlink resolves through its parent directory (Bun's
+ * realpathSync returns ENOENT for an existing name containing a backslash).
  */
 export function isPathSafe(filePath: string, gitRoot: string): boolean {
   try {
-    return isWithinRoot(realpathSync(filePath), realpathSync(gitRoot));
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- this is the containment guard: join normalizes the realpath'd parent plus basename, and isWithinRoot below rejects any result outside gitRoot
+    const real = lstatSync(filePath).isSymbolicLink() ? realpathSync(filePath) : join(realpathSync(dirname(filePath)), basename(filePath));
+    return isWithinRoot(real, realpathSync(gitRoot));
   } catch {
     return false;
   }
@@ -629,7 +675,7 @@ export function isPathSafe(filePath: string, gitRoot: string): boolean {
 export function hasOriginRemote(repoPath: string): boolean {
   try {
     execFileSync('git', buildGitInvocation(repoPath, ['remote', 'get-url', 'origin']), {
-      env: gitChildEnv(),
+      env: gitChildEnv(GIT_READ_ENV),
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['ignore', 'ignore', 'ignore'],
@@ -647,6 +693,11 @@ export function isDetachedHead(repoPath: string): boolean {
   } catch {
     return true;
   }
+}
+
+/** `isDetachedHead` without blocking the event loop (GBRA-133 2b.3). */
+export async function isDetachedHeadAsync(repoPath: string): Promise<boolean> {
+  return gitAsync(repoPath, ['symbolic-ref', '--quiet', 'HEAD']).then(() => false, () => true);
 }
 
 export function unique<T>(items: T[]): T[] {

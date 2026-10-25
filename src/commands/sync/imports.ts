@@ -30,9 +30,11 @@ import { isWindowsColonTarget } from '../../core/persistence/native-file-target.
 import { ERROR_CATALOGUE } from '../../core/error-catalogue.ts';
 import { enginePoolStats } from '../../core/postgres-engine/pool-stats.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
-import { clearLegacyHold, holdRefusedImport, noteScreenedImport, type LegacyHolds } from './holds.ts';
+import { clearLegacyHold, holdClassicFile, holdRefusedImport, noteScreenedImport, type LegacyHolds } from './holds.ts';
+import { classifyClassicFile } from '../../core/classic-file-holds.ts';
 import { partial, markCompleted, noteTypeWarning, maybeYield } from './sync-run.ts';
 import type { SyncPlan, SyncProgress, SyncRun } from './sync-run.ts';
+import { noteCommittedProgress } from '../../core/forward-progress.ts';
 
 type ImportPlan = Pick<SyncPlan, 'opts' | 'filtered' | 'lastCommit' | 'pin' | 'company' | 'gitContextRoot' | 'syncImportRoot' | 'syncActivePack' | 'holds'>;
 
@@ -278,6 +280,16 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
     progress.tick(1, `skip:${path}`);
     return;
   }
+  // GBRA-133: a symlink, a permission error or a committed file missing from
+  // the working tree is held (re-screened every run), never failed: it stays
+  // out of failedFiles and the auto-skip streak, so it never gates the bookmark.
+  const unreadable = holds?.active && !company ? classifyClassicFile(syncRepoPath, path, gitContextRoot) : null;
+  if (unreadable && await holdClassicFile(eng, holds!, path, unreadable)) {
+    await markCompleted(run, path);
+    progressAt.last = Date.now();
+    progress.tick(1, `held:${path}`);
+    return;
+  }
   if (!company && !existsSync(filePath)) {
     // v0.42.x (#1794, Codex #3): the diff is against the PINNED target, but
     // importFile reads the live working tree. A file added in lastCommit..pin
@@ -360,6 +372,7 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
       // much actually landed before --timeout fired.
       run.filesImported++;
       run.itemRun.succeed();
+      noteCommittedProgress();
       await clearLegacyHold(eng, holds, path);
       // v0.42.x (#1794): checkpoint this path so a kill banks it.
       await markCompleted(run, path);

@@ -261,6 +261,20 @@ import { v257 } from './v257-pages-live-origin-key.ts';
 import { v258 } from './v258-pages-links-extract-failure.ts';
 import { v259 } from './v259-ingest-log-marked-index.ts';
 import { v260 } from './v260-segmented-page-size-index.ts';
+import { v261 } from './v261-persistence-request-transient-retries.ts';
+import { v262 } from './v262-commit-notifier.ts';
+import { v263 } from './v263-try-jsonb-function.ts';
+import { v264 } from './v264-set-based-fact-insert-guards.ts';
+import { v265 } from './v265-derived-generations.ts';
+import { v266 } from './v266-derived-generation-activations.ts';
+import { v267 } from './v267-pages-title-search-index.ts';
+import { v268 } from './v268-effect-claim-owner.ts';
+import { v269 } from './v269-links-supersedes-index.ts';
+import { v270 } from './v270-pages-source-created-index.ts';
+import { v271 } from './v271-facts-superseded-by-index.ts';
+import { v272 } from './v272-git-canonical-declared.ts';
+import { v273 } from './v273-segment-derivations.ts';
+import { v274 } from './v274-pages-withheld-source-path.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -520,4 +534,18 @@ export const MIGRATIONS: Migration[] = [
   v258,
   v259,
   v260,
+  v261,
+  v262,
+  v263,
+  v264,
+  v265,
+  v266,
+  v267,
+  v268,
+  v269,
+  v270,
+  v271,
+  v272,
+  v273,
+  v274,
 ];

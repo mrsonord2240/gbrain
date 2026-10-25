@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
 import { load as loadYaml } from 'js-yaml';
-import { MINIMUM_BUN_VERSION } from '../../src/core/runtime-version.ts';
+import { MINIMUM_BUN_VERSION, SECURE_BUN_VERSION } from '../../src/core/runtime-version.ts';
 
 type Matrix = Record<string, unknown> & { exclude?: string };
 type Job = { if?: string; 'runs-on'?: string; strategy?: { matrix: Matrix }; steps?: Array<{ id?: string; run?: string; env?: Record<string, string> }> };
@@ -51,16 +51,16 @@ describe('pull-request CI scope', () => {
 
   test('a pull request touching native paths runs every target on the primary Bun version', () => {
     const primary = nativeCells('primary');
-    expect(primary.native.sort()).toEqual(['darwin-arm64', 'darwin-x64', 'linux-arm64-glibc', 'linux-x64-glibc', 'win32-arm64', 'win32-x64'].map(target => `1.4.3/${target}`));
-    expect(primary.musl).toEqual(['1.4.3/linux-x64-musl', '1.4.3/linux-arm64-musl']);
-    expect(primary.console).toEqual(['windows-2022/1.4.3', 'windows-11-arm/1.4.3']);
-    expect(primary.dotnet).toEqual(['windows-2022/1.4.3', 'windows-11-arm/1.4.3']);
+    expect(primary.native.sort()).toEqual(['darwin-arm64', 'darwin-x64', 'linux-arm64-glibc', 'linux-x64-glibc', 'win32-arm64', 'win32-x64'].map(target => `1.4.4/${target}`));
+    expect(primary.musl).toEqual(['1.4.4/linux-x64-musl', '1.4.4/linux-arm64-musl']);
+    expect(primary.console).toEqual(['windows-2022/1.4.4', 'windows-11-arm/1.4.4']);
+    expect(primary.dotnet).toEqual(['windows-2022/1.4.4', 'windows-11-arm/1.4.4']);
     expect(primary.openclaw).toBe(true);
   });
 
   test('other pull requests keep one Linux smoke cell that runs the whole native step list', () => {
     const smoke = nativeCells('smoke');
-    expect(smoke).toEqual({ native: ['1.4.3/linux-x64-glibc'], musl: [], console: [], dotnet: [], openclaw: false });
+    expect(smoke).toEqual({ native: ['1.4.4/linux-x64-glibc'], musl: [], console: [], dotnet: [], openclaw: false });
   });
 
   test('native path changes, an empty list and docs-only diffs classify as expected', () => {
@@ -150,16 +150,22 @@ esac
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test('security and persistence matrices run both supported Bun versions on pull requests and merge-queue runs (event parity)', () => {
+  // Pull requests run the cheap tier (docs/ci-event-parity.md#full-ci-on-pull-requests):
+  // of the persistence lanes only the crash robot and convergence; the rest run
+  // in the full-ci dispatch, on every push, in the merge queue and nightly.
+  test('security and persistence matrices run both supported Bun versions on every event that runs them; pull requests run only the crash robot and convergence', () => {
     const security = load('test.yml').jobs['security-regressions'];
     const persistence = load('persistence-validation.yml').jobs;
-    const jobs = [security, ...['read-performance', 'deployment-matrix', 'unit-postgres-arms', 'invariants', 'crash-robot', 'reconciliation', 'convergence'].map(name => persistence[name]!)];
-    for (const job of jobs) {
+    const cheap = [security, persistence['crash-robot']!, persistence.convergence!];
+    const fullOnly = ['read-performance', 'deployment-matrix', 'unit-postgres-arms', 'invariants', 'reconciliation'].map(name => persistence[name]!);
+    for (const job of [...cheap, ...fullOnly]) {
       expect(job.strategy!.matrix.exclude).toBeUndefined();
       const push = cells(job, { github: { event_name: 'push' }, inputs: {} });
-      for (const event_name of ['pull_request', 'merge_group', 'schedule', 'workflow_dispatch']) {
+      expect(push.length).toBeGreaterThan(0);
+      for (const event_name of ['merge_group', 'schedule', 'workflow_dispatch']) {
         expect(cells(job, { github: { event_name }, inputs: {} })).toEqual(push);
       }
+      expect(cells(job, { github: { event_name: 'pull_request' }, inputs: {} })).toEqual(cheap.includes(job) ? push : []);
       expect(push.filter(cell => cell.split('/').includes(MINIMUM_BUN_VERSION)).length).toBe(push.length / 2);
     }
     expect(cells(security, { github: { event_name: 'pull_request' }, inputs: {} })).toHaveLength(6);
@@ -266,7 +272,7 @@ esac
     expect(Object.keys(raw.on).sort()).toEqual(['schedule', 'workflow_dispatch']);
     expect(raw.concurrency).toEqual({ group: '${{ github.workflow }}-${{ github.ref }}', 'cancel-in-progress': false });
     const nightly = raw.jobs.convergence!;
-    expect(nightly.strategy!.matrix.bun).toEqual([MINIMUM_BUN_VERSION, '1.4.3']);
+    expect(nightly.strategy!.matrix.bun).toEqual([MINIMUM_BUN_VERSION, '1.4.4']);
     expect(nightly.name).toContain('seed ${{ inputs.seed || github.run_id }}');
     expect(cell(nightly)).toEqual({ NOTES: '2000', LATENCY_MS: '50', KILLS: '20', SEED: '${{ inputs.seed || github.run_id }}' });
     // Outside test-status: no workflow calls it, and test.yml's aggregator never names it.
@@ -284,7 +290,9 @@ esac
   // #4479: a local gate or VM on a different Bun than CI produced
   // runtime-only skew, so every single-version pin moves together.
   test('every single-version Bun pin matches the primary, and matrices keep the oldest supported version', () => {
-    const primary = '1.4.3';
+    const primary = '1.4.4';
+    // #7373: release binaries embed this Bun, so it never drops below the first release with the CVE-2026-111497 fix.
+    expect(Bun.semver.order(primary, SECURE_BUN_VERSION)).toBeGreaterThanOrEqual(0);
     const read = (path: string) => readFileSync(join(root, path), 'utf8');
     const workflows = ['test', 'e2e', 'heavy-tests', 'macos-validation', 'persistence-validation', 'release', 'native-locks']
       .map(name => read(`.github/workflows/${name}.yml`)).join('\n');

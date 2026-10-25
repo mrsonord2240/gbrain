@@ -45,10 +45,13 @@ import {
 import {
   markdownDigest, markdownHead, readViewLines, segmentedMarkdownDocument, segmentedOutline, segmentedReadDocument, tailDigest, type SegmentedDocument,
 } from '../page-window/segmented.ts';
-import { confirmBodyPin, openSegmentedBody, type BodyPin } from '../page-body/read-range.ts';
+import { confirmBodyPin, hiddenBefore, openSegmentedBody, type BodyPin } from '../page-body/read-range.ts';
+import { inlineRegions, inlineTailDigest } from '../page-body/tail-digest.ts';
+import { TIMELINE_SEPARATOR } from '../page-window/document.ts';
 import { renderTrustedText, type TrustFields } from '../eligibility/labels.ts';
 import { pageTrustForRead, type QuarantinedView } from './get-page-projection.ts';
 import { chunkGenerationProbe, chunkManifestReads } from '../search/safe-chunks.ts';
+import { GET_PAGE_SLICE_PARAMS, parseSliceRequest, readGrep, readSection, sliceCharBudget, type SliceRequest } from './get-page-slice.ts';
 
 export const BODY_MODES = ['auto', 'full', 'none', 'outline', 'window'] as const;
 export type BodyMode = typeof BODY_MODES[number];
@@ -64,15 +67,16 @@ const AUTO_WINDOW_BYTES = 16_000;
 export const LARGE_PAGES_CAPABILITY = 'large_pages_v1';
 
 export const GET_PAGE_BODY_PARAMS: Record<string, ParamDef> = {
-  body: { type: 'string', enum: [...BODY_MODES], description: 'auto: whole up to 256 KB, else outline + window. none: revision + size.', fullSurfaceOnly: true },
-  lines: { type: 'object', description: 'Window: 1-based lines.', properties: { from: { type: 'number', required: true }, count: { type: 'number', required: true } }, fullSurfaceOnly: true },
-  bytes: { type: 'object', description: 'Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).', properties: { offset: { type: 'number', required: true }, length: { type: 'number', required: true } }, fullSurfaceOnly: true },
+  body: { type: 'string', enum: [...BODY_MODES], description: 'auto: whole up to 256 KB, else outline + window; a window\'s edit_target is edit_page `within`. none: revision + size + tail_sha256 (append_page expected_tail_sha256).', fullSurfaceOnly: true },
+  lines: { type: 'object', cliRange: ['from', 'count'], description: 'Window: 1-based lines.', properties: { from: { type: 'number', required: true }, count: { type: 'number', required: true } }, fullSurfaceOnly: true },
+  bytes: { type: 'object', cliRange: ['offset', 'length'], description: 'Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).', properties: { offset: { type: 'number', required: true }, length: { type: 'number', required: true } }, fullSurfaceOnly: true },
   around_chunk_id: { type: 'number', description: 'Window around a search hit chunk_id.', fullSurfaceOnly: true },
   context_lines: { type: 'number', description: 'Lines around around_chunk_id (20).', fullSurfaceOnly: true },
   cursor: { type: 'string', description: 'next_cursor: read on.', fullSurfaceOnly: true },
   max_bytes: { type: 'number', description: 'Window bytes (40000).', fullSurfaceOnly: true },
   view: { type: 'string', enum: ['read', 'markdown'], description: 'markdown: page the round-trip content.', fullSurfaceOnly: true },
   outline_from: { type: 'number', description: 'Outline next_from_index.', fullSurfaceOnly: true },
+  ...GET_PAGE_SLICE_PARAMS,
 };
 
 type Selector =
@@ -90,6 +94,8 @@ export interface BodyRequest {
   outlineFrom: number;
   /** The caller named no mode and is gbrain's thin client (full or refused, never a window). */
   legacyThin: boolean;
+  /** section or grep (#7180): one part of the read view instead of a window. */
+  slice?: SliceRequest;
 }
 
 const SELECTOR_EXAMPLE = { slug: 'notes/acme-example-log', body: 'window', lines: { from: 1, count: 200 } };
@@ -103,6 +109,8 @@ export function parseBodyRequest(ctx: Pick<OperationContext, 'remote' | 'transpo
   if (body !== undefined && (typeof body !== 'string' || !(BODY_MODES as readonly string[]).includes(body))) {
     throw invalidParam(ctx, 'get_page', 'body', `get_page: body must be one of ${BODY_MODES.join(', ')}.`, { choices: BODY_MODES, example: 'none' });
   }
+  const slice = parseSliceRequest(ctx, p);
+  if (slice) return { mode: 'window', view: 'read', contextLines: DEFAULT_CONTEXT_LINES, outlineFrom: 0, legacyThin: false, slice };
   const selectors: Selector[] = [];
   if (p.lines !== undefined) {
     const l = p.lines as Record<string, unknown> | null;
@@ -335,6 +343,8 @@ interface WindowDocument {
   from(offset: number, maxBytes: number): Promise<WindowSlice>;
   lines(from: number, count: number, maxBytes: number): Promise<WindowSlice>;
   bytes(offset: number, length: number): Promise<WindowSlice>;
+  /** The whole document in order, one segment (or the inline page) at a time: what section and grep scan. */
+  stream(): AsyncIterable<Buffer>;
   /** around_chunk_id's text: the inline document, or the segmented read view. */
   inline?: PageDocument;
   segments?: SegmentedDocument;
@@ -347,6 +357,7 @@ function inlineDocument(doc: PageDocument): WindowDocument {
     from: async (offset, maxBytes) => windowFrom(doc.bytes, offset, maxBytes),
     lines: async (from, count, maxBytes) => windowForLines(doc.bytes, from, count, maxBytes),
     bytes: async (offset, length) => windowForBytes(doc.bytes, offset, length),
+    stream: async function* () { yield doc.bytes; },
   };
 }
 
@@ -376,7 +387,49 @@ async function segmentedWindows(ctx: OperationContext, input: PartialReadInput, 
     from: (offset, maxBytes) => seg.from(offset, maxBytes),
     lines: (from, count, maxBytes) => seg.lines(from, count, maxBytes),
     bytes: (offset, length) => seg.bytes(offset, length),
+    stream: () => seg.stream(),
   } };
+}
+
+/**
+ * Wave B (spec 6.3): the stored-body range under a read-view window, for edit_page's `within`. A row (or an inline
+ * region) whose read projection is its stored bytes maps byte for byte; any other widens to its stored bounds, so the
+ * range always covers the window. A remote caller gets it only while nothing hidden precedes the window's end: stored
+ * offsets would otherwise measure the hidden text.
+ */
+async function editTarget(ctx: OperationContext, page: Page, doc: WindowDocument, win: WindowSlice, revision: string):
+  Promise<{ revision: string; byte_start: number; byte_end: number } | undefined> {
+  const remote = ctx.remote !== false;
+  if (doc.segments) {
+    const seg = doc.segments;
+    const { rows, truthBytes, bodyBytes } = seg.body;
+    /** Stored offset of read-view byte `p`: a window start (the unit holding p) or end (the unit holding p - 1). */
+    const map = (p: number, side: 'start' | 'end') => {
+      if (p >= seg.total) return bodyBytes;
+      const u = seg.units[seg.unitAt(side === 'end' ? Math.max(0, p - 1) : p)];
+      if (!u) return 0;
+      if (u.row < 0) return truthBytes;
+      const row = rows[u.row]!;
+      if (u.bytes === row.byteLen && !row.hasFacts) return row.byteStart + Math.min(row.byteLen, p - u.start);
+      return side === 'start' ? row.byteStart : row.byteStart + row.byteLen;
+    };
+    if (remote && await hiddenBefore(ctx.engine, seg.body, win.byte_end, 'projected')) return undefined;
+    const start = map(win.byte_start, 'start');
+    return { revision, byte_start: start, byte_end: Math.max(start, map(win.byte_end, 'end')) };
+  }
+  const { truth, timeline } = await inlineRegions(ctx.engine, page.id);
+  const truthBytes = Buffer.byteLength(truth, 'utf8'), bodyBytes = truthBytes + Buffer.byteLength(timeline, 'utf8');
+  const raw = timeline.trim() ? truth + TIMELINE_SEPARATOR + timeline : truth;
+  const bytes = doc.inline!.bytes;
+  if (bytes.equals(Buffer.from(raw, 'utf8'))) {
+    const at = (p: number) => p <= truthBytes ? p : p < truthBytes + Buffer.byteLength(TIMELINE_SEPARATOR) ? truthBytes : p - Buffer.byteLength(TIMELINE_SEPARATOR);
+    return { revision, byte_start: at(win.byte_start), byte_end: at(win.byte_end) };
+  }
+  if (remote) return undefined;
+  const timelineAt = doc.inline!.timelineByte;
+  const inTruth = timelineAt < 0 || win.byte_end <= timelineAt - Buffer.byteLength(TIMELINE_SEPARATOR);
+  const inTimeline = timelineAt >= 0 && win.byte_start >= timelineAt;
+  return { revision, byte_start: inTimeline ? truthBytes : 0, byte_end: inTruth ? truthBytes : bodyBytes };
 }
 
 /** next_cursor plus `next`, the exact call that reads on (the starter surface does not advertise `cursor`; dispatch accepts it). */
@@ -412,7 +465,7 @@ export async function readPartialBody(ctx: OperationContext, input: PartialReadI
   };
   const omitted = quarantined?.body_omitted === true;
   const mode = req.mode === 'auto' ? 'outline' : req.mode;
-  if (omitted) return { ...base, body: mode, truncated: true, body_omitted: true };
+  if (omitted) return { ...base, body: mode, truncated: true, body_omitted: true, chars: 0 };
 
   const markdown = req.view === 'markdown';
   let doc: WindowDocument;
@@ -426,6 +479,7 @@ export async function readPartialBody(ctx: OperationContext, input: PartialReadI
       total_bytes: whole.bytes.length, total_lines: totalLines(whole.bytes),
       ...(whole.timelineByte >= 0 ? { timeline_byte_start: whole.timelineByte } : {}),
       ...(markdown ? { sha256: sha256Hex(whole.bytes) } : {}),
+      ...(mode === 'none' ? await inlineTailDigest(ctx.engine, page.id, ctx.remote !== false) : {}),
     };
     doc = inlineDocument(whole);
   }
@@ -433,8 +487,17 @@ export async function readPartialBody(ctx: OperationContext, input: PartialReadI
   // A segmented read is returned only while the page is still at the revision its caller was authorized for.
   const confirmed = async (result: Record<string, unknown>) => {
     if (doc.segments) await confirmBodyPin(ctx.engine, doc.segments.body);
-    return result;
+    const text = (result.window as { text?: unknown } | undefined)?.text;
+    return 'chars' in result ? result : { ...result, chars: typeof text === 'string' ? text.length : 0 };
   };
+  if (req.slice) {
+    const wrap = (text: string) => envelopeText(text, quarantined, trust);
+    const budget = await sliceCharBudget(ctx);
+    const sliced = req.slice.kind === 'section'
+      ? await readSection(page, doc.stream(), req.slice.heading, budget, wrap)
+      : await readGrep(doc.stream(), req.slice.term, req.slice.context, budget, wrap);
+    return confirmed({ ...out, ...sliced });
+  }
 
   if (mode === 'none') return confirmed(await noneResult(ctx, page, out, doc.total > 0));
 
@@ -491,6 +554,8 @@ export async function readPartialBody(ctx: OperationContext, input: PartialReadI
     const win = await select(maxBytes);
     if (!win) return confirmed({ ...out, truncated: true });
     out.window = { ...win, text: envelopeText(win.text, quarantined, trust) };
+    const target = markdown || typeof win.byte_start !== 'number' ? undefined : await editTarget(ctx, page, doc, win, revision);
+    if (target) out.edit_target = target; else delete out.edit_target;
     out.truncated = win.byte_start > 0 || win.byte_end < doc.total;
     if (win.byte_end < doc.total) setNext(out, page, encodeCursor({ page_id: page.id, revision, view: req.view, offset: win.byte_end, max_bytes: cursorMax }), markdown);
     else { delete out.next_cursor; delete out.next; }

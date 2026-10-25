@@ -36,6 +36,7 @@ import { VOLUNTEER_MAX_PAGES_CAP } from '../core/context/volunteer.ts';
 import { assembleTurnContext, TURN_CONTEXT_DEFAULT_MAX_BYTES, type TurnContextResult } from '../core/context/turn-context.ts';
 import { attachBrief, briefEnabled, BRIEF_MAX_BYTES, recordBriefDelivered, turnBrief, TURN_BRIEF_CUTOFF_MS, withBriefDeadline } from '../core/context/proactive-brief.ts';
 import { proactiveEligibility } from '../core/eligibility/registry.ts';
+import { readHotMemorySessionOnly } from '../core/facts/meta-hook.ts';
 import { makeContextPackIpcHandler } from './context-pack-handler.ts';
 import { logBriefDeliveryFireAndForget, logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
 import { persistenceSocketPathForConfig, startPersistenceIpcServer, type PersistenceIpcProvider, type PersistenceIpcBinding } from '../core/persistence/ipc.ts';
@@ -80,6 +81,7 @@ export async function turnContextWithBrief(engine: BrainEngine, sourceId: string
     window: req.window ?? [],
     priorContextText: req.priorContextText,
     sessionId: req.sessionId,
+    sessionOnly: await readHotMemorySessionOnly(engine),
     maxBytes: briefOn ? Math.max(1024, (req.maxBytes ?? TURN_CONTEXT_DEFAULT_MAX_BYTES) - BRIEF_MAX_BYTES - 2) : req.maxBytes,
     // Per-request config read: `gbrain serve` is long-running, and the
     // lexical-arms switch reverts a false-fire regression on the NEXT turn
@@ -189,7 +191,7 @@ export async function bindResolveIpcForServe(
     // catch would otherwise swallow the error and start NO listener).
     // Kill switch: GBRAIN_SERVE_SYNC_IPC=0 → the kinds are simply not
     // registered and clients get 'unsupported_kind' (the polite refusal).
-    let syncHandlers: Pick<IpcHandlers, 'sync_start' | 'sync_status' | 'sync_abort'> = {};
+    let syncHandlers: Pick<IpcHandlers, 'sync_start' | 'sync_status' | 'sync_abort' | 'sync_nudge'> = {};
     if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
       try {
         const runner = await import('../core/serve-sync-runner.ts');
@@ -202,6 +204,8 @@ export async function bindResolveIpcForServe(
             }),
           sync_status: (req) => runner.getDelegatedSyncStatus(req.jobId, typeof req.afterLine === 'number' ? req.afterLine : 0),
           sync_abort: (req) => runner.abortDelegatedSync(req.jobId),
+          // GBRA-133 PR 2a: a wanted marker recorded through this serve, acknowledged, and a nudge to its notifier.
+          sync_nudge: async (req) => (await import('../core/notifier/nudge.ts')).recordSyncNudge(engine, req),
         };
       } catch (e) {
         process.stderr.write(

@@ -25,6 +25,8 @@ import type { Action } from '../agent-output.ts';
 import { isStatementTimeout } from './bounded-reads.ts';
 import { readSchemaBehind } from './schema-admission.ts';
 import { readReceiptRetentionDays, DEFAULT_RECEIPT_RETENTION_DAYS } from './limits.ts';
+import { MANAGED_SYNC_PASS_OP } from './sync-pass-row.ts';
+import { SYNC_PASS_SUPERSEDED } from './sync-checkpoint-replaced.ts';
 import type { PublicCategory } from './public-category.ts';
 import { classifyTerminal, dispositionOf, driftSinceAction, TERMINAL_FIXED_IN, supersessionOrderSql, supersessionSql, terminalInspectArgv, terminalKnockOnSql, type TerminalCategory,
   type TerminalDisposition, type TerminalVerdict, CONNECTION_MESSAGE_PATTERN, LEGACY_PUBLICATION_PREFIX } from './terminal-classify.ts';
@@ -144,7 +146,7 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
     ), resolved AS (
       SELECT r.id FROM base r WHERE NOT r.has_recovery AND EXISTS (SELECT 1 FROM persistence_requests c WHERE ${supersessionSql('r', 'c')})
     ), tagged AS (
-      SELECT b.*, (x.id IS NOT NULL) AS resolved, (b.has_recovery OR b.ended_at > now()-($3::int*interval '1 day')) AS in_window, ${HISTORICAL_BY_BUILD('b')} AS historical_build
+      SELECT b.*, (x.id IS NOT NULL OR (NOT b.has_recovery AND b.error_code='${SYNC_PASS_SUPERSEDED}')) AS resolved, (b.has_recovery OR b.ended_at > now()-($3::int*interval '1 day')) AS in_window, ${HISTORICAL_BY_BUILD('b')} AS historical_build
       FROM base b LEFT JOIN resolved x ON x.id=b.id
     )
     SELECT GROUPING(state) AS set, source_id, state, error_code, origin, reason, cause, operation, intent_kind, has_recovery, blocked_reason, compacted, knock_on, routed_message, build, resolved,
@@ -225,6 +227,11 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
 /**
  * PR A's checkpoint blockers for every non-archived source whose managed-sync cursor waits at its checkpoint step
  * (the others have none), keyed by source, for `readTerminalFailureSummary`.
+ * #6712 PR 4b (design v3.2 §3.7): also every source whose open pass (pass row `telemetry.outcome = 'open'`) has its
+ * `managed_sync_checkpoint` admitted and not yet committed (`intent.passId` equal to the row's `pass_id`). Its blockers
+ * are what the pass checkpoint's validation refuses on (design v3 §3.3 clauses 1-2): a recovery row on the worktree, and
+ * a queued, running or recovering sync page or checkpoint request of the worktree other than the checkpoint itself.
+ * Both reads go through the partial indexes `persistence_requests_recovery` and `persistence_requests_pending`.
  */
 export async function readCheckpointBlockerMap(engine: BrainEngine, sourceIds?: string[]): Promise<NonNullable<Parameters<typeof readTerminalFailureSummary>[1]>['checkpointBlockers'] & {}> {
   const { readCheckpointBlockers } = await import('./sync-status.ts');
@@ -234,6 +241,23 @@ export async function readCheckpointBlockerMap(engine: BrainEngine, sourceIds?: 
       AND ($1::text[] IS NULL OR o.completed_keys->0->>'sourceId'=ANY($1::text[]))`, [sourceIds ?? null]);
   const blockers = new Map<string, Awaited<ReturnType<typeof readCheckpointBlockers>>>();
   for (const row of atCheckpoint) blockers.set(row.source_id, await readCheckpointBlockers(engine, row.source_id));
+  const passes = await engine.executeRaw<{ source_id: string; worktree_id: string; checkpoint: string }>(`SELECT s.id AS source_id, b.worktree_id::text AS worktree_id, r.request_id::text AS checkpoint
+    FROM sources s JOIN persistence_source_bindings b ON b.source_id=s.id AND b.source_incarnation=s.incarnation
+    JOIN op_checkpoints p ON p.op=$1 AND p.fingerprint=s.id||':'||s.incarnation::text AND p.completed_keys->0->'telemetry'->>'outcome'='open'
+    JOIN persistence_requests r ON r.worktree_id=b.worktree_id AND r.state IN ('queued','running','recovering')
+      AND r.intent->>'kind'='managed_sync_checkpoint' AND r.intent->>'passId'=p.completed_keys->0->'telemetry'->>'pass_id'
+    WHERE s.archived IS NOT TRUE AND ($2::text[] IS NULL OR s.id=ANY($2::text[]))`, [MANAGED_SYNC_PASS_OP, sourceIds ?? null]);
+  for (const pass of passes) {
+    if (blockers.has(pass.source_id)) continue;
+    const rows = await engine.executeRaw<{ request_id: string; slug: string; state: string; code: string | null; recovery: boolean }>(`SELECT DISTINCT ON (request_id) request_id, slug, state, code, recovery FROM (
+        (SELECT r.request_id::text AS request_id, r.slug, r.state, r.error_code AS code, true AS recovery, r.sequence FROM persistence_requests r
+          WHERE r.worktree_id=$1::uuid AND r.recovery IS NOT NULL ORDER BY r.sequence LIMIT 20)
+        UNION ALL (SELECT r.request_id::text, r.slug, r.state, r.error_code, false, r.sequence FROM persistence_requests r
+          WHERE r.worktree_id=$1::uuid AND r.state IN ('queued','running','recovering') AND r.request_id::text<>$2
+            AND r.intent->>'kind' IN ('managed_sync_import','managed_sync_delete','managed_sync_checkpoint') ORDER BY r.sequence LIMIT 20)) blockers
+      ORDER BY request_id, recovery DESC`, [pass.worktree_id, pass.checkpoint]);
+    blockers.set(pass.source_id, rows.slice(0, 20).map(row => ({ request_id: row.request_id, slug: row.slug, state: row.state, code: row.code, index: null, recovery: row.recovery === true, knock_on: false })));
+  }
   return blockers;
 }
 
@@ -319,7 +343,8 @@ export async function readTerminalFailures(engine: BrainEngine, q: TerminalFailu
       scanned++;
       cursor = row.sequence;
       const v = verdictOf(row, schemaBehind);
-      const disposition = dispositionOf(row.later_state ? { state: row.later_state, same_intent: row.same_intent === true } : null);
+      // GBRA-133 PR 3a: a pass checkpoint whose pass ended is superseded by construction (the next pass stamps its own).
+      const disposition = row.error_code === SYNC_PASS_SUPERSEDED ? 'superseded' : dispositionOf(row.later_state ? { state: row.later_state, same_intent: row.same_intent === true } : null);
       const historical = !row.has_recovery && (disposition !== 'unknown' || v.historical);
       const matches = (!q.category || v.category === q.category) && (!q.code || v.code === q.code)
         && (q.origin === undefined || (v.origin ?? NO_ORIGIN) === q.origin) && (state === 'all' || !historical);

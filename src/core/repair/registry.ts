@@ -36,6 +36,7 @@ import { currentCliWriteWait } from '../persistence/write-wait.ts';
 import { REPAIR_KINDS, runRepair, type RepairHandler, type RepairKind, type RepairResult, type RepairScope } from './core.ts';
 import { timelineRepair } from './timeline.ts';
 import { timelineCommentsRepair } from './timeline-comments.ts';
+import { timelineOrderRepair } from './timeline-order.ts';
 import { visibilityRepair } from './visibility.ts';
 import { safeChunksRepair } from './safe-chunks.ts';
 import { contextualModeRepair } from './contextual-mode.ts';
@@ -54,9 +55,12 @@ import { atomsRestoreRepair } from './atoms-restore.ts';
 import { extractorFactsRepair } from './extractor-facts.ts';
 import { conversationLabelsRepair } from './conversation-labels.ts';
 import { capturedFactsRepair } from './captured-facts.ts';
+import { redactedFactsRepair } from './redacted-facts.ts';
 import { loopFactsRepair } from './loop-facts.ts';
 import { ontologyFactsRepair } from './ontology-facts.ts';
 import { factsRehomeRepair } from './facts-rehome.ts';
+import { consolidateTiesRepair } from './consolidate-ties.ts';
+import { duplicateFactsRepair } from './duplicate-facts.ts';
 import { orphanChildrenRepair } from './orphan-children.ts';
 import { failedWritesRepair } from './failed-writes.ts';
 import { frontmatterRepair } from './frontmatter.ts';
@@ -69,6 +73,7 @@ import { frontmatterKeysRepair } from './frontmatter-keys.ts';
 import { fileDriftRepair } from './file-drift.ts';
 import { stuckRecoveryRepair } from './stuck-recovery.ts';
 import { ghostPagesRepair, GHOST_CONSENT_TEXT, GHOST_CONSEQUENCES, GHOST_PURGE_FUSE_HOURS } from './ghost-pages.ts';
+import { legacyTwinsRepair, LEGACY_TWINS_CONSENT_TEXT, LEGACY_TWINS_PURGE_FUSE_HOURS } from './legacy-twins.ts';
 import { originTwinsRepair, ORIGIN_TWINS_CONSENT_TEXT, ORIGIN_TWINS_PURGE_FUSE_HOURS } from './origin-twins.ts';
 import { receiptCompactionRepair } from './receipt-compaction.ts';
 import { aliasesRepair } from './aliases.ts';
@@ -76,8 +81,14 @@ import { renameIdentityRepair, RENAME_IDENTITY_CONSENT_TEXT } from './rename-ide
 import { overwrittenEditsRepair } from './overwritten-edits.ts';
 import { missingTablesRepair } from './missing-tables.ts';
 import { urlCloneFencesRepair } from './url-clone-fences.ts';
+import { segmentedMirrorRepair } from './segmented-mirror.ts';
+import { uncommittedDeletionsRepair, UNCOMMITTED_DELETIONS_CONSENT_TEXT } from './uncommitted-deletions.ts';
+import { factClaimDatesRepair } from './fact-claim-dates.ts';
+import { generationsRepair, generationsSelectionArgv, type GenerationsSelection } from '../generations/repair.ts';
+import { restoreDaysHint } from '../generations/config.ts';
 import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
 import type { OperationError } from '../ops/contract.ts';
+import type { ProgressReporter } from '../progress.ts';
 
 export interface RepairKindSpec {
   kind: RepairKind;
@@ -112,8 +123,11 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
     summary: 'Write database-only timeline rows back into their pages as marked bullets (#5567). Rows that cannot round-trip are kept and counted. Each repaired page is re-embedded by its publication.',
   },
   visibility: {
-    handler: visibilityRepair, embeds: 'effect', checks: ['derived_visibility'],
-    summary: 'Stamp explicit visibility on extracted atoms and synthesized concepts, tighten-only (#5525). Transcript and missing origins become private; nothing is ever loosened. Each repaired page is re-embedded by its publication.',
+    handler: visibilityRepair, embeds: 'effect', checks: ['derived_visibility'], preview_bound: true,
+    summary: 'Stamp explicit visibility on extracted atoms and synthesized concepts, tighten-only (#5525). Transcript and missing origins become private; nothing is ever loosened. '
+      + 'Also makes private the chronicle events of a private origin, the pages that carry a privacy alias (access: private, ...) but no visibility, and the world facts held in or extracted from a private page. '
+      + 'The preview plans by class (--class facts|events|aliases|lineage; facts first, only lineage reads links), lists one window (--limit, default 1000) '
+      + 'and prints --apply --expect <hash>, which applies exactly that window (resumable); preview again for the next window. Each repaired page is re-embedded by its publication.',
   },
   'safe-chunks': {
     handler: safeChunksRepair, embeds: 'inline', checks: ['safe_index_pending'],
@@ -225,6 +239,14 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '--expect <hash> expires exactly the previewed set; a fact that changed since reports changed_since_preview. Rows are expired, never withdrawn, '
       + 'so remember can save the same claim again; fenced rows are struck in their page, which is re-embedded by its publication.',
   },
+  'redacted-facts': {
+    handler: redactedFactsRepair, embeds: 'effect', checks: ['facts_redaction_marker'], explicit_only: true,
+    summary: 'Restore the words the prompt sanitizer deleted from stored facts before the fix (#7125: "Business System (ABS)" stored as '
+      + '"Business [redacted](ABS)"). A fact is restored only when a page it came from (the page its context names, or the page that '
+      + 'holds it, now or in a retained version) proves the original words around every marker; the rest are listed and left unchanged. '
+      + 'Preview-bound: --apply --expect <hash> restores exactly the previewed set; a fact that changed since reports changed_since_preview. '
+      + 'A fenced row is rewritten in its page, which is re-embedded by its publication; page history keeps the damaged revisions.',
+  },
   'loop-facts': {
     handler: loopFactsRepair, embeds: 'effect', checks: ['loop_facts_drift'], explicit_only: true,
     summary: 'Retire the commitment facts of loops closed before this release (#5869): expires each fact and strikes its fence row in one coordinated write, '
@@ -245,6 +267,30 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'page-less slug with its class; ambiguous, unverified, unresolved and fence-owned slugs are listed and never moved. Preview-bound: --apply '
       + '--expect <hash> moves exactly the previewed database-only facts; a slug that gained a page, lost its target or whose facts changed reports '
       + 'changed_since_preview. Database-only; no page is rewritten.',
+  },
+  'consolidate-ties': {
+    handler: consolidateTiesRepair, embeds: 'none', checks: [], explicit_only: true, preview_bound: true,
+    summary: 'Reopen typed facts that dream consolidation closed at their own effective time (#6023): before this release a cluster whose typed claims '
+      + 'stated one metric, unit and period for the same instant was promoted anyway, and the fact that lost the confidence tie got a zero-length '
+      + 'validity. The preview lists each such fact with its tied partners and take. Preview-bound: --apply --expect <hash> sets exactly the previewed '
+      + 'facts back to open validity and keeps their consolidation mark; a fact that was expired, edited or reopened reports changed_since_preview. '
+      + 'Database-only; no page is rewritten.',
+  },
+  'duplicate-facts': {
+    handler: duplicateFactsRepair, embeds: 'effect', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: 'Retire the previewed copies of duplicate facts, keeping the oldest row of each claim',
+      why: 'The preview listed each group of active facts that state one claim (same fingerprint, source and visibility) with the row it keeps; applying it supersedes exactly the listed copies.',
+      risk: 'Copies are expired with superseded_by pointing at the kept row, never deleted or withdrawn, so the claim stays in recall and can be saved again. '
+        + 'Fenced copies are struck in their page as "superseded by #N" through a revision-bound page write. A row that changed since the preview is kept.',
+      user_message: 'Retire the previewed duplicate fact copies? Each claim keeps its oldest row; the copies are marked superseded by it, not deleted.',
+    },
+    summary: 'Retire exact copies of one active fact (#7043): in each group of active facts of one source and visibility that share their fingerprint, the '
+      + 'oldest row is kept and every other row is superseded by it (expired_at set, superseded_by the kept row; never a withdrawal, so the claim stays '
+      + 'rememberable). Groups whose copies sit on other entities are listed as cross_entity and retired only with --include-cross-entity; the kept row keeps '
+      + 'its entity. Near duplicates are never touched. Fenced copies are struck in their page through a revision-bound put_page when the kept row is in the '
+      + 'same fence, listed as fence_kept_elsewhere otherwise, and kept as segmented_page on a segmented page. Preview-bound: --apply --expect <hash> --yes retires exactly the previewed set; a row that '
+      + 'changed since reports changed_since_preview. Runs only when named.',
   },
   'orphan-children': {
     handler: orphanChildrenRepair, embeds: 'none', checks: ['child_table_orphans'], explicit_only: true,
@@ -281,6 +327,21 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
     summary: 'Clean timeline rows filed from adjacent HTML comments (#6184): drop the materialized bullets that copied a section END marker into the page, '
       + 'delete rows that are only comment markup, and strip the markup from the rest. Each page whose bullets change is re-embedded by its publication.',
   },
+  'timeline-order': {
+    handler: timelineOrderRepair, embeds: 'effect', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: 'Rewrite the previewed pages so each timeline is in date order, without exact duplicate bullets, in one section',
+      why: 'The preview listed each page whose timeline bullets are out of date order, repeat a bullet exactly, or sit in more than one timeline section, with the page revision it read.',
+      risk: 'Only timeline bullets move; a later exact copy of a bullet is dropped and a later timeline section\'s bullets join the first. No other text changes and no timeline row is added or removed. A page that changed since the preview refuses the apply (preview_changed). Managed sources commit the file through the Git effect; undo with git revert or gbrain revert.',
+      user_message: 'Put the previewed timelines in date order? Exact duplicate bullets are dropped and split timeline sections are joined',
+    },
+    summary: 'Put existing timelines back in date order (#7247): bulk imports and hand edits appended - **YYYY-MM-DD** | bullets at the end, '
+      + 'copied one twice, or started a second ## Timeline section. Bullets move with their indented lines in the direction the page already uses '
+      + '(ascending unless mostly descending), stable for equal dates; prose, sub-headings and comments stay where they are. Exact duplicates in one '
+      + 'run keep the first copy; near duplicates are only counted. Later timeline sections join the first one only when nothing but bullets moves. A '
+      + 'page with a line the parser cannot place, or that would not read back with the same text and timeline rows, is listed needs_human. --slug '
+      + '<slug> narrows. Preview-bound: --apply --expect <hash> --yes rewrites exactly the previewed pages through revision-bound put_page; runs only when named.',
+  },
   fences: {
     handler: fencesRepair, embeds: 'effect', checks: ['fence_integrity'], preview_bound: true, spends: 'llm',
     summary: 'Repair malformed facts and takes fences (#6188) that sync held or that pages store: per file or page the free tiers first (the lossless '
@@ -304,7 +365,7 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
     handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'], approval: 'unbound',
     summary: 'ANALYZE the hot tables (pages, links, facts, takes, content_chunks, timeline_entries) whose planner statistics are stale (F4b), '
       + 'so search and graph reads stop planning as slow nested loops. PGLite also resets each table\'s pending row count; Postgres runs each '
-      + 'ANALYZE with a 60 s statement and 2 s lock timeout. No journal admission and no user data changes. Brain-wide.',
+      + 'ANALYZE with a 60 s statement timeout and defers a table another session holds (a running vacuum) instead of waiting on it. No journal admission and no user data changes. Brain-wide.',
   },
   'managed-sync-orphans': {
     handler: managedSyncOrphansRepair, embeds: 'none', checks: ['sync_failures'], explicit_only: true, preview_bound: true,
@@ -337,7 +398,10 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'writes each resolved result to a private artifact; --apply --expect <hash> applies exactly that set with request ids derived from the hash, '
       + 'resumable, per page repaired, refused or changed_since_preview. Backups are reconcile\'s own. A selected page whose canonical file is gone from the '
       + 'last commit: --prefer database recreates the file from the page, --prefer file soft-deletes exactly that page (mass-delete valve applies); a file '
-      + 'deleted only in the worktree is listed deletion_uncommitted and routed to committing the deletion or repair ghost-pages. Trusted local CLI only; runs only when named.',
+      + 'deleted only in the worktree is listed deletion_uncommitted and routed to committing the deletion or repair ghost-pages. --held [--side both|unknown|deleted '
+      + '[--state tombstone_edited|purged_differs|file_gone]] selects the source\'s held file_drift pages of one Decision (several sides or states are refused; '
+      + '--side deleted needs --state): a deleted page whose file changed is restored and imported (--prefer file) or keeps its deletion while the file is '
+      + 'removed by a coordinated commit (--prefer database); a purged page\'s file is imported as a new page or removed. Trusted local CLI only; runs only when named.',
   },
   'stuck-recovery': {
     handler: stuckRecoveryRepair, embeds: 'none', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
@@ -398,6 +462,17 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'of a page that still exists is never touched. Each target slug is rechecked under its page lock; coordinated maintenance write on a managed '
       + 'brain, no journal admission. Runs only when named.',
   },
+  'legacy-twins': {
+    handler: legacyTwinsRepair, embeds: 'none', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: LEGACY_TWINS_CONSENT_TEXT,
+    summary: 'Merge page pairs older syncs forked before #6857 (#6885): a legacy page with no recorded origin whose slug the current slug fold spells '
+      + 'differently, and its twin at the folded slug recording the file. Needs --source; refused off the canonical owner host (not_owner_host). The preview '
+      + 'lists each pair (both ids, slugs and revisions, the path, whether the content matches) and, as decisions never merged automatically, pairs whose '
+      + 'content differs, several legacy candidates for one twin, and twins whose file is missing or drifted. --apply --expect <hash> --yes merges exactly '
+      + 'the approved pairs, one coordinated write each: the legacy page records the file and keeps its id, links and history; the twin\'s links, timeline '
+      + 'rows and aliases move to it, its slug becomes an alias, its sync import record follows, and the twin is soft-deleted with its file untouched '
+      + `(purged after ${LEGACY_TWINS_PURGE_FUSE_HOURS} h). Refused when the pairs are over half of the source\'s file-backed pages unless GBRAIN_ALLOW_MASS_RECONCILE=1. Runs only when named.`,
+  },
   'rename-identity': {
     handler: renameIdentityRepair, embeds: 'none', checks: ['rename_identity_downgrades'], explicit_only: true, preview_bound: true, consent: 'destructive',
     consentText: RENAME_IDENTITY_CONSENT_TEXT,
@@ -437,6 +512,66 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'per previewed file: back it up, keep its appended rows database-only in one transaction, import HEAD\'s bytes as the page, then restore the file '
       + 'from HEAD. Unmanaged brains only (a managed brain uses gbrain sources mirror-readonly). Runs only when named.',
   },
+  'segmented-mirror': {
+    handler: segmentedMirrorRepair, embeds: 'none', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: 'Rewrite the previewed canonical files of pages stored in segments without their withdrawn or purged rows',
+      why: 'The preview listed each file an older binary left holding a row a withdrawal or purge removed from the database; the apply rewrites each one to the page\'s canonical render through the withdrawal mirror.',
+      risk: 'Each listed file is replaced by the bytes gbrain export writes for its page (other formatting differences in it are normalized the same way). A file that changed since the preview refuses the apply (preview_changed), and one that differs from the database for any other reason is never rewritten. The Git effect commits the change; the old bytes stay in earlier commits.',
+      user_message: 'Rewrite the previewed page files without their withdrawn rows? Each becomes the page\'s canonical render',
+    },
+    summary: 'Re-mirror the canonical files of pages stored in segments whose withdrawal mirror an older binary (before v0.60.299.0) passed by '
+      + '(skipped page_body_segmented), so the file still holds a row forget, forget_fact or purge_fact removed from the database. The preview, '
+      + 'on the source\'s owner host and in bounded memory, lists each file-backed segmented page whose file is an older render: it passes the '
+      + 'mirror\'s own file/database check and still holds a withdrawn or purged row; it prints the path, the file\'s SHA-256 and size and those '
+      + 'of the canonical render (gbrain export\'s bytes). A file that differs from the database for another reason is listed held '
+      + '(file_database_drift) and never rewritten. Preview-bound and destructive: --apply --expect <hash> --yes re-checks each page and commits, per '
+      + 'page, one receipted request whose withdrawal-mirror and Git effects rewrite and commit the file. Runs only when named; never on upgrade.',
+  },
+  'uncommitted-deletions': {
+    handler: uncommittedDeletionsRepair, embeds: 'none', checks: ['uncommitted_sync_deletions'], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: UNCOMMITTED_DELETIONS_CONSENT_TEXT,
+    summary: 'Restore soft-deleted pages whose recorded file Git never held (.gitignore excludes it, or no commit holds it and it is not on the disk), which a managed '
+      + 'sync deleted before #7130 because it read the absent file as a deletion. Needs --source; refused off the canonical owner host (not_owner_host). The preview '
+      + 'lists each page (slug, recorded path, deletion time, evidence, whether a sync deleted it) and prints the apply command with its hash; pages another writer '
+      + 'deleted are listed apart and join the set only with --include-ambiguous. --apply --expect <hash> --yes restores exactly that set, one coordinated '
+      + 'restore_page with detach per page, published database-only: each comes back live, forgets its recorded file and no file is written, so the next sync '
+      + 'never deletes it again. Pages already purged cannot be restored by this command; only a backup (pg_dump, or gbrain backup create) can bring them back. '
+      + 'Runs only when named; never on upgrade.',
+  },
+  'fact-claim-dates': {
+    handler: factClaimDatesRepair, embeds: 'effect', checks: ['fact_bulk_dates'], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: 'Set the valid_from of the previewed facts to the date each one\'s claim states',
+      why: 'The preview listed each facts fence row and database-only fact dated with the day a bulk load ran whose claim states exactly one earlier date; that date replaces the load day.',
+      risk: 'Only the listed valid_from cells change; every other row and page stays as it is. Page edits publish through revision-bound put_page (a managed brain commits the file, so git revert undoes it; page history keeps the earlier revision). A page that changed since the preview is skipped.',
+      user_message: 'Move the previewed facts to the date their claim states? Only their valid_from changes',
+    },
+    summary: 'Give facts that a bulk load dated with the day it ran the date their claim states (#7247). Needs --source; --day YYYY-MM-DD names the '
+      + 'loaded day instead of the days doctor fact_bulk_dates detects (200+ active facts, 25%+ of the source, 20+ entities on one UTC day). Candidates '
+      + 'are active facts of that day whose claim holds exactly one ISO date, a real date from 1900 to the day before; facts with none, several or one out '
+      + 'of range are counted and kept. A fence row\'s valid_from cell is rewritten and the page published through revision-bound put_page, so the facts '
+      + 'row follows the file; a database-only fact is updated directly on an unmanaged brain and counted database_only_managed on a managed one. '
+      + 'Preview-bound and destructive: --apply --expect <hash> --yes recomputes the plan (preview_changed when it differs) and moves exactly the '
+      + 'previewed rows. Runs only when named; never on upgrade.',
+  },
+  'generations': {
+    handler: generationsRepair, embeds: 'effect', checks: ['generation_retirements', 'generation_held', 'generation_pending'], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: 'Apply the previewed generations repair: restore each listed key to the generation it replaced, or publish each listed held result once',
+      why: 'The preview listed each key with what it revives, retires or publishes; the apply changes exactly that set and refuses a key that changed since.',
+      risk: 'A restore versions and retires the items the restored-from generation added (retired_by generation-restore, restorable for generations.restore_days) and revives the items it retired from their ledger preimages; a release publishes the held result, retiring what it no longer has the same way.',
+      user_message: 'Apply the previewed generations repair? Each listed key changes exactly as the preview showed',
+    },
+    summary: 'Undo or release a derived generation (GBRA-161): --kind <kind> names the ledger kind, --mode restore (default) republishes the item set the '
+      + 'selected live generation replaced from its ledger preimages and retires what it added, --mode release-held publishes a held result once '
+      + '(shrunk, valve, attempts_exhausted; oversize after raising generations.max_items; no_proof, fence_absent, tie and segmented_unsupported are refused; '
+      + 'a managed source releases atom page keys through its writer and restores retired atoms with atoms-restore), --mode cleanup lists, read-only, the members '
+      + 'an activated managed generation still waits on and the orphan candidates an activation that never happened left, each with its activation id. '
+      + 'One selector bounds the set: --run <id>, --since <ISO-8601|7d>, --key <owner>, --generation <id>, or --held (release-held). The preview lists each key '
+      + 'and saves the set under its hash; --apply --expect <hash> --yes applies exactly that set, refusing a key edited since or with no stored preimage. '
+      + 'Runs only when named; never on upgrade.',
+  },
 };
 
 export const REPAIR_REGISTRY: readonly RepairKindSpec[] = REPAIR_KINDS.map(kind => ({ kind, ...SPECS[kind] }));
@@ -470,7 +605,7 @@ export function repairSpec(kind: RepairKind, registry: readonly RepairKindSpec[]
 
 /** `gbrain repair <kind> [--source <id>]`, the read-only preview of one kind. */
 export function repairPreviewCommand(kind: RepairKind, opts: { source?: string } = {}): string {
-  return `gbrain repair ${kind}${opts.source ? ` --source ${opts.source}` : ''}`;
+  return `gbrain repair ${kind}${opts.source ? ` --source ${opts.source}` : ''}${kind === 'generations' ? ` --kind atom --since ${restoreDaysHint()}d` : ''}`;
 }
 
 /** How `--all`, the remediation plan and the banner report an explicit-only kind instead of running it. */
@@ -518,18 +653,19 @@ export async function repairRunner(engine: BrainEngine, opts: { apply: boolean; 
      * `explicit`: the operator named `kind`; required for explicit-only kinds.
      * `maxLlmUsd`: what this run may spend on a paid chat model (`spends: 'llm'` kinds; undefined = no run cap).
      */
-    async run(kind: RepairKind, scope: RepairScope, run: { limit?: number; sourceFlag?: string; explicit?: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[];
-      slugs?: string[]; noLlm?: boolean; maxLlmUsd?: number; deadline?: number;
-      prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string; since?: string;
-      keep?: 'prior' | 'disk' | 'withdrawn'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean; from?: string; close?: boolean } = {}): Promise<RepairResult> {
+    async run(kind: RepairKind, scope: RepairScope, run: { limit?: number; sourceFlag?: string; explicit?: boolean; expect?: string; includeAmbiguous?: boolean; includeCrossEntity?: boolean; only?: string[]; skip?: string[];
+      slugs?: string[]; noLlm?: boolean; maxLlmUsd?: number; deadline?: number; stop?: AbortSignal; recordDatabaseStops?: boolean;
+      prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string; since?: string; held?: boolean; side?: string; state?: string; provenance?: string; cursor?: string; progress?: ProgressReporter;
+      keep?: 'prior' | 'disk' | 'withdrawn'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean; from?: string; close?: boolean; afterPage?: number; generations?: GenerationsSelection; day?: string } = {}): Promise<RepairResult> {
       const ctx = { engine, config, logger, dryRun: !opts.apply, remote: false, sourceId: scope.source_ids[0], writeWaitMs } as OperationContext;
       const spec = repairSpec(kind, opts.registry);
       return runRepair(ctx, spec.handler, scope, { apply: opts.apply, limit: run.limit, embeddingModel, sourceFlag: run.sourceFlag, spec,
         embed: !opts.noEmbed && embeddingModel !== undefined, applyArgs: [...(opts.noEmbed && spec.embeds === 'inline' ? ['--no-embed'] : []),
-          ...(run.olderThan ? ['--older-than', run.olderThan] : []), ...(run.includeFailures ? ['--include-failures'] : []), ...(run.force ? ['--force'] : [])],
-        explicit: run.explicit, expect: run.expect, includeAmbiguous: run.includeAmbiguous, only: run.only, skip: run.skip, slugs: run.slugs, noLlm: run.noLlm,
-        maxLlmUsd: run.maxLlmUsd, deadline: run.deadline, prefer: run.prefer, requests: run.requests, allDrifted: run.allDrifted, driftClass: run.driftClass, since: run.since,
-        keep: run.keep, requestId: run.requestId, olderThan: run.olderThan, includeFailures: run.includeFailures, force: run.force, from: run.from, close: run.close });
+          ...(run.olderThan ? ['--older-than', run.olderThan] : []), ...(run.includeFailures ? ['--include-failures'] : []), ...(run.force ? ['--force'] : []),
+          ...(run.afterPage !== undefined ? ['--after', String(run.afterPage)] : []), ...(run.generations ? generationsSelectionArgv(run.generations) : []), ...(run.day ? ['--day', run.day] : [])],
+        explicit: run.explicit, expect: run.expect, includeAmbiguous: run.includeAmbiguous, includeCrossEntity: run.includeCrossEntity, only: run.only, skip: run.skip, slugs: run.slugs, noLlm: run.noLlm,
+        maxLlmUsd: run.maxLlmUsd, deadline: run.deadline, ...(run.stop ? { stop: run.stop } : {}), ...(run.recordDatabaseStops ? { recordDatabaseStops: true } : {}), prefer: run.prefer, requests: run.requests, allDrifted: run.allDrifted, driftClass: run.driftClass, since: run.since,
+        held: run.held, side: run.side, state: run.state, provenance: run.provenance, cursor: run.cursor, progress: run.progress, keep: run.keep, requestId: run.requestId, olderThan: run.olderThan, includeFailures: run.includeFailures, force: run.force, from: run.from, close: run.close, afterPage: run.afterPage, generations: run.generations, day: run.day });
     },
   };
 }

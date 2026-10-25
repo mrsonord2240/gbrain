@@ -1,6 +1,6 @@
 {
   "golden": {
-    "count": 255,
+    "count": 269,
     "gaps": [
       17,
       18,
@@ -15,6 +15,7 @@
       "CONTENT_CHUNKS_GENERATION_INDEX": "c434b3a4acdad499cf3b9f170d9f9967b8e3e8218c829db99f3ecba3b53c8b5d",
       "CONTENT_CHUNKS_OCCURRENCE_GENERATION_INDEX": "b4f73db97ad878ef7256128ddef83fd11e2e08fd215e389d9e921a0daf04853d",
       "CONTENT_CHUNKS_OCCURRENCE_INDEX": "7b692ba777b30399ab5a3b100eb40b3b9d1b3fb2322dc4dc808ba8a4d667912c",
+      "FACTS_SUPERSEDED_BY_INDEX": "555c2b267989359a078de0f82cea830584bc0a268be6796bf526c0a9bed45905",
       "FACT_PURGES_ALL_SUBJECTS_INDEX": "99e2eb6c24134b539cb4cfd6e5ff66a724463525d09e9ba1fdde3c13f5787b6c",
       "FACT_PURGES_SUBJECT_INDEX": "f4fba07082f2e26da3fa51b0b689f3fe78a3d09afd20c1924dbc2fbe6b1560f1",
       "FACT_RELINK_TABLE_SQL": "1fdde4b99d0077365274096f294be64a992961c7b4544af794224de238b03630",
@@ -24,10 +25,13 @@
       "INGEST_LOG_MARKED_INDEX": "1099f19af7873878974239a9a6f1a627827221eebd75aea01896246e0809e91c",
       "INGEST_LOG_UNMARKED_INDEX": "c94e6b009f830527d2f1d6af1683bee94189474e8e67aa4c60165ab4abbd8726",
       "ISSUANCE_CLOCK_SLACK_SECONDS": "8f36c80392df6f9b9c754826289b63969d9d41ca8955213291e4413d614dce35",
+      "LINKS_SUPERSEDES_INDEX": "a1353995111ef65c1347f295081cf8336dd5da955db7e0e330558d34fd21a4c6",
       "OPEN_LOOPS_COUNTERPARTY_SOURCE_INDEX": "e9b472d9db37733e908ea40512ad3f9520d7a6729ce207b0d279d43d3beb5b2f",
       "PAGES_NAME_LOOKUP_INDEXES": "1ca830342164b5606e96cf0090645364f9145d36178d90f166230189fe8d2705",
       "PAGES_RECONCILE_NAME_INDEXES": "8805e35341b22324b932b1cc05030cc8f2bfc95532bf810ec35330783f29c59a",
       "PAGES_SEGMENTED_BODY_BYTES_INDEX": "c904a4f68cf190cce6bc68c03219c7b62d05b77eeb557db946a4f58a4f965e57",
+      "PAGES_SOURCE_CREATED_INDEX": "33411b4d6fc2287ee8fa37b1ebf2cc36a076101dbd3f3f6ac492aed06288513a",
+      "PAGES_TITLE_SEARCH_INDEX": "27e8e1a6c9a2069ee6c6af6fa99b9a7e9e9c118c7a933ffa80ba1864bf68baa3",
       "PAGE_TIMELINE_FTS_MAX_CHARS": "f7d29264f4144976bbe2e1ded0251095b638175f8e1d711c36f1e80d2263e172",
       "PERSISTENCE_COMMITTED_WATERMARK_INDEX": "f472fa0acb542c1caebaaa3bc69fb2da1647e5e201239429fc02ccef0d669533",
       "PERSISTENCE_COMPACTABLE_INDEX": "25ee657878efb41ba9ea3a7624464ddcf66407d861659456c230366e57f230a0",
@@ -40,7 +44,9 @@
       "PLANNER_REPAIR_TABLES": "008725595e099adba279d4292661eb4a59930b777c35db43c340220f7f12e093",
       "TOKEN_TTL_MAX_SECONDS": "f4a45bec6ec0bacc859dc57732ceb76cec7eb72f242b5a6c89d47190d0525ab4",
       "TOKEN_TTL_MIN_SECONDS": "441d8ce6bd21f753de90abd3013eaa9992a469ea60c590f1005533618199aa25",
-      "analyzeAfterIndexBuild": "7c24d458f4d7c0c9055c6371d02375075f25e16de937bc44e2b0a94b9983f3e0",
+      "analyzeAfterIndexBuild": "8d627df6b496e1c197a244f8519aeaf3aebcd23e3f7cf514576d453a4270e33a",
+      "analyzeDeferred": "e627ca5e77ce0b79cf5eae7c749a0c9275f04bc186704e3f3a6e05121bb78442",
+      "analyzeYieldingToVacuum": "edba1beff1547ea5c2e9f902efe44ab24e8d7016b2253603dcbba92d4137ca9a",
       "backfillChunkVectors": "1c8cc09a28aa3e906fe2f112b71cd3aa61f750a99984e35a029cff9458272aa1",
       "backfillPageVectors": "a325a5eee3bab49723af311f21b38a1ee4a0eaff1fb3c7e1539aa4dcb287ed66",
       "buildIndexOnline": "aea86be06da261a76f6fad15def8f417cb5318c7991d2ded3cd86aeed82fb2cc",
@@ -53,23 +59,27 @@
       "getFtsLanguage": "0d790b4c4af1f67a2a1bbd59470beb13f434917b381931baf8404a41c5d903db",
       "grantFromRow": "2d0603bb0f964d7e45e04aa76bac54cd4f6f63c91a8d9f028b60b4792bc1695e",
       "hnswMaxDimsForType": "a187cdcc520f813b7c39da97ce53da58509232ed9f851627ef41abfe1b68bd26",
+      "lockTableForAnalyze": "b6e4f173cffd877d2cfd85af813aa694a6d2c32907eaea613c6879800d3a7b44",
       "migrateAutoThinkToPins": "34267fe3b1cc4ab2850ddcf9ba18ce73d959678233a53de238c85231e6b71470",
       "migrateConnectorCheckpoints": "5c13e69a334bfc5275c7d555c4e7b28e034569f086dd4bd70b4b78fa4770dc7a",
       "migrateLegacyTokens": "6e4abe3670127e7a495b56ecbf9f5789edd3a7362d45704656c2210a85b27f4c",
       "migrationNotice": "9a6607b26a9719ef1833571b137bc8ebfcd1e16d545e89ff8728cf3ccbcbb409",
+      "migrationStatementTimeoutMs": "2883be5073d2cd96cc17136e2f7d3223c6bdafebe3ef3c7a6836be320867251d",
       "originTwinsRepairCommand": "fb3c721e48d9f2a98845ef91231836d4a37eb5929e9a9b62f8dfab5ce395c462",
       "pageSearchVectorTriggerFnSql": "c78074a731ae571c508ca0a84c6bb19ac34a933a7f4ab2068b47124aabb87435",
       "quietMigrationNotices": "4045c32034a8f46204dd5d89e185ff5c35e8073f560f14caa8b127f8a695957c",
       "readExistingEmbeddingShape": "16d92d7cd52d8ebd7e89982f02e1bbdd8e8d08a6712a4ce57fbcf0952b7a6ca5",
       "repairLegacyClientGrants": "c1dc6b1d0c4933c041583aa1c4eacaefc0ff0ae2a67f56cfad7534f87a5ab309",
       "repairLegacyTimelineSourceRows": "405d4ae158482c020b029b93aff1ae4ac6854e6948cafaf82dbef473e6e5552e",
+      "runMigrationStatement": "84ba969e61fe8e898dd50cf96e1643d237e521e04cd92b5ef43c5d6be75940c1",
       "seedConnectorDispatchAttempts": "2395a3995a6bf78776d37e72ce79b0dd15f6c6fa7f81c40612a744cb74ab01a5",
       "slugifyPath": "401dbca23580865d8b168dd8d84db4a6c708c6610d7cb61abafc7d0ee9809063",
       "sqlQueryForEngine": "71fb1ccec1b22cdc1662876dbd8c17ed81e9ab83485c6965cdf5caa4fc4a4ab5",
       "tableRows": "906d2413b13d76a06d5910885e47ed5c544be4ff3a2266e83146715721b24270",
-      "verifyProjectionStatistics": "0d231b04ecfbc5a4109d6fca9567bf4e8c9e9db6c3fbbb35212e026579ed6f67"
+      "verifyProjectionStatistics": "0d231b04ecfbc5a4109d6fca9567bf4e8c9e9db6c3fbbb35212e026579ed6f67",
+      "withSchemaLockTimeout": "95605bd3004955e11e936c7a4aa6889319b401098abf9db18ef3e48da2c3fc59"
     },
-    "latest": 260,
+    "latest": 274,
     "records": [
       {
         "handler": {
@@ -2263,8 +2273,8 @@
         "idempotent": true,
         "name": "durable_concurrent_persistence",
         "sql": {
-          "length": 12573,
-          "sha256": "8f5c615007ff91fc8a9ed62d44125951aaf48e5f3fd43a7a30bd76ac68147d7a"
+          "length": 13332,
+          "sha256": "e0e36fbcff5d72d7cffb6c290f5fce2fdc7b2f014c4bb20887240821f0408d29"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2328,8 +2338,8 @@
         "idempotent": true,
         "name": "managed_alias_and_source_checkpoint_guards",
         "sql": {
-          "length": 6278,
-          "sha256": "b4e6169bf100ed36973cececf7fa611f8c26f7b1995f0a085d8b7d76d74b5e77"
+          "length": 7037,
+          "sha256": "1964cc4ad2ac89e71e37417b81f19df7635ae1e1cfe01c597c775184e963bd27"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2487,8 +2497,8 @@
         "idempotent": true,
         "name": "fact_embedding_identity",
         "sql": {
-          "length": 6423,
-          "sha256": "f95330837bc60e5a73191a93e17d6503d7ef2d1ee294a861ff4c438e975facec"
+          "length": 7182,
+          "sha256": "900ebf824b3255a9f483b19ab0ef4a00be37114859806c56dacb160156345854"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2683,8 +2693,11 @@
             "PERSISTENCE_SYNC_RUN_INDEXES",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -2889,8 +2902,8 @@
         "idempotent": true,
         "name": "take_embedding_identity",
         "sql": {
-          "length": 6423,
-          "sha256": "739d2dfe3f5d4e0b68511a27478f877381aa2455af3389976e03974eebfc4240"
+          "length": 7182,
+          "sha256": "00cd2c3e74426d3ba1e64147628c4a90213326e35578e81e23dd10b23e3d26f8"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2902,8 +2915,8 @@
         "idempotent": true,
         "name": "f1_write_attribution",
         "sql": {
-          "length": 15269,
-          "sha256": "6ed235b09ce8b18a25cf065fa32321472485ad16b2af17f90e292d01881b3ead"
+          "length": 17096,
+          "sha256": "1828c72a03caf415da2d2690d1211c06c52820e4d9fdffe9870685150cec8f0c"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2960,8 +2973,8 @@
         "idempotent": true,
         "name": "managed_guard_null_source_fallback",
         "sql": {
-          "length": 5738,
-          "sha256": "bf17d089ce9f8473be13d541be18136e4f7b0ac12b68f8b2f7e87d5e5b396efc"
+          "length": 6497,
+          "sha256": "1661de8bdc43511fda3ebe84135800d415e6d2cd1653335011510a44fc92ec6f"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2973,8 +2986,8 @@
         "idempotent": true,
         "name": "publication_failure_detail",
         "sql": {
-          "length": 5829,
-          "sha256": "00788e42366bb2dd3f546d1eb586b4ad5f1951f3f99abfaf71e82dfebccdd289"
+          "length": 6588,
+          "sha256": "3ac268e502ae5c7041441a433c9abf6122e915ac77c1677da79b093b26080d88"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3221,8 +3234,8 @@
         "idempotent": true,
         "name": "facts_attributed_to",
         "sql": {
-          "length": 9118,
-          "sha256": "2e772deed199aba5dc05c6b9f88b70c57a6b50dc724d60b0e9eca684c66f63ba"
+          "length": 10186,
+          "sha256": "87e2f77b99e6081776216ea01fa59602f5253f257600935e150f7f8c4123d2c4"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3275,8 +3288,11 @@
             "PAGES_RECONCILE_NAME_INDEXES",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3327,8 +3343,11 @@
             "PERSISTENCE_COMMITTED_WATERMARK_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3354,8 +3373,11 @@
             "PERSISTENCE_SYNC_WATERMARK_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3412,8 +3434,8 @@
         "idempotent": true,
         "name": "trust_tiers",
         "sql": {
-          "length": 21668,
-          "sha256": "f6cf6e708adf48bf130320153f8f8fe9308ca3f57b883b6b739840ff464f115b"
+          "length": 22427,
+          "sha256": "a45cf1c8031731bb7934737b379eb96559c7892af1d64f8f0700231c0c701199"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3480,8 +3502,11 @@
             "FACT_PURGES_SUBJECT_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3590,8 +3615,11 @@
             "OPEN_LOOPS_COUNTERPARTY_SOURCE_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3615,10 +3643,13 @@
           "helpers": [
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
             "ensureFactsFtsIndex",
             "getFtsLanguage",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3669,8 +3700,11 @@
             "PAGES_NAME_LOOKUP_INDEXES",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3695,8 +3729,11 @@
             "PERSISTENCE_REQUEST_SLUG_INTENT_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3812,8 +3849,11 @@
             "CONTENT_CHUNKS_OCCURRENCE_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3847,8 +3887,11 @@
             "BELIEF_FACTS_STREAM_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3873,8 +3916,11 @@
             "PERSISTENCE_REQUEST_ID_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3912,8 +3958,11 @@
             "CONTENT_CHUNKS_GENERATION_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3951,8 +4000,11 @@
             "INGEST_LOG_UNMARKED_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -3990,8 +4042,11 @@
             "CONTENT_CHUNKS_OCCURRENCE_GENERATION_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -4051,8 +4106,11 @@
             "INGEST_LOG_MARKED_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -4077,8 +4135,11 @@
             "PAGES_SEGMENTED_BODY_BYTES_INDEX",
             "PLANNER_REPAIR_TABLES",
             "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
             "buildIndexOnline",
             "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
             "migrationNotice",
             "quietMigrationNotices",
             "tableRows"
@@ -4095,6 +4156,260 @@
         "transaction": false,
         "verify": "absent",
         "version": 260
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "persistence_request_transient_retries",
+        "sql": {
+          "length": 208,
+          "sha256": "3ab9a442fb2e2c6999cbca77df5bf5acf77aed37cf3c3de8547becbd7addeff0"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 261
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "commit_notifier",
+        "sql": {
+          "length": 1716,
+          "sha256": "92b10ec00767e181fc76c3e945a9085e37c16f06ba6235512ae6b55c409ba695"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 262
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "try_jsonb_function",
+        "sql": {
+          "length": 241,
+          "sha256": "ca16373eb5df962e15b59ed33ebffd4469d09ee873039600929e1b9145638272"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 263
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "set_based_fact_insert_guards",
+        "sql": {
+          "length": 8343,
+          "sha256": "d01ea4d8a212485932351ad8473d54ef7d0b65f4d5b59b1ba34e4b63bf20b4bb"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 264
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "derived_generations",
+        "sql": {
+          "length": 2832,
+          "sha256": "8f07eb75b6de03f1be543c4236cb47d50bb85bbd5e8d9e47c9f776e0cb514872"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 265
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "derived_generation_activations",
+        "sql": {
+          "length": 1151,
+          "sha256": "a33706dbe93948e527af3f692ece4aed3ab7d41f6789ddb552e75fcf39e6055c"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 266
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PAGES_TITLE_SEARCH_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "08f633af1c107eb453085b9027b8cad8d2ba1595147c44acf4296aa4e5410b3d"
+        },
+        "idempotent": true,
+        "name": "pages_title_search_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 267
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "effect_claim_owner",
+        "sql": {
+          "length": 83,
+          "sha256": "1342d23315a82e4b650358cc8ddd08a1197a2da8ddd3be107a2c96976a032a7f"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 268
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "LINKS_SUPERSEDES_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "e7d77bcf13643b56d3b80e2d5cea59a1e35f94e47ede80dbb9bad76dd04cf4fc"
+        },
+        "idempotent": true,
+        "name": "links_supersedes_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 269
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "PAGES_SOURCE_CREATED_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "61bbcf074ff9a40f227b7836eb1b4fefb5cc3ec22c4845c556c9e1f4e3e92b3b"
+        },
+        "idempotent": true,
+        "name": "pages_source_created_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 270
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "FACTS_SUPERSEDED_BY_INDEX",
+            "PLANNER_REPAIR_TABLES",
+            "analyzeAfterIndexBuild",
+            "analyzeDeferred",
+            "analyzeYieldingToVacuum",
+            "buildIndexOnline",
+            "dropInvalidConcurrentIndex",
+            "lockTableForAnalyze",
+            "migrationNotice",
+            "quietMigrationNotices",
+            "tableRows"
+          ],
+          "sha256": "da2e5f805da6de37f972aa014bc83ce70e66c6f2d7f0485497efef6ae16f656b"
+        },
+        "idempotent": true,
+        "name": "facts_superseded_by_index",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 271
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "git_canonical_declared",
+        "sql": {
+          "length": 8553,
+          "sha256": "c18a85c1f6621f60f19274990cca67fb0a87d988a01b38463464737192bf0a4b"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 272
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "migrationStatementTimeoutMs",
+            "runMigrationStatement",
+            "withSchemaLockTimeout"
+          ],
+          "sha256": "c0b02932c7327d8a0e02f2211a6e4f12ff860ae8aabece9c841ff537a1961d7a"
+        },
+        "idempotent": true,
+        "name": "segment_derivations",
+        "sql": {
+          "length": 6527,
+          "sha256": "6817b97b501c8fadfb66177fa317ecd4e1a05ef879cc0c411df134f99019e491"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 273
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "pages_withheld_source_path",
+        "sql": {
+          "length": 77,
+          "sha256": "42dd9471b93c51d33f563e1da50966237e919dd84440787a3021822b6f59a379"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 274
       }
     ],
     "versions": [
@@ -4352,7 +4667,21 @@
       257,
       258,
       259,
-      260
+      260,
+      261,
+      262,
+      263,
+      264,
+      265,
+      266,
+      267,
+      268,
+      269,
+      270,
+      271,
+      272,
+      273,
+      274
     ]
   },
   "normalizer": "migrations-record-v1"

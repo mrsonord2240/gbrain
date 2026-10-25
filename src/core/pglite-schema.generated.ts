@@ -31,6 +31,14 @@ CREATE TABLE IF NOT EXISTS sources (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE OR REPLACE FUNCTION gbrain_try_jsonb(input text) RETURNS jsonb
+  LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = pg_catalog, public AS \$fn\$
+BEGIN
+  RETURN input::jsonb;
+EXCEPTION WHEN data_exception THEN
+  RETURN NULL;
+END \$fn\$;
+
 INSERT INTO sources (id, name, config)
   SELECT 'default', 'default', '{"federated": true}'::jsonb
   WHERE NOT EXISTS (SELECT 1 FROM sources WHERE id = 'default')
@@ -225,6 +233,7 @@ CREATE INDEX IF NOT EXISTS idx_links_origin ON links(origin_page_id);
 CREATE OR REPLACE VIEW page_links AS
   SELECT id, from_page_id, to_page_id FROM links;
 
+CREATE INDEX IF NOT EXISTS idx_links_supersedes_to ON links (to_page_id) WHERE link_type = 'supersedes';
 
 CREATE TABLE IF NOT EXISTS wanted_links (
   id               BIGSERIAL PRIMARY KEY,
@@ -639,6 +648,7 @@ CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS search_vector tsvector;
 
 CREATE INDEX IF NOT EXISTS idx_pages_search ON pages USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_pages_title_search ON pages USING GIN (ts_filter(search_vector, '{a}'));
 
 CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS \$\$
 DECLARE
@@ -1209,6 +1219,82 @@ CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx
   ON extract_atoms_page_state (source_incarnation, content_hash, page_id) WHERE tombstoned;
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_page_state (page_id);
+
+CREATE TABLE IF NOT EXISTS derived_generations (
+  id BIGSERIAL PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  owner_key TEXT NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL CHECK (state IN ('live','held','superseded')),
+  run_id TEXT,
+  operation_id TEXT NOT NULL,
+  hold_id TEXT,
+  input_pin TEXT,
+  input_size BIGINT,
+  completeness JSONB NOT NULL DEFAULT '{}',
+  item_set_hash TEXT NOT NULL,
+  held_reason TEXT CHECK (held_reason IS NULL OR held_reason IN ('shrunk','oversize','valve','no_proof','fence_absent','attempts_exhausted','segmented_unsupported','tie')),
+  held_context JSONB,
+  proposal JSONB,
+  proposal_bytes INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  superseded_by BIGINT,
+  restore_of BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  locator TEXT,
+  activation_id TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS derived_generations_one_live ON derived_generations (source_id, kind, owner_key) WHERE state = 'live';
+CREATE UNIQUE INDEX IF NOT EXISTS derived_generations_one_hold ON derived_generations (source_id, kind, owner_key) WHERE state = 'held';
+CREATE INDEX IF NOT EXISTS derived_generations_operation ON derived_generations (operation_id);
+CREATE INDEX IF NOT EXISTS derived_generations_state_created ON derived_generations (state, created_at);
+CREATE TABLE IF NOT EXISTS derived_generation_items (
+  generation_id BIGINT NOT NULL REFERENCES derived_generations(id) ON DELETE CASCADE,
+  item_key TEXT NOT NULL,
+  identity_hash TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('published','retired','revived','kept','adopted')),
+  preimage JSONB,
+  preimage_bytes INTEGER,
+  pending BOOLEAN NOT NULL DEFAULT false,
+  PRIMARY KEY (generation_id, item_key)
+);
+CREATE INDEX IF NOT EXISTS derived_generation_items_key ON derived_generation_items (item_key);
+CREATE INDEX IF NOT EXISTS derived_generation_items_pending ON derived_generation_items (generation_id) WHERE pending;
+CREATE TABLE IF NOT EXISTS derived_generation_valve (
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  window_key TEXT NOT NULL,
+  retired INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, kind, window_key)
+);
+CREATE TABLE IF NOT EXISTS derived_generation_attempts (
+  hold_id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  owner_key TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  codes JSONB NOT NULL DEFAULT '[]',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS derived_generation_attempts_key ON derived_generation_attempts (source_id, kind, owner_key);
+CREATE TABLE IF NOT EXISTS derived_generation_activations (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  owner_key TEXT NOT NULL,
+  expected_generation INTEGER NOT NULL,
+  input_pin TEXT,
+  item_set_hash TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending','activated')),
+  generation_id BIGINT REFERENCES derived_generations(id) ON DELETE SET NULL,
+  members JSONB NOT NULL DEFAULT '[]',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS derived_generation_activations_key ON derived_generation_activations (source_id, kind, owner_key, state);
 CREATE TABLE IF NOT EXISTS page_embedding_budget (
   page_id INTEGER PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
   state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'held', 'capped')),
@@ -1379,6 +1465,101 @@ CREATE TABLE IF NOT EXISTS page_body_staging_texts (
   PRIMARY KEY (staging_id, sha256)
 );
 CREATE INDEX IF NOT EXISTS page_body_staging_texts_text ON page_body_staging_texts (source_id, sha256);
+
+-- Wave B per-segment derivation watermarks (migration v273; src/core/page-body/derivations.ts).
+CREATE TABLE IF NOT EXISTS page_segment_derivations (
+  page_id          INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  pipeline         TEXT    NOT NULL CHECK (pipeline IN ('links','mentions','timeline','fences','conversation_facts','facts_backstop','synopsis')),
+  occurrence_id    BIGINT  NOT NULL,
+  pipeline_version INTEGER NOT NULL CHECK (pipeline_version >= 0),
+  segment_sha256   BYTEA   NOT NULL CHECK (octet_length(segment_sha256) = 32),
+  context_hash     BYTEA   NOT NULL CHECK (octet_length(context_hash) = 32),
+  state            TEXT    NOT NULL CHECK (state IN ('done','partial','failed','skipped')),
+  output           JSONB,
+  receipt          JSONB,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (page_id, pipeline, occurrence_id)
+);
+CREATE INDEX IF NOT EXISTS page_segment_derivations_unsettled ON page_segment_derivations (pipeline, page_id) WHERE state IN ('partial','failed');
+CREATE TABLE IF NOT EXISTS page_derivation_spend (
+  page_id      INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  family       TEXT    NOT NULL CHECK (family IN ('facts','synopsis')),
+  spent_usd    DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (spent_usd >= 0),
+  reserved_usd DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
+  reserved_at  TIMESTAMPTZ,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (page_id, family)
+);
+CREATE TABLE IF NOT EXISTS page_segment_derivation_purges (
+  request_id        UUID      PRIMARY KEY,
+  source_id         TEXT      NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  needles           TEXT[]    NOT NULL,
+  patterns          TEXT[]    NOT NULL,
+  page_ids          INTEGER[] NOT NULL DEFAULT '{}',
+  phase             TEXT      NOT NULL DEFAULT 'sweep' CHECK (phase IN ('sweep','verify','recheck')),
+  recheck           INTEGER[],
+  found             INTEGER   NOT NULL DEFAULT 0 CHECK (found >= 0),
+  cursor_page       INTEGER,
+  cursor_pipeline   TEXT,
+  cursor_occurrence BIGINT,
+  batch_rows        INTEGER   CHECK (batch_rows >= 1),
+  stalled_at        TIMESTAMPTZ,
+  stalled_reason    TEXT      CHECK (stalled_reason IN ('statement_timeout','paid_row_unreadable')),
+  pending_reason    TEXT      CHECK (pending_reason IN ('scope_lock_busy')),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS page_segment_derivation_purges_source ON page_segment_derivation_purges (source_id, created_at);
+CREATE TABLE IF NOT EXISTS page_segment_derivation_purge_pages (
+  request_id UUID    NOT NULL,
+  page_id    INTEGER NOT NULL,
+  PRIMARY KEY (request_id, page_id)
+);
+CREATE OR REPLACE FUNCTION gbrain_mark_derivation_scope_entry() RETURNS trigger SET search_path = pg_catalog, public AS \$func\$
+DECLARE
+  src TEXT;
+  page INTEGER;
+BEGIN
+  IF TG_TABLE_NAME = 'pages' THEN
+    src := NEW.source_id;
+    page := NEW.id;
+  ELSE
+    src := OLD.source_id;
+    page := OLD.page_id;
+  END IF;
+  PERFORM pg_advisory_xact_lock_shared(hashtextextended('gbrain:derivation-scope:' || src, 0));
+  INSERT INTO page_segment_derivation_purge_pages (request_id, page_id)
+    SELECT x.request_id, page FROM page_segment_derivation_purges x WHERE x.source_id = src ON CONFLICT DO NOTHING;
+  RETURN NULL;
+END
+\$func\$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS page_body_manifest_derivation_scope_retire ON page_body_manifest;
+CREATE TRIGGER page_body_manifest_derivation_scope_retire AFTER UPDATE OF gen_to ON page_body_manifest
+  FOR EACH ROW WHEN (OLD.gen_to IS NULL AND NEW.gen_to IS NOT NULL AND OLD.staging_id IS NULL) EXECUTE FUNCTION gbrain_mark_derivation_scope_entry();
+DROP TRIGGER IF EXISTS page_body_manifest_derivation_scope_delete ON page_body_manifest;
+CREATE TRIGGER page_body_manifest_derivation_scope_delete AFTER DELETE ON page_body_manifest
+  FOR EACH ROW WHEN (OLD.gen_to IS NULL AND OLD.staging_id IS NULL) EXECUTE FUNCTION gbrain_mark_derivation_scope_entry();
+DROP TRIGGER IF EXISTS pages_derivation_scope_delete ON pages;
+CREATE TRIGGER pages_derivation_scope_delete AFTER UPDATE OF deleted_at ON pages
+  FOR EACH ROW WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL) EXECUTE FUNCTION gbrain_mark_derivation_scope_entry();
+CREATE OR REPLACE FUNCTION gbrain_refuse_purging_derivation() RETURNS trigger SET search_path = pg_catalog, public AS \$func\$
+BEGIN
+  IF EXISTS (SELECT 1 FROM page_segment_derivation_purges x JOIN pages p ON p.source_id = x.source_id
+    WHERE p.id = NEW.page_id AND (NEW.page_id = ANY(x.page_ids::int[]) OR p.deleted_at IS NOT NULL OR NOT EXISTS (SELECT 1 FROM page_body_manifest m
+    WHERE m.page_id = NEW.page_id AND m.occurrence_id = NEW.occurrence_id AND m.gen_to IS NULL AND m.staging_id IS NULL AND m.sha256 = NEW.segment_sha256))
+      AND CASE WHEN replace(translate(lower(COALESCE(NEW.output::text, '') || ' ' || COALESCE(NEW.receipt::text, '')), 'ς', 'σ'), 'i̇', 'i') LIKE ANY (x.patterns::text[]) THEN EXISTS (SELECT 1 FROM (VALUES (NEW.output), (NEW.receipt)) doc(j),
+    LATERAL (SELECT jsonb_path_query(doc.j, 'strict \$.** ? (@.type() == "string")') #>> '{}' AS t
+      UNION ALL SELECT jsonb_path_query(doc.j, 'strict \$.** ? (@.type() == "object").keyvalue().key') #>> '{}') s
+    WHERE CASE WHEN replace(translate(lower(s.t), 'ς', 'σ'), 'i̇', 'i') LIKE ANY (x.patterns::text[]) THEN EXISTS (SELECT 1 FROM unnest(x.needles::text[]) k(n)
+      WHERE strpos(' ' || replace(translate(gbrain_fact_normalize(s.t), 'ς', 'σ'), 'i̇', 'i') || ' ', k.n) > 0) ELSE false END) ELSE false END) THEN
+    RETURN NULL;
+  END IF;
+  RETURN NEW;
+END
+\$func\$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS page_segment_derivations_refuse_purging ON page_segment_derivations;
+CREATE TRIGGER page_segment_derivations_refuse_purging BEFORE INSERT OR UPDATE OF output, receipt ON page_segment_derivations
+  FOR EACH ROW EXECUTE FUNCTION gbrain_refuse_purging_derivation();
 
 
 
@@ -1584,6 +1765,14 @@ BEGIN
         WHEN NOT (allowed ? target_source) THEN 'different_source' ELSE 'old_source_outside' END,
         'target_source',target_source,'old_source',old_source,'allowed',allowed)::text;
   END IF;
+  -- G7a (git-canonical-schema.ts): a git-canonical source takes rows only from a writer that declares the git protocol.
+  IF COALESCE(current_setting('gbrain.git_protocol',true),'') <> '1'
+    AND EXISTS (SELECT 1 FROM git_canonical_brain WHERE singleton=1 AND strict_sources>0)
+    AND EXISTS (SELECT 1 FROM sources WHERE id IN (target_source, old_source) AND config->>'canonical'='git') THEN
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='git_protocol_required: this source is git-canonical and the writer does not declare the git protocol',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='git_canonical_fence:mutation',
+      DETAIL=jsonb_build_object('op',TG_OP,'target_source',target_source,'old_source',old_source)::text;
+  END IF;
   IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END \$fn\$;
 
@@ -1598,6 +1787,38 @@ BEGIN
   END LOOP;
 END \$body\$;
 ;
+
+CREATE TABLE IF NOT EXISTS git_canonical_brain (
+  singleton INTEGER PRIMARY KEY DEFAULT 1 CHECK (singleton = 1),
+  strict_sources INTEGER NOT NULL DEFAULT 0 CHECK (strict_sources >= 0)
+);
+CREATE OR REPLACE FUNCTION gbrain_count_git_canonical_sources() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
+BEGIN
+  INSERT INTO git_canonical_brain(singleton, strict_sources)
+    VALUES (1, (SELECT count(*) FROM sources WHERE config->>'canonical' = 'git'))
+    ON CONFLICT (singleton) DO UPDATE SET strict_sources = EXCLUDED.strict_sources;
+  RETURN NULL;
+END \$fn\$;
+DROP TRIGGER IF EXISTS git_canonical_sources_count_insert ON sources;
+CREATE TRIGGER git_canonical_sources_count_insert AFTER INSERT ON sources
+  FOR EACH ROW WHEN (NEW.config->>'canonical' = 'git') EXECUTE FUNCTION gbrain_count_git_canonical_sources();
+DROP TRIGGER IF EXISTS git_canonical_sources_count_update ON sources;
+CREATE TRIGGER git_canonical_sources_count_update AFTER UPDATE ON sources
+  FOR EACH ROW WHEN (OLD.config->>'canonical' IS DISTINCT FROM NEW.config->>'canonical') EXECUTE FUNCTION gbrain_count_git_canonical_sources();
+DROP TRIGGER IF EXISTS git_canonical_sources_count_delete ON sources;
+CREATE TRIGGER git_canonical_sources_count_delete AFTER DELETE ON sources
+  FOR EACH ROW WHEN (OLD.config->>'canonical' = 'git') EXECUTE FUNCTION gbrain_count_git_canonical_sources();
+INSERT INTO git_canonical_brain(singleton, strict_sources)
+  VALUES (1, (SELECT count(*) FROM sources WHERE config->>'canonical' = 'git'))
+  ON CONFLICT (singleton) DO UPDATE SET strict_sources = EXCLUDED.strict_sources;
+DO \$rls\$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper))
+    AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = current_schema() AND c.relname = 'git_canonical_brain' AND c.relkind = 'r' AND NOT c.relrowsecurity) THEN
+    ALTER TABLE git_canonical_brain ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
 -- Verified text projection work (migration 153).
 DROP TRIGGER IF EXISTS trg_pages_search_vector ON pages;
 DO \$trg\$ BEGIN
@@ -2552,6 +2773,52 @@ DO \$rls\$ BEGIN
     ALTER TABLE belief_redactions ENABLE ROW LEVEL SECURITY;
   END IF;
 END \$rls\$;
+
+CREATE TABLE IF NOT EXISTS sync_wanted_markers (
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  intent TEXT NOT NULL CHECK (intent IN ('freshness','pull','full')),
+  source_incarnation TEXT,
+  wanted_head TEXT,
+  generation BIGINT NOT NULL DEFAULT 1,
+  first_due_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  requested_by TEXT NOT NULL,
+  job_id BIGINT,
+  PRIMARY KEY (source_id, intent)
+);
+CREATE TABLE IF NOT EXISTS sync_notifier_leases (
+  host_id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  fence BIGINT NOT NULL DEFAULT 1,
+  resident_kind TEXT NOT NULL,
+  pid INTEGER,
+  renewed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_notifier_sources (
+  source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+  source_incarnation TEXT,
+  syncer_host_id TEXT,
+  syncer_recorded_at TIMESTAMPTZ,
+  state TEXT NOT NULL DEFAULT 'idle' CHECK (state IN ('idle','due','running','retry','operator_blocked')),
+  reason TEXT,
+  first_due_at TIMESTAMPTZ,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry_at TIMESTAMPTZ,
+  last_progress_at TIMESTAMPTZ,
+  last_error_code TEXT,
+  last_error TEXT,
+  last_error_at TIMESTAMPTZ,
+  trace_path TEXT,
+  observed_head TEXT,
+  observed_at TIMESTAMPTZ,
+  detection_mode TEXT CHECK (detection_mode IN ('watch','poll')),
+  owner_host_id TEXT,
+  owner_kind TEXT,
+  owner_pid INTEGER,
+  owner_seen_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 `;
 
