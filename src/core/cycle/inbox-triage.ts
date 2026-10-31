@@ -33,7 +33,7 @@ import { operations } from '../operations.ts';
 import type { OperationContext } from '../operations.ts';
 import { chat as gatewayChat, isAvailable } from '../ai/gateway.ts';
 import { resolveModel } from '../model-config.ts';
-import { loadActivePack } from '../schema-pack/index.ts';
+import { loadActivePackForEngine, type ResolvedPack } from '../schema-pack/index.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import { loadConfig } from '../config.ts';
 
@@ -153,6 +153,11 @@ Respond as strict JSON only:
   }
 }
 
+/** The active pack through every tier, database settings included, so the types offered are the ones the brain runs. */
+export async function loadTriagePack(engine: BrainEngine, sourceId?: string): Promise<ResolvedPack> {
+  return loadActivePackForEngine(engine, { remote: false, ...(sourceId ? { sourceId } : {}) });
+}
+
 export async function runPhaseInboxTriage(
   engine: BrainEngine,
   opts: InboxTriagePhaseOpts = {},
@@ -209,7 +214,7 @@ export async function runPhaseInboxTriage(
     fallback: 'haiku',
   });
 
-  const pack = await loadActivePack({ cfg: loadConfig(), remote: false, sourceId: opts.sourceId });
+  const pack = await loadTriagePack(engine, opts.sourceId);
 
   const putPageOp = operations.find((o) => o.name === 'put_page');
   const deletePageOp = operations.find((o) => o.name === 'delete_page');
