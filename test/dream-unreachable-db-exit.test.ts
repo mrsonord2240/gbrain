@@ -7,12 +7,11 @@
  * Existing coverage: test/dream-failed-phase-exit.test.ts pins failed phases,
  * and a skipped phase is not a failed one. No production seam is added.
  */
-import { afterAll, afterEach, beforeAll, expect, spyOn, test } from 'bun:test';
+import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { run } from '../src/cli/commands/dream.ts';
-import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
 import type { CliDispatchContext } from '../src/cli/command-table.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -24,16 +23,19 @@ const unreachable = {
   connectEngine: async () => { throw new Error('write CONNECT_TIMEOUT db.example.test:5432'); },
 } as unknown as CliDispatchContext;
 
-/** Runs the command and returns everything it printed to stdout. */
-async function dream(home: string, ...extra: string[]): Promise<string> {
+/** Runs the command; `exit` is what it passed to process.exit, null if it returned. */
+async function dream(home: string, ...extra: string[]): Promise<{ printed: string; exit: number | null }> {
+  let code: number | null = null;
+  const exit = spyOn(process, 'exit').mockImplementation(((c?: number) => { code = c ?? 0; throw new Error('EXIT'); }) as never);
   const log = spyOn(console, 'log').mockImplementation(() => {});
   const err = spyOn(console, 'error').mockImplementation(() => {});
   const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
   try {
     await withEnv({ GBRAIN_HOME: home, GBRAIN_DATABASE_URL: undefined, DATABASE_URL: undefined }, () =>
-      run(['--dir', dir, '--phase', 'lint', ...extra], unreachable));
-    return log.mock.calls.map(c => String(c[0])).join('\n');
+      run(['--dir', dir, '--phase', 'lint', ...extra], unreachable)).catch((e: Error) => { if (e.message !== 'EXIT') throw e; });
+    return { printed: log.mock.calls.map(c => String(c[0])).join('\n'), exit: code };
   } finally {
+    exit.mockRestore();
     log.mockRestore();
     err.mockRestore();
     stderr.mockRestore();
@@ -50,32 +52,26 @@ beforeAll(() => {
     database_url: 'postgresql://user:pass@db.example.test:5432/postgres',
   }));
 });
-afterEach(() => {
-  _resetCliExitVerdictForTests();
-  process.exitCode = 0;
-});
 afterAll(() => {
   for (const d of [configured, unconfigured, dir]) rmSync(d, { recursive: true, force: true });
 });
 
 test('a configured brain with an unreachable database exits 1', async () => {
-  await dream(configured);
-  expect(currentExitCode()).toBe(1);
+  expect((await dream(configured)).exit).toBe(1);
 }, 60_000);
 
 test('no gbrain config keeps the filesystem-only cycle at exit 0', async () => {
-  await dream(unconfigured);
-  expect(currentExitCode()).toBe(0);
+  expect((await dream(unconfigured)).exit).toBeNull();
 }, 60_000);
 
-test('--json stays parseable when the database is unreachable', async () => {
-  const printed = await dream(configured, '--json');
+test('--json reports a failed cycle when the database is unreachable', async () => {
+  const { printed, exit } = await dream(configured, '--json');
   const report = JSON.parse(printed.slice(printed.indexOf('{')));
-  expect(report.phases.find((p: { phase: string }) => p.phase === 'lint')).toBeDefined();
-  expect(currentExitCode()).toBe(1);
+  expect(report.status).toBe('failed');
+  expect(report.reason).toBe('database_unreachable');
+  expect(exit).toBe(1);
 }, 60_000);
 
 test('an unreachable database never prints Brain is healthy', async () => {
-  const printed = await dream(configured);
-  expect(printed).not.toContain('Brain is healthy');
+  expect((await dream(configured)).printed).not.toContain('Brain is healthy');
 }, 60_000);

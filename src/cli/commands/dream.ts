@@ -3,7 +3,7 @@
  * handleCliOnly before the connectEngine() terminator. Moved verbatim from
  * src/cli.ts (refactor wave 1, W4 cli); the record lives in src/cli/command-table.ts.
  */
-import { finishCliTeardown, setCliExitVerdict } from '../../core/cli-force-exit.ts';
+import { finishCliTeardown } from '../../core/cli-force-exit.ts';
 import { loadConfig } from '../../core/config.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import type { CliDispatchContext } from '../command-table.ts';
@@ -17,16 +17,16 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
   // were skipped instead of seeing a silent "lint + backlinks done"
   // and assuming the cycle actually ran. Pre-fix, foxhoundinc reported
   // the cycle exiting 0 on PostgreSQL with every DB phase silently no-op.
-  // A configured brain that can't be reached still exits 1 once those
+  // A configured brain that can't be reached is a failed cycle once those
   // phases finish: a scheduled run must not read as success. With no
   // config there is no database to miss, so that run stays exit 0.
   const { runDream } = await import('../../commands/dream.ts');
   let eng: BrainEngine | null = null;
-  let unreachable = false;
+  let databaseUnreachable = false;
   try {
     eng = await connectEngine();
   } catch (err) {
-    unreachable = loadConfig() != null;
+    databaseUnreachable = loadConfig() != null;
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(
       `[dream] WARNING: could not connect to DB (${msg}). ` +
@@ -35,7 +35,7 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
     );
   }
   try {
-    await runDream(eng, args);
+    await runDream(eng, args, { databaseUnreachable });
   } finally {
     // #1471 invariant tripwire (the dream-cycle owner): `eng` created the
     // module singleton (first module connector) and is torn down LAST,
@@ -47,10 +47,5 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
     // overnight cron, where a lingering-socket hang is a silent zombie
     // (closes the TODOS.md drain-before-owner-disconnect item).
     if (eng) await finishCliTeardown({ engine: eng });
-  }
-  if (unreachable) {
-    process.stderr.write('[dream] FAILED: database unreachable; DB-dependent phases did not run.\n');
-    // A verdict, not exit(): stdout may still hold the --json report.
-    setCliExitVerdict(1);
   }
 }
