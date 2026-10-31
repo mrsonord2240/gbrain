@@ -495,7 +495,7 @@ Related:
 
 // ─── Human-friendly report printing ────────────────────────────────
 
-function printHuman(report: CycleReport) {
+function printHuman(report: CycleReport, databaseConnected = true) {
   if (report.status === 'skipped') {
     if (report.reason === 'cycle_already_running') {
       const h = report.lock_holder;
@@ -505,6 +505,12 @@ function printHuman(report: CycleReport) {
     } else {
       console.log(`Skipped: ${report.reason ?? 'unknown reason'}.`);
     }
+    return;
+  }
+
+  if (report.status === 'clean' && !databaseConnected) {
+    const skipped = report.phases.filter(p => p.status === 'skipped').length;
+    console.log(`Filesystem phases only: database not connected. ${skipped} phase(s) skipped.`);
     return;
   }
 
@@ -913,7 +919,7 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
   // 'partial' cycles still exit 0.
   const failedPhases = report.phases.filter(p => p.status === 'fail' || p.details?.contained === true).map(p => p.phase);
   const failed = report.status === 'failed' || failedPhases.length > 0;
-  if (!opts.json) printHuman(report);
+  if (!opts.json) printHuman(report, engine !== null);
   else if (!failed || !jsonGuardActive()) await writeJsonDocument(JSON.stringify(report, null, 2));
   else {
     // D2: under the --json guard a failed cycle is one envelope leading with the CycleReport keys.

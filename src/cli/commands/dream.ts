@@ -3,24 +3,30 @@
  * handleCliOnly before the connectEngine() terminator. Moved verbatim from
  * src/cli.ts (refactor wave 1, W4 cli); the record lives in src/cli/command-table.ts.
  */
-import { finishCliTeardown } from '../../core/cli-force-exit.ts';
+import { finishCliTeardown, setCliExitVerdict } from '../../core/cli-force-exit.ts';
+import { loadConfig } from '../../core/config.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import type { CliDispatchContext } from '../command-table.ts';
 
 export async function run(args: string[], ctx: CliDispatchContext): Promise<void> {
   const { connectEngine } = ctx;
   // Dream mirrors doctor's pattern: filesystem phases run without a DB,
-  // so an engine connection failure is non-fatal. runCycle honestly
+  // so an engine connection failure doesn't stop them. runCycle honestly
   // reports DB phases as skipped when engine is null. v0.41.13 (#1422):
   // bind + surface the error on stderr so the user knows WHY DB phases
   // were skipped instead of seeing a silent "lint + backlinks done"
   // and assuming the cycle actually ran. Pre-fix, foxhoundinc reported
   // the cycle exiting 0 on PostgreSQL with every DB phase silently no-op.
+  // A configured brain that can't be reached still exits 1 once those
+  // phases finish: a scheduled run must not read as success. With no
+  // config there is no database to miss, so that run stays exit 0.
   const { runDream } = await import('../../commands/dream.ts');
   let eng: BrainEngine | null = null;
+  let unreachable = false;
   try {
     eng = await connectEngine();
   } catch (err) {
+    unreachable = loadConfig() != null;
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(
       `[dream] WARNING: could not connect to DB (${msg}). ` +
@@ -41,5 +47,10 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
     // overnight cron, where a lingering-socket hang is a silent zombie
     // (closes the TODOS.md drain-before-owner-disconnect item).
     if (eng) await finishCliTeardown({ engine: eng });
+  }
+  if (unreachable) {
+    process.stderr.write('[dream] FAILED: database unreachable; DB-dependent phases did not run.\n');
+    // A verdict, not exit(): stdout may still hold the --json report.
+    setCliExitVerdict(1);
   }
 }
