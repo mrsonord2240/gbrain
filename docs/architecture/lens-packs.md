@@ -59,11 +59,14 @@ takes), `founder_evaluation` (scalar_brier over person-attached takes),
 conviction so high-stakes misses cost more).
 
 ### gbrain-engineer
-Bridge-only pack. Declares `learning` page type + reuses base `code`.
-No new cycle phases — the daemon-side `gstack-learnings` IngestionSource watches `~/.gstack/projects/{repo}/learnings.jsonl` and emits
-each JSONL line as a `learning` page when this pack is active. Three
-calibration domains: `architecture_calls` (scalar_brier),
+Declares `learning` page type + reuses base `code`. No new cycle phases.
+Three calibration domains: `architecture_calls` (scalar_brier),
 `effort_estimates` (weighted_brier), `risk_assessment` (scalar_brier).
+
+Activating this pack does not import anything. The `gstack-learnings`
+IngestionSource in `src/core/ingestion/sources/gstack-learnings.ts` is
+built to emit each line of `~/.gstack/projects/{repo}/learnings.jsonl` as
+a `learning` page, but nothing constructs it or the ingestion daemon.
 
 Speculative ADR/postmortem/refactor_thesis/tech_debt types are
 deferred — they'll ship when a real user authors the first one.
@@ -114,18 +117,16 @@ domain))`. Multi-domain assignment honest — a take about "fund-a's
 investment in acme-example" can land in BOTH `deal_success` AND
 `market_call` rather than being force-bucketed.
 
+Nothing writes this table yet, so `scalar_brier`, `weighted_brier` and
+`count_based` domains report `n: 0`. `cluster_summary` reads pages
+directly and still works.
+
 ## What this enables for the user
 
 - **Atoms + concepts ship in the binary.** Your OpenClaw's parallel
   atom-pipeline-coordinator + atom-backfill-coordinator + concept-
   synthesis crons can retire. One `gbrain dream` cron
   covers everything.
-- **gstack learnings reach gbrain.** Engineer-pack-active brains
-  surface every gstack-logged learning as a queryable page within
-  seconds of being written.
-- **Multi-lens calibration.** Activate gbrain-everything and see how
-  often you're wrong on deals AND market calls AND architecture
-  AND effort estimates in one `gbrain calibration --json` call.
 - **Lossless OpenClaw migration.** The `markdown-greenfield`
   importer (mode='migration') re-ingests existing OpenClaw
   pages with permanent slug-keyed idempotency + per-row JSONL audit
@@ -134,6 +135,9 @@ investment in acme-example" can land in BOTH `deal_success` AND
 
 ## Known gaps / deferred follow-ups
 
+- Wire up or delete the ingestion daemon and its `gstack-learnings`
+  source.
+- Populate `take_domain_assignments` so Brier domains can score takes.
 - Per-page-type `frontmatter_validators` on PageTypeSchema so the
   atom_type enum (currently hardcoded in extract_atoms.ts) reads from
   the active pack manifest at runtime.
