@@ -12,6 +12,14 @@ not the source, not the skill that's running.
 3. Cross-link from related directories
 4. When in doubt: what would you search for to find this page again?
 
+## The Active Schema Pack Wins
+
+This file describes the default taxonomy. A brain's active schema pack can
+change it, and the pack is what that brain actually runs. `gbrain schema show
+--json` lists each page type with its directories, and its `filing_rules` say
+where new pages go and what belongs there. Where the pack and this file
+disagree, follow the pack.
+
 ## Common Misfiling Patterns -- DO NOT DO THESE
 
 | Wrong | Right | Why |

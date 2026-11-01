@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
   "companion": "_brain-filing-rules.md",
-  "description": "Canonical (machine-readable) brain filing rules. The .md companion is the human explainer; this JSON is what `gbrain check-resolvable` audits against. Keep both in sync.",
+  "description": "Canonical (machine-readable) brain filing rules. The .md companion is the human explainer; this JSON is what `gbrain check-resolvable` audits against. Keep both in sync. It is the default taxonomy: a brain's active schema pack can change it, and where they disagree the pack wins (`gbrain schema show --json`).",
   "rules": [
     {
       "kind": "person",
@@ -146,6 +146,48 @@
       "directory": "conversations/",
       "examples": ["conversations/chatgpt/{thread-slug}.md", "conversations/claude/{thread-slug}.md"],
       "description": "Imported chat exports (ChatGPT, Claude, etc.) where the conversation itself is the artifact. Cross-link concepts and people from the conversation; the conversation page is the source-of-truth for the dialog. Distinct from voice-notes/ (which holds raw voice capture)."
+    },
+    {
+      "kind": "system",
+      "directory": "systems/",
+      "examples": ["machines", "tools", "services"],
+      "description": "A thing the work runs on. Hub page for what is known about it."
+    },
+    {
+      "kind": "gotcha",
+      "directory": "gotchas/",
+      "examples": ["failure modes", "misleading errors"],
+      "description": "One way something breaks and how to recognize it."
+    },
+    {
+      "kind": "decision",
+      "directory": "decisions/",
+      "examples": ["architecture choices", "policy calls"],
+      "description": "A settled choice and why."
+    },
+    {
+      "kind": "issue",
+      "directory": "issues/",
+      "examples": ["open bugs", "known problems"],
+      "description": "Something wrong with something, still open."
+    },
+    {
+      "kind": "todo",
+      "directory": "todos/",
+      "examples": ["planned work", "steps in a plan"],
+      "description": "A plan or a step in a plan."
+    },
+    {
+      "kind": "handoff",
+      "directory": "handoff/",
+      "examples": ["session handoffs", "project state"],
+      "description": "Where work stands and what is next."
+    },
+    {
+      "kind": "clip",
+      "directory": "clips/",
+      "examples": ["web clips", "saved articles"],
+      "description": "Captured outside material."
     }
   ],
   "sources_dir": {

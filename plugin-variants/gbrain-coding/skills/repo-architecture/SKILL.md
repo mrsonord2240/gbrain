@@ -30,8 +30,9 @@ This skill guarantees:
 
 ## Phases
 
-1. **Identify the primary subject.** What would you search for to find this page?
-2. **Walk the decision tree:**
+1. **Read the active pack.** Run `gbrain schema show --json`. Its `filing_rules` and page types are what this brain runs, and they win over the default tree below.
+2. **Identify the primary subject.** What would you search for to find this page?
+3. **Walk the decision tree:**
    - About a person → `people/{name-slug}.md`
    - About a company → `companies/{name-slug}.md`
    - A reusable concept/framework → `concepts/{slug}.md`
@@ -39,8 +40,15 @@ This skill guarantees:
    - A meeting → `meetings/{slug}.md`
    - Media content → `media/{type}/{slug}.md`
    - Raw data import → `sources/{slug}.md`
-3. **Cross-link.** Link from related directories.
-4. **Check notability.** See `skills/conventions/quality.md` notability gate.
+   - A machine, tool or service → `systems/{slug}.md`
+   - One way something breaks → `gotchas/{slug}.md`
+   - A settled choice and why → `decisions/{slug}.md`
+   - Something wrong that is still open → `issues/{slug}.md`
+   - A plan or a step in a plan → `todos/{slug}.md`
+   - Where work stands and what is next → `handoff/{slug}.md`
+   - Captured outside material → `clips/{slug}.md`
+4. **Cross-link.** Link from related directories.
+5. **Check notability.** See `skills/conventions/quality.md` notability gate.
 
 ## Output Format
 
