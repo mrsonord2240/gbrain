@@ -105,16 +105,32 @@ function sanitizeSlug(raw: string): string {
     .join('/');
 }
 
+/**
+ * The types the classifier may choose, one per line. A filing rule sets where
+ * a type goes and says what belongs there; without one, its first prefix is the
+ * directory. A type with neither has nowhere to file to, so it isn't offered.
+ */
+export function triageTypeList(manifest: {
+  page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }>;
+  filing_rules: ReadonlyArray<{ kind: string; directory: string; description?: string }>;
+}): string {
+  const rules = new Map(manifest.filing_rules.map((r) => [r.kind, r]));
+  return manifest.page_types
+    .flatMap((t) => {
+      const rule = rules.get(t.name);
+      const directory = rule?.directory ?? t.path_prefixes[0];
+      if (!directory) return [];
+      return [`- ${t.name} (directory: ${directory})${rule?.description ? `: ${rule.description}` : ''}`];
+    })
+    .join('\n');
+}
+
 async function classifyInboxPage(
   content: string,
   slug: string,
-  pageTypes: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }>,
+  typeList: string,
   model: string,
 ): Promise<TriageDecision> {
-  const typeList = pageTypes
-    .map((t) => `- ${t.name} (directory: ${t.path_prefixes[0] ?? t.name + '/'})`)
-    .join('\n');
-
   const sys = `You file raw captures dropped into a personal knowledge brain's inbox/ into their canonical home.
 
 Available page types (name + the directory its pages live under):
@@ -215,6 +231,7 @@ export async function runPhaseInboxTriage(
   });
 
   const pack = await loadTriagePack(engine, opts.sourceId);
+  const typeList = triageTypeList(pack.manifest);
 
   const putPageOp = operations.find((o) => o.name === 'put_page');
   const deletePageOp = operations.find((o) => o.name === 'delete_page');
@@ -245,7 +262,7 @@ export async function runPhaseInboxTriage(
       const page = await engine.getPage(candidate.slug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
       if (!page) continue;
 
-      const decision = await classifyInboxPage(page.compiled_truth, page.slug, pack.manifest.page_types, model);
+      const decision = await classifyInboxPage(page.compiled_truth, page.slug, typeList, model);
 
       if (decision.confidence !== 'high' || !decision.type || !decision.target_slug) {
         flagged++;
