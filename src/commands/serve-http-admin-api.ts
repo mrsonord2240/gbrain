@@ -587,7 +587,7 @@ function mountAdminKeyApi(app: Express, ctx: ServeHttpContext): void {
   });
 
   mountAdminApiKeys(app, requireAdmin, engine);
-  mountAdminExplore(app, requireAdmin, engine, config);
+  mountAdminExplore(app, requireAdmin, engine, ctx.config);
 }
 
 function mountAdminClientApi(app: Express, ctx: ServeHttpContext): void {

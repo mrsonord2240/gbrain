@@ -160,7 +160,9 @@ export function ExplorePage() {
   const openPage = (slug: string, pageSource?: string) => setOpen({ slug, source: pageSource });
   const activeMode = MODES.find(item => item.id === mode)!;
   const filteredIdeas = run ? run.ideas.filter(idea => !idea.passes).length : 0;
-  const ideas = run ? run.ideas.filter(idea => idea.passes || showFiltered) : [];
+  const ideas = run
+    ? run.ideas.filter(idea => idea.passes || showFiltered).sort((a, b) => (b.judge?.weighted_score ?? 0) - (a.judge?.weighted_score ?? 0))
+    : [];
 
   return <div className="explore">
     <aside className="explore-sidebar" aria-label="Brain contents">
@@ -242,7 +244,7 @@ export function ExplorePage() {
           {run.saved && (run.saved.dbSaved ? ' Saved.' : ' Not saved.')}
         </p>
         {ideas.map(idea => <article className="idea-card" key={idea.id}>
-          <p>{idea.text}</p>
+          <p><Inline text={idea.text} onOpen={slug => openPage(slug)} /></p>
           <p className="result-meta">
             <a className="md-link" onClick={() => openPage(idea.close_slug)}>{idea.close_slug}</a>
             {' × '}
