@@ -73,7 +73,8 @@ describe('chat touchpoint — recipe registry', () => {
     // predicate: Claude Code caches automatically on every model it routes,
     // `--print` runs included. See the recipe for the measurement and
     // test/ai/recipe-claude-cli-prompt-cache.test.ts for the behavior.
-    const ALWAYS_CACHES = new Set(['anthropic', 'deepseek', 'llama-server', 'claude-cli']);
+    // litellm: fork carry, the proxy recipe declares prompt-cache support.
+    const ALWAYS_CACHES = new Set(['anthropic', 'deepseek', 'llama-server', 'claude-cli', 'litellm']);
     for (const r of listRecipes()) {
       if (!r.touchpoints.chat) continue;
       const flag = r.touchpoints.chat.supports_prompt_cache;
