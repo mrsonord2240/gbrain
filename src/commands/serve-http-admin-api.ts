@@ -15,6 +15,7 @@ import { sqlQueryForEngine } from '../core/sql-query.ts';
 import { VERSION } from '../version.ts';
 import { mountAdminApiKeys } from './serve-http-api-keys.ts';
 import { mountAdminClients } from './serve-http-clients.ts';
+import { mountAdminExplore } from './serve-http-explore.ts';
 import { mountAdminRegistration } from './serve-http-registration.ts';
 import { parseAdminGrantRequest, grantHttpStatus, GRANT_TOKEN_IMPLICATIONS, mountAdminGrantDiscovery, mountAdminGrantEdits } from './serve-http-grants.ts';
 import { probeHealth } from './serve-http-metrics.ts';
@@ -586,6 +587,7 @@ function mountAdminKeyApi(app: Express, ctx: ServeHttpContext): void {
   });
 
   mountAdminApiKeys(app, requireAdmin, engine);
+  mountAdminExplore(app, requireAdmin, engine, config);
 }
 
 function mountAdminClientApi(app: Express, ctx: ServeHttpContext): void {

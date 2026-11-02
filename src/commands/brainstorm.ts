@@ -21,6 +21,7 @@ import {
   BRAINSTORM_PROFILE,
   LSD_PROFILE,
   type BrainstormProfile,
+  type BrainstormResult,
 } from '../core/brainstorm/orchestrator.ts';
 import { loadConfig } from '../core/config.ts';
 import { StructuredAgentError } from '../core/errors.ts';
@@ -338,21 +339,31 @@ async function runBrainstormCli(
 
   if (shouldSave) {
     const slug = result.idea_slug ?? freshSlug;
-    const title = `${profile.label === 'lsd' ? 'LSD' : 'Brainstorm'}: ${parsed.question.slice(0, 100)}`;
-    // Build ONE frontmatter object and render via the canonical serializer so
-    // the saved file round-trips through `gbrain sync` byte-for-byte. Include
-    // filtered ideas (onlyPassed:false) so a judge-failed run still shows every
-    // idea; `--resume <run_id>` re-scores and overwrites this same page.
-    const fmObj = { ...buildBrainstormFrontmatterObject(result), source_kind: profile.label };
-    const body = formatBrainstormMarkdown(result, { onlyPassed: false, includeMeta: true });
-    const content = serializeMarkdown(fmObj, body, '', { type: 'note', title, tags: [] });
-
-    const outcome = await persistSavedIdea(engine, { slug, content, provenanceVia: profile.label });
+    const outcome = await saveBrainstormResult(engine, result, profile.label, freshSlug);
     const msg = formatSaveOutcome(outcome, { profileLabel: profile.label, slug });
     if (msg.stdout) console.log(msg.stdout);
     for (const line of msg.stderr) console.error(line);
     if (msg.exitCode) setCliExitVerdict(msg.exitCode);
   }
+}
+
+/** Save a finished run as an idea page under its checkpoint slug, else `freshSlug`. Shared by the CLI and the admin dashboard. */
+export async function saveBrainstormResult(
+  engine: BrainEngine,
+  result: BrainstormResult,
+  label: 'brainstorm' | 'lsd',
+  freshSlug: string,
+): Promise<SaveOutcome> {
+  const slug = result.idea_slug ?? freshSlug;
+  const title = `${label === 'lsd' ? 'LSD' : 'Brainstorm'}: ${result.question.slice(0, 100)}`;
+  // Build ONE frontmatter object and render via the canonical serializer so
+  // the saved file round-trips through `gbrain sync` byte-for-byte. Include
+  // filtered ideas (onlyPassed:false) so a judge-failed run still shows every
+  // idea; `--resume <run_id>` re-scores and overwrites this same page.
+  const fmObj = { ...buildBrainstormFrontmatterObject(result), source_kind: label };
+  const body = formatBrainstormMarkdown(result, { onlyPassed: false, includeMeta: true });
+  const content = serializeMarkdown(fmObj, body, '', { type: 'note', title, tags: [] });
+  return persistSavedIdea(engine, { slug, content, provenanceVia: label });
 }
 
 /** Outcome of persisting a saved idea to both sinks. */

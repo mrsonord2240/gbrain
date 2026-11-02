@@ -43,6 +43,59 @@ async function apiFetchText(path: string) {
   return res.text();
 }
 
+export interface ExploreFacets {
+  sources: Array<{ id: string; name: string; pages: number }>;
+  types: Array<{ type: string; pages: number }>;
+}
+export interface ExploreEntity { slug: string; title: string | null; type: string; source_id: string; backlinks: number }
+export interface ExploreRow { key: string; slug: string | null; title: string; type: string; source_id: string; score: number; date: string | null; snippet: string; stale: boolean }
+export interface ExplorePage {
+  slug: string; title: string; type: string; source_id: string; updated_at: string; body: string;
+  /** null means that section failed to load, which is not the same as empty. */
+  backlinks: Array<{ from_slug: string }> | null;
+  timeline: Array<{ id?: number; date: string; summary: string }> | null;
+  facts: Array<{ id?: number; fact: string }> | null;
+}
+export interface ExploreThinkResult {
+  answer: string; gaps: string[]; warnings: string[]; status: string;
+  citations: Array<{ page_slug: string; source_id?: string | null }>;
+}
+export interface ExploreRunEstimate { estimated_usd: number; model: string; max_cap_usd: number }
+export interface ExploreRunResult {
+  ideas: Array<{ id: string; text: string; close_slug: string; far_slug: string; distance_score: number; passes: boolean; judge?: { weighted_score: number; note: string } }>;
+  judge_failed: boolean;
+  cost: { actual_usd: number };
+  saved: { dbSaved: boolean } | null;
+}
+
+// Long runs answer newline-delimited JSON: progress lines, then one result or error line.
+async function apiStream<T>(path: string, body: unknown, onProgress: (line: string) => void, signal: AbortSignal): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST', credentials: 'same-origin', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (res.status === 401) window.location.hash = '#login';
+  if (!res.ok || !res.body) {
+    const failure = await res.json().catch(() => null);
+    throw new ApiError(typeof failure?.error === 'string' ? failure.error : `HTTP ${res.status}`, res.status);
+  }
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffered = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) throw new ApiError('The run ended without a result.', 502);
+    buffered += value;
+    const lines = buffered.split('\n');
+    buffered = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      if (event.error) throw new ApiError(event.error, 502);
+      if ('result' in event) return event.result as T;
+      if (event.progress) onProgress(event.progress);
+    }
+  }
+}
+
 export const api = {
   oauthRequest: (id: string) => apiFetch(`/admin/api/oauth-requests/${encodeURIComponent(id)}`),
   decideOAuthRequest: (id: string, decision: 'approve' | 'deny', csrf: string, sourceId?: string) =>
@@ -88,4 +141,22 @@ export const api = {
     apiFetchText(`/admin/api/calibration/charts/${encodeURIComponent(type)}${holder ? `?holder=${encodeURIComponent(holder)}` : ''}`),
   // v0.41 D2 — live minion-jobs dashboard snapshot.
   jobsWatch: () => apiFetch('/admin/api/jobs/watch'),
+  exploreFacets: (): Promise<ExploreFacets> => apiFetch('/admin/api/explore/facets'),
+  exploreEntities: (filter: string, source?: string): Promise<ExploreEntity[]> => {
+    const query = new URLSearchParams({ q: filter });
+    if (source) query.set('source', source);
+    return apiFetch(`/admin/api/explore/entities?${query}`);
+  },
+  explorePage: (slug: string, source?: string): Promise<ExplorePage> => {
+    const query = new URLSearchParams({ slug });
+    if (source) query.set('source', source);
+    return apiFetch(`/admin/api/explore/page?${query}`);
+  },
+  exploreSearch: (body: { query: string; mode: 'keyword' | 'hybrid'; source?: string; types?: string[]; offset?: number }): Promise<{ rows: ExploreRow[]; next_offset: number | null }> =>
+    apiFetch('/admin/api/explore/search', { method: 'POST', body: JSON.stringify(body) }),
+  exploreThink: (body: { question: string; source?: string }, onProgress: (line: string) => void, signal: AbortSignal) =>
+    apiStream<ExploreThinkResult>('/admin/api/explore/think', body, onProgress, signal),
+  exploreRunEstimate: (profile: 'brainstorm' | 'lsd'): Promise<ExploreRunEstimate> => apiFetch(`/admin/api/explore/run-estimate?profile=${profile}`),
+  exploreRun: (body: { question: string; profile: 'brainstorm' | 'lsd'; source?: string; max_usd: number; save: boolean }, onProgress: (line: string) => void, signal: AbortSignal) =>
+    apiStream<ExploreRunResult>('/admin/api/explore/run', body, onProgress, signal),
 };

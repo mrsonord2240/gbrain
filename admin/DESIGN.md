@@ -156,3 +156,4 @@
 | 2026-05-03 | Incorporate GStack design DNA | Same family: Inter + JetBrains Mono, dark base, semantic-only color. Diverges on accent (GStack: amber; GBrain: none — data is the color). |
 | 2026-05-03 | Per-client config export tabs | Claude Code, ChatGPT, Claude.ai, Cursor, Perplexity, JSON. Every agent has a copy-paste setup path. |
 | 2026-05-03 | Magic link auth | Login page tells you to ask your agent. No pasting hex strings into forms. |
+| 2026-11-02 | Search page | Sidebar filters by source and type; imported conversations start hidden so they cannot crowd out curated pages. Think, brainstorm and LSD show progress and stay inside a server-side $5 cap. |

@@ -5,16 +5,17 @@ import { AgentsPage } from './pages/Agents';
 import { RequestLogPage } from './pages/RequestLog';
 import { CalibrationPage } from './pages/Calibration';
 import { JobsWatchPage } from './pages/JobsWatch';
+import { ExplorePage } from './pages/Explore';
 import { OAuthConsentPage } from './pages/OAuthConsent';
 import { pendingOAuthRequest } from './lib/oauth-request';
 import { api } from './api';
 
-type Page = 'login' | 'dashboard' | 'agents' | 'log' | 'calibration' | 'jobs' | 'oauth-consent';
+type Page = 'login' | 'dashboard' | 'search' | 'agents' | 'log' | 'calibration' | 'jobs' | 'oauth-consent';
 
 function getPage(): Page {
   const hash = window.location.hash.replace('#', '') || 'dashboard';
   if (pendingOAuthRequest() && hash === 'dashboard') return 'oauth-consent';
-  if (['login', 'dashboard', 'agents', 'log', 'calibration', 'jobs', 'oauth-consent'].includes(hash)) return hash as Page;
+  if (['login', 'dashboard', 'search', 'agents', 'log', 'calibration', 'jobs', 'oauth-consent'].includes(hash)) return hash as Page;
   return 'dashboard';
 }
 
@@ -55,6 +56,8 @@ export function App() {
         <div className="sidebar-nav">
           <a className={`nav-item ${page === 'dashboard' ? 'active' : ''}`}
              onClick={() => navigate('dashboard')}>Dashboard</a>
+          <a className={`nav-item ${page === 'search' ? 'active' : ''}`}
+             onClick={() => navigate('search')}>Search</a>
           <a className={`nav-item ${page === 'agents' ? 'active' : ''}`}
              onClick={() => navigate('agents')}>Agents</a>
           <a className={`nav-item ${page === 'log' ? 'active' : ''}`}
@@ -85,6 +88,7 @@ export function App() {
       </nav>
       <main className="main">
         {page === 'dashboard' && <DashboardPage />}
+        {page === 'search' && <ExplorePage />}
         {page === 'agents' && <AgentsPage />}
         {page === 'log' && <RequestLogPage />}
         {page === 'calibration' && <CalibrationPage />}
