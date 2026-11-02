@@ -41,6 +41,7 @@ import {
   connectionGateEntry,
 } from './checks/db-connection.ts';
 import { ipcSocketPathEntry } from './checks/local-ipc.ts';
+import { functionSearchPathEntry } from './checks/function-search-path.ts';
 import {
   pgvectorEntry,
   rlsEntry,
@@ -94,6 +95,8 @@ import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
 import { grantNewOpsEntry } from './checks/grant-new-ops.ts';
 import { linksExtractionLagEntry, syncFreshnessEntry, searchModeEntry } from './checks/sync-search.ts';
 import { persistenceConsumersEntry, serveBuildDriftEntry } from './checks/persistence-consumers.ts';
+import { ownerHostStaleEntry } from './checks/owner-host-stale.ts';
+import { embeddingPlaneDisagreementEntry } from './checks/embedding-plane.ts';
 import { runtimeBuildSkewEntry } from './checks/runtime-build-skew.ts';
 import { cliSocketRefusalsEntry } from './checks/cli-socket-refusals.ts';
 import { gitConvergenceEntry } from './checks/git-convergence.ts';
@@ -114,14 +117,17 @@ import { plannerStatsEntry } from './checks/planner-stats.ts';
 import { revisionBackfillEntry } from './checks/revision-backfill.ts';
 import { beliefLedgerEntry } from './checks/belief-ledger.ts';
 import { trustTiersEntry } from './checks/trust-tiers.ts';
+import { provenanceStampDriftEntry } from './checks/provenance-stamp-drift.ts';
 import { trustScanEntry } from './checks/trust-scan.ts';
 import { trustSourcesUnclaimedEntry } from './checks/trust-sources-unclaimed.ts';
+import { trustReleaseUnpreviewedEntry } from './checks/trust-release-unpreviewed.ts';
 import { harnessWiringDoctorEntry } from './checks/harness-wiring.ts';
 import { agentContractEntry } from './checks/agent-contract.ts';
 import { chatFallbackChainEntry } from './checks/chat-fallback.ts';
 import { providerConsentEntry } from './checks/provider-consent.ts';
 import { behaviorChangesEntry } from './checks/behavior-changes.ts';
 import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
+import { outsideContentFencesEntry } from './checks/outside-content-fences.ts';
 import { dbAheadOfGitEntry } from './checks/db-ahead-of-git.ts';
 import { gitIndexLagEntry } from './checks/git-index-lag.ts';
 import { syncConfigKeysEntry } from './checks/sync-config-keys.ts';
@@ -136,6 +142,7 @@ import { derivationPurgeSweepsEntry } from './checks/derivation-purge-sweeps.ts'
 import { missingRecordedFilesEntry } from './checks/missing-recorded-files.ts';
 import { uncommittedSyncDeletionsEntry } from './checks/uncommitted-sync-deletions.ts';
 import { overwrittenEditsEntry } from './checks/overwritten-edits.ts';
+import { rowsBehindEntry } from './checks/rows-behind.ts';
 import { managedSyncMovementEntry } from './checks/managed-sync-movement.ts';
 import { managedSyncLatencyEntry } from './checks/managed-sync-latency.ts';
 import { commitNotifierEntry } from './checks/commit-notifier.ts';
@@ -207,6 +214,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   // #7276: the privacy check next, with its own entry budget, before any full scan.
   derivedVisibilityEntry,
   rlsEntry,
+  functionSearchPathEntry,
   schemaVersionEntry,
   rlsEventTriggerEntry,
   embeddingsEntry,
@@ -267,8 +275,10 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   revisionBackfillEntry,
   beliefLedgerEntry,
   trustTiersEntry,
+  provenanceStampDriftEntry,
   trustScanEntry,
   trustSourcesUnclaimedEntry,
+  trustReleaseUnpreviewedEntry,
   coreMemoryEntry,
   persistenceConsumersEntry,
   runtimeBuildSkewEntry,
@@ -286,6 +296,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   uncommittedSyncDeletionsEntry,
   unindexedFilesEntry,
   overwrittenEditsEntry,
+  rowsBehindEntry,
   syncConfigKeysEntry,
   // #6712 PR 4a: the read-only convergence shadow (deep tier: a full level read per source).
   managedSyncConvergenceEntry,
@@ -295,6 +306,11 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   dbAheadOfGitEntry,
   // Git-canonical G3: how far each strict source's index trails the commit at HEAD.
   gitIndexLagEntry,
+  // GBRA-221: live fence rows on imported pages whose body is outside-authored text (review only).
+  outsideContentFencesEntry,
+  // GBRA-248 W0: writes waiting on a long-quiet owner host, and a file plane that disables embeddings over a database with vectors.
+  ownerHostStaleEntry,
+  embeddingPlaneDisagreementEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];

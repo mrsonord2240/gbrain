@@ -41,6 +41,7 @@ import { collapseHotFacts } from './capture-dedup.ts';
 import { proactiveEligibility } from '../eligibility/registry.ts';
 import { partitionForActivation, suppressionSummary } from '../eligibility/activation.ts';
 import { trustFields } from '../eligibility/labels.ts';
+import { quoteFacts } from '../search/transcript-quote.ts';
 import { eligibilityCacheField, readTrustGeneration } from '../eligibility/generation.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { isConfigTruthy } from '../config.ts';
@@ -127,7 +128,7 @@ function cacheSet(key: string, entry: CacheEntry): void {
 export async function getBrainHotMemoryMeta(
   name: string,
   ctx: OperationContext,
-  opts: { topK?: number; ttlMs?: number; sessionOnly?: boolean } = {},
+  opts: { topK?: number; ttlMs?: number; sessionOnly?: boolean; untrusted?: boolean } = {},
 ): Promise<Record<string, unknown> | undefined> {
   // Don't inject on tool calls that themselves manipulate hot memory —
   // the agent doesn't need the brain's hot memory wrapped around its own
@@ -163,6 +164,8 @@ export async function getBrainHotMemoryMeta(
   // fact leak through the cache, not through any query.
   const ttl = Math.max(1000, opts.ttlMs ?? DEFAULT_TTL_MS);
   const sessionOnly = opts.sessionOnly === true;
+  // GST-687: an untrusted (remote MCP) reader gets facts below the owner's tier quoted; it is part of the key.
+  const untrusted = opts.untrusted ?? ctx.remote !== false;
   const topK = Math.max(1, Math.min(opts.topK ?? DEFAULT_TOP_K, 25));
 
   // The watermark and the trust generation are read before the rows, so a
@@ -185,7 +188,7 @@ export async function getBrainHotMemoryMeta(
   }
   // The effective eligibility is part of the key: two connections with
   // different floors never share an entry.
-  const cacheKey = `${engineCacheField(ctx.engine)}::${encodeCacheField(sourceId)}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}::${encodeCacheField(eligibilityCacheField(policy))}::${sessionOnly ? 'session-only' : 'fallback'}`;
+  const cacheKey = `${engineCacheField(ctx.engine)}::${encodeCacheField(sourceId)}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}::${encodeCacheField(eligibilityCacheField(policy))}::${sessionOnly ? 'session-only' : 'fallback'}::${untrusted ? 'quoted' : 'raw'}`;
 
   // Cache hit?
   const cached = _cache.get(cacheKey);
@@ -248,7 +251,8 @@ export async function getBrainHotMemoryMeta(
       source_id: sourceId,
       session_id: sessionId,
       ...(suppressed ? { suppressed } : {}),
-      facts: rows.map(r => ({
+      // #8042: a fact saved from a chat page rides the ambient channel quoted; GST-687: for an untrusted reader, so does a fact below the owner's tier.
+      facts: (await quoteFacts(ctx.engine, rows, untrusted)).map(r => ({
         id: r.id,
         fact: r.fact,
         kind: r.kind,
@@ -269,6 +273,7 @@ export async function getBrainHotMemoryMeta(
         ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
         ...trustFields(r.trust_tier, r.write_origin),
         ...(unconfirmed.has(r.id) ? { unconfirmed: true as const } : {}),
+        ...(r.quoted ? { quoted: r.quoted } : {}),
       })),
     },
   };

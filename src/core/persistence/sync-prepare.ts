@@ -2,6 +2,7 @@ import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { sizeStateField } from '../page-embedding-budget.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { boundedReads } from './bounded-reads.ts';
+import { chunksEmbeddedAsIs } from './noop-kernel.ts';
 import { basename, dirname, join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
@@ -324,7 +325,7 @@ export function screenSyncImport(input: SyncImportScreenInput): { screen: Import
   const newerWorkingTree = !input.companyApproval && !!base && !input.lineEndingOnly && input.rawHash !== sha256(content) && !sameCanonicalImport(base, parsedInput);
   const gateSource = input.writeGateSource;
   const gateTrust = gateSource ? ownerPageTrust({ frontmatter: parsedInput.frontmatter, sourceConfig: gateSource.config, channel: 'managed_sync_import', sourceUri: sourcePath }) : null;
-  const screen = screenImportContent({ content, path: `${slug}.md`, activePack, expectedSlug: resolveSlugForPath(sourcePath), fences: 'coordinated',
+  const screen = screenImportContent({ content, path: `${slug}.md`, activePack, expectedSlug: resolveSlugForPath(sourcePath), fences: 'coordinated', holdNoncanonicalPrivate: true,
     ...(input.normalize === false ? { normalize: false } : {}),
     slugExempt: declared => snapshot?.page.source_path != null && syncOriginPath(snapshot.page.source_path) === syncOriginPath(sourcePath) && declared === snapshot.page.slug,
     slugConflictMessage: (found, expected) => frontmatterSlugConflictMessage(sourcePath, found, expected),
@@ -468,13 +469,13 @@ async function prepareManagedSyncCode(engine: BrainEngine, row: WriteRequest, p:
  * #6712 PR 1: the import provenance a code or image publication records in its transaction, as a Markdown import records
  * its own: the page's revision after the write, the bytes on disk (the file: neither writes one back) and the parser.
  */
-function syncFileProvenance(row: WriteRequest, p: SyncIntent, root: string, rawSha256: string): (tx: BrainEngine) => Promise<void> {
+function syncFileProvenance(row: WriteRequest, p: SyncIntent, root: string, imported: Buffer): (tx: BrainEngine) => Promise<void> {
   return async tx => {
     const final = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
     if (!final || final.page.deleted_at != null) return;
     await recordSyncImportProvenance(tx, { source_id: row.source_id, incarnation: row.source_incarnation, page_id: Number(final.page.id), origin: p.sourcePath!,
-      raw_sha256: rawSha256, ...(p.blobOid ? { blob_oid: p.blobOid } : {}), working: p.working === true, gbrain_version: VERSION, revision: final.revision,
-      parser: syncImportParserFor(p.sourcePath!, null), ...syncDiskProvenance(syncDiskBytes(root, p.path!, p.content!, p.rawHash), p.target) });
+      raw_sha256: sha256(imported), ...(p.blobOid ? { blob_oid: p.blobOid } : {}), working: p.working === true, gbrain_version: VERSION, revision: final.revision,
+      parser: syncImportParserFor(p.sourcePath!, null), ...syncDiskProvenance(syncDiskBytes(root, p.path!, imported, p.rawHash), p.target) });
   };
 }
 
@@ -498,9 +499,18 @@ function publishedSyncNoop(row: WriteRequest, p: SyncIntent, root: string, snaps
     } };
 }
 
-/** The bytes on disk of an import that writes no file back: its frozen content when that is the file (raw hash), else the file read now (null: absent). */
-export function syncDiskBytes(root: string, path: string, content: string, rawHash: string | null): Uint8Array | null {
-  return rawHash !== null && rawHash === sha256(content) ? Buffer.from(content) : readSyncFile(root, path);
+/**
+ * The bytes on disk of an import that writes no file back, as its provenance records them: the imported bytes when they
+ * are the file (raw hash), else the file read now (null: absent) when it holds those bytes up to line endings. #8071: any
+ * other file bytes are not what the page holds; the record names the imported bytes instead, or a later commit of the
+ * newer bytes would classify `fileSame` and never be imported.
+ */
+export function syncDiskBytes(root: string, path: string, imported: Buffer, rawHash: string | null): Uint8Array | null {
+  if (rawHash !== null && rawHash === sha256(imported)) return imported;
+  const disk = readSyncFile(root, path);
+  if (!disk || disk.equals(imported)) return disk;
+  const text = disk.toString('utf8'), lf = (value: string) => value.replace(/\r\n/g, '\n');
+  return disk.equals(Buffer.from(text)) && lf(text) === lf(imported.toString('utf8')) ? disk : imported;
 }
 
 /** A pass's stamp is refused because the pass no longer holds the source (its lease went, or another pass pinned since). */
@@ -548,6 +558,7 @@ export async function publishPassStamp(tx: BrainEngine, row: WriteRequest, p: Sy
     if (pinned) throw syncPublicationRefusal('slug_root_mode_mismatch', `The source pins slug_root_mode=${pinned}, but this sync ran under ${p.slugMode}.`, row, p, slugModeMismatchCause(row.source_id, pinned, p.slugMode));
     if (!changed.length) throw syncPublicationRefusal('revision_conflict', CHECKPOINT_MOVED_MESSAGE, row, p,
       `Another sync moved the commit checkpoint of ${row.source_id} while this pass published.`);
+    // The closed episode re-imported every page except those already at the current chunker (sync-classify.ts `inPlace`).
     if (stamp.stampChunker) await tx.executeRaw('UPDATE sources SET chunker_version=$2 WHERE id=$1', [row.source_id, chunkerStamp()]);
   }
   await recordPassTail(tx, row.source_id, p.passId!, { changed: read.changed, extract: stamp.extract, ...(stamp.since ? { since: stamp.since } : {}) });
@@ -620,7 +631,8 @@ async function applyManagedSyncCheckpoint(tx: BrainEngine, row: WriteRequest, p:
   if (!changed.length) throw syncPublicationRefusal('revision_conflict', CHECKPOINT_MOVED_MESSAGE, row, p,
     `Another sync moved the commit checkpoint of ${row.source_id} while this run published.`);
   await recordSliceCursor(tx, row, p, settled);
-  // #5566: a full walk re-chunked every stale page, so acknowledge the chunker version as the legacy gate does.
+  // #5566: a full walk re-chunked every stale page, so acknowledge the chunker version as the legacy gate does. (A pass's
+  // full episode stamps through its own checkpoint, above; the pages it admits without a reparse are already current.)
   if (settled && (p.from === null || p.syncOptions?.full === true)) await tx.executeRaw('UPDATE sources SET chunker_version=$2 WHERE id=$1', [row.source_id, chunkerStamp()]);
   await tx.executeRaw("UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0,done}','true'::jsonb),updated_at=now() WHERE op='managed-sync' AND fingerprint=$1", [p.cursorKey]);
   // #6712 PR 2 (L5): the tail (statistics, links) runs after the lease is released; it is owed from this commit on.
@@ -812,11 +824,11 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
   if (isImageFilePath(p.sourcePath)) {
     return prepareManagedSyncImage(engine, row, { content: p.content, sourcePath: p.sourcePath, path: p.path, rawHash: p.rawHash, lineEndingOnly: p.lineEndingOnly },
       { root, snapshot, ...(moved && moved.slug !== row.slug ? { renamedFrom: { slug: moved.slug } } : {}), noEmbed: p.processingOptions?.noEmbed === true || p.embedDeferred === true, companyApproval: !!p.companyApproval, validate, releaseHold, clock, screening: !!screening,
-        recordProvenance: syncFileProvenance(row, p, root, sha256(Buffer.from(p.content, 'base64'))),
+        recordProvenance: syncFileProvenance(row, p, root, Buffer.from(p.content, 'base64')),
         refuse: (code, message, cause) => syncPublicationRefusal(code, message, row, p, cause) });
   }
   if (isCodeFilePath(p.sourcePath)) return prepareManagedSyncCode(engine, row, { content: p.content, sourcePath: p.sourcePath, rawHash: p.rawHash, lineEndingOnly: p.lineEndingOnly, companyApproval: !!p.companyApproval },
-    { snapshot, validate, releaseHold, recordProvenance: syncFileProvenance(row, p, root, sha256(p.content)), clock, refuse: (code, message, cause) => syncPublicationRefusal(code, message, row, p, cause), contentRefusal: refusal => syncContentRefusal(refusal, row, p) });
+    { snapshot, validate, releaseHold, recordProvenance: syncFileProvenance(row, p, root, Buffer.from(p.content)), clock, refuse: (code, message, cause) => syncPublicationRefusal(code, message, row, p, cause), contentRefusal: refusal => syncContentRefusal(refusal, row, p) });
   const schema = p.companyApproval?.schema;
   if (schema && p.processingOptions?.noSchemaPack) throw syncPublicationRefusal('profile_incompatible', 'Company source approval requires its pinned schema pack.', row,
     { ...p, processingOptions: { ...p.processingOptions!, noSchemaPack: false } },
@@ -910,7 +922,7 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
     pageUnchanged: ready.noop && !moved,
     ...(renamed ? { additionalPageKeys: [{ sourceId: row.source_id, slug: renamed.slug }] } : {}),
     validate: async tx => { await validate(tx); await ready.validate(tx); },
-    deferEmbedding: p.processingOptions?.noEmbed || p.embedDeferred === true,
+    deferEmbedding: p.processingOptions?.noEmbed || p.embedDeferred === true, ...(!(p.processingOptions?.noEmbed || p.embedDeferred === true) && ready.noop && !moved && snapshot && await chunksEmbeddedAsIs(engine, snapshot.page.id) ? { embeddingCurrent: true } : {}),
     ...(ready.afterCommit || renamed ? { afterCommit: async (target: BrainEngine) => { await published.afterCommit?.(target); } } : {}),
     ...(writeback ? { file: { root, path: join(root, p.path), content: canonicalFile, expectedBeforeHash: p.rawHash } } : {}),
     ...(mirrorReadOnly ? { databaseOnlyReason: 'mirror_read_only' as const } : {}),
@@ -955,7 +967,7 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
         },
         () => releaseHold(tx),
         async () => { if (final) await recordSyncImportProvenance(tx, { ...importProvenance, page_id: Number(final.page.id), revision: final.revision,
-          ...syncDiskProvenance(writeback ? Buffer.from(canonicalFile) : syncDiskBytes(root, p.path!, p.content!, p.rawHash), p.target) }); },
+          ...syncDiskProvenance(writeback ? Buffer.from(canonicalFile) : syncDiskBytes(root, p.path!, Buffer.from(p.content!), p.rawHash), p.target) }); },
       ]);
       preparedImport.postimage = final;
       const writeState = applied.noop ? {} : await syncWriteState(tx, row, live?.page, installed?.segmented, applied.parsedPage?.frontmatter);

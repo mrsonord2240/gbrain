@@ -7,9 +7,67 @@ import { isFrontmatterHoldMessage } from '../markdown.ts';
 import { fenceLocationFromMessage, fenceWhere } from '../fence-repair/refusal.ts';
 import { FACT_WITHDRAWN_SUGGESTION } from '../facts/withdrawal.ts';
 import { CHECKPOINT_MOVED_MESSAGE } from './sync-slug-mode.ts';
+import { PAGE_CHANGED_AFTER_READ_MESSAGE } from '../page-state/types.ts';
+import { readFix } from '../ops/op-fix.ts';
+import { ERROR_CATALOGUE } from '../error-catalogue.ts';
+import { SOURCE_CHECKOUT_MISSING, type CheckoutRefusalOrigin } from './publication-failure.ts';
+import { ownershipRecordNotPrivateError, physicalRootDirectoryChangedError } from './physical-root-record.ts';
+
+/** GST-465: a page write to a source whose canonical checkout is missing on this host. The path is left to the read-only fix, which a remote caller cannot run. */
+export function sourceCheckoutMissingRefusal(sourceId: string, slug: string | null): OperationError {
+  return opError('recovery_required', `The canonical checkout of source '${sourceId}' is missing on this host, so ${slug ? `the file of ${slug}` : 'the page file'} was not written.`,
+    'Nothing was written. Restore the checkout at the path the command in fix shows (from a backup or the machine it came from), then submit again with a new request_id; an empty directory recreated there does not help. How to recover the source is the user\'s decision.',
+    { detail: SOURCE_CHECKOUT_MISSING, docs: ERROR_CATALOGUE.source_checkout_missing.docs,
+      fix: readFix(`Shows source ${sourceId}'s canonical binding and the checkout path this host registered for it, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] }) });
+}
+
+/**
+ * GST-465: the classified exit of a page write refused because of the checkout itself, rebuilt from the origin its receipt
+ * keeps. Re-stamping a recreated checkout and restoring a record's mode stay the owner's deliberate acts on the brain host:
+ * the check exists to catch a swapped checkout, so the agent tells the user and never runs them itself.
+ */
+export function storedCheckoutRefusal(origin: unknown, sourceId: string, slug: string | null): OperationError | undefined {
+  if (origin === SOURCE_CHECKOUT_MISSING) return sourceCheckoutMissingRefusal(sourceId, slug);
+  if (origin === 'ownership_record_not_private') {
+    const error = ownershipRecordNotPrivateError();
+    error.fix = { argv: ['gbrain', 'doctor', '--only', 'foreign_ownership_marker'], consent: [], actor: 'user', requires_exclusive: false,
+      why: 'Read-only on the brain host: names each ownership record other users can read and the chmod 600 that makes it private again.' };
+    error.docs = 'docs/guides/write-refusals.md#ownership_record_not_private';
+    return error;
+  }
+  if (origin !== ('physical_root_directory_changed' satisfies CheckoutRefusalOrigin)) return undefined;
+  const state = { name: 'admin_state', how: `admin_state from gbrain sources writer status ${sourceId} --json on the brain host, read again before each phase` };
+  const intent = (phase: string) => ['--self-transfer', '--confirm-relocated-root', '--admin-intent', `writer_transfer_${phase}`, '--expected-state', '<admin_state>'];
+  return Object.assign(physicalRootDirectoryChangedError(), {
+    suggestion: 'Nothing was written. Only if the checkout was restored, copied or recreated at its recorded path on purpose, the brain host\'s owner re-stamps it with the relocated-root self-transfer in fix, then you submit again with a new request_id. Never remove the ownership records to get past this.',
+    docs: 'docs/guides/write-refusals.md#recreated-root',
+    fix: { argv: ['gbrain', 'sources', 'writer', 'transfer', 'prepare', sourceId, ...intent('prepare')], inputs: [state], consent: [], actor: 'user', requires_exclusive: false,
+      why: 'Owner only, after confirming the move was deliberate: records the manifest of the directory now at the recorded path. The identity check exists to catch a swapped checkout.',
+      then: { argv: ['gbrain', 'sources', 'writer', 'transfer', 'accept', sourceId, '--path', '<checkout root>', '--expected-epoch', '<owner_epoch>', '--manifest', '<manifest digest printed by prepare>', ...intent('accept')],
+        inputs: [state, { name: 'checkout root', how: 'the local_path writer status prints for the source' }, { name: 'owner_epoch', how: 'the owner_epoch prepare printed' }],
+        consent: [], actor: 'user', requires_exclusive: false, why: 'Re-stamps the checkout identity at the same path; page writes publish again after it.' } } satisfies Action });
+}
 
 /** The refusal of a fact-batch completion request whose per-entity requests did not all commit (facts-prepare.ts). */
 export const FACTS_BATCH_INCOMPLETE_MESSAGE = 'Some extracted facts have not committed.';
+/** facts-prepare.ts: an entity request admitted at a revision another write moved (or a deleted or replaced entity page). */
+export const FACTS_ENTITY_CHANGED_MESSAGE = 'The fact entity changed after extraction admission.';
+export const FACTS_ENTITY_CHANGED_IN_PREPARATION_MESSAGE = 'The fact entity changed during preparation.';
+export const FACTS_DEDUP_CHANGED_MESSAGE = 'The fact deduplication state changed before publication.';
+/** The coordinator's refusal when the page moved between preparation and publication (coordinator.ts, group-publish.ts), also
+ * thrown when a staged large file no longer matches its stage (large-file.ts); fact requests never stage large files. */
+export const PAGE_CHANGED_DURING_PREPARATION_MESSAGE = 'The page changed during preparation.';
+/**
+ * #7602: entity request refusals a follow-up batch re-admits at the entity's current revision (facts-maintenance.ts), and
+ * that `gbrain repair failed-writes` lists. Stored receipts are matched by this exact text, so never reword these messages.
+ * PAGE_CHANGED_AFTER_READ_MESSAGE is how a move during preparation was stored before the fix.
+ */
+export const FACTS_ENTITY_MOVED_MESSAGES: readonly string[] = [FACTS_ENTITY_CHANGED_MESSAGE, FACTS_ENTITY_CHANGED_IN_PREPARATION_MESSAGE, FACTS_DEDUP_CHANGED_MESSAGE,
+  PAGE_CHANGED_DURING_PREPARATION_MESSAGE, PAGE_CHANGED_AFTER_READ_MESSAGE];
+
+export function isEntityMovedRefusal(row: { error_code: string | null; error_message: string | null }): boolean {
+  return row.error_code === 'revision_conflict' && FACTS_ENTITY_MOVED_MESSAGES.includes(row.error_message ?? '');
+}
 
 const FRONTMATTER_SLUG_CONFLICT = /^The frontmatter slug "[^"\n]{1,300}" in [^/"\n][^"\n]{0,1000} conflicts with its path, which expects slug "[^"\n]{1,300}"\. Remove `slug:` or make it match the path\.$/;
 

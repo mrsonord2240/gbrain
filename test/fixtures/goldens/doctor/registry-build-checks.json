@@ -358,6 +358,10 @@
         "name": "rls"
       },
       {
+        "category": "ops",
+        "name": "function_search_path"
+      },
+      {
         "category": "meta",
         "name": "schema_version"
       },
@@ -576,6 +580,10 @@
       {
         "category": "brain",
         "name": "captured_facts_active"
+      },
+      {
+        "category": "brain",
+        "name": "agent_session_facts"
       },
       {
         "category": "brain",
@@ -895,11 +903,19 @@
       },
       {
         "category": "brain",
+        "name": "provenance_stamp_drift"
+      },
+      {
+        "category": "brain",
         "name": "trust_scan"
       },
       {
         "category": "brain",
         "name": "trust_sources_unclaimed"
+      },
+      {
+        "category": "brain",
+        "name": "trust_release_unpreviewed_fields"
       },
       {
         "category": "brain",
@@ -982,6 +998,10 @@
         "name": "sync_overwritten_db_edits"
       },
       {
+        "category": "brain",
+        "name": "sync_rows_behind_checkpoint"
+      },
+      {
         "category": "meta",
         "name": "sync_config_keys"
       },
@@ -1000,6 +1020,18 @@
       {
         "category": "brain",
         "name": "git_index_lag"
+      },
+      {
+        "category": "brain",
+        "name": "outside_content_fences"
+      },
+      {
+        "category": "ops",
+        "name": "owner_host_stale"
+      },
+      {
+        "category": "brain",
+        "name": "embedding_plane_disagreement"
       },
       {
         "category": "brain",

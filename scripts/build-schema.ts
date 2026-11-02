@@ -29,6 +29,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL } from '../src/core/company-brain/receipt-schema.ts';
 import { FTS_INPUT_FUNCTION_SQL } from '../src/core/fts-language.ts';
+import { PAGE_RETRIEVALS_FORGET_FUNCTION_SQL } from '../src/core/derived-state-maintainers.ts';
 import { FACT_WITHDRAWAL_SCHEMA_STATEMENTS } from '../src/core/facts/withdrawal-schema.ts';
 import { GRANT_AUDIT_SCHEMA_SQL } from '../src/core/grants/schema.ts';
 import { LEASE_TOKEN_SCHEMA_SQL } from '../src/core/lease-schema.ts';
@@ -48,6 +49,7 @@ import { FACT_PURGE_LOOKUP_INDEX_SQL, MEMORY_PURGE_SCHEMA_SQL } from '../src/cor
 import { WRITE_GATE_SCHEMA_SQL } from '../src/core/write-gate-schema.ts';
 import { BELIEF_LEDGER_SCHEMA_SQL } from '../src/core/belief/schema.ts';
 import { GIT_CANONICAL_SCHEMA_SQL } from '../src/core/persistence/git-canonical-schema.ts';
+import { FUNCTION_SEARCH_PATH_HARDENING_SQL } from '../src/core/function-search-path.ts';
 
 const REPO = resolve(import.meta.dir, '..');
 export const SCHEMA_SQL_PATH = 'src/schema.sql';
@@ -80,6 +82,7 @@ const persistenceSql = (statements: readonly string[]) => `${statements.join(';\
 export const FRAGMENTS: readonly Fragment[] = [
   { source: 'src/core/page-body/schema.ts', expr: 'PAGE_GENERATION_BUMP_FN_SQL', postgres: PAGE_GENERATION_BUMP_FN_SQL, pglite: PAGE_GENERATION_BUMP_FN_SQL },
   { source: 'src/core/fts-language.ts', expr: 'FTS_INPUT_FUNCTION_SQL', postgres: FTS_INPUT_FUNCTION_SQL, pglite: FTS_INPUT_FUNCTION_SQL },
+  { source: 'src/core/derived-state-maintainers.ts', expr: 'PAGE_RETRIEVALS_FORGET_FUNCTION_SQL', postgres: PAGE_RETRIEVALS_FORGET_FUNCTION_SQL, pglite: PAGE_RETRIEVALS_FORGET_FUNCTION_SQL },
   { source: 'src/core/grants/schema.ts', expr: 'GRANT_AUDIT_SCHEMA_SQL', postgres: GRANT_AUDIT_SCHEMA_SQL, pglite: GRANT_AUDIT_SCHEMA_SQL },
   {
     source: 'src/core/facts/withdrawal-schema.ts',
@@ -118,6 +121,9 @@ export const FRAGMENTS: readonly Fragment[] = [
   { source: 'src/core/write-gate-schema.ts', expr: 'WRITE_GATE_SCHEMA_SQL', postgres: WRITE_GATE_SCHEMA_SQL, pglite: WRITE_GATE_SCHEMA_SQL },
   { source: 'src/core/questions/schema.ts', expr: 'PINNED_QUESTIONS_SCHEMA_SQL', postgres: PINNED_QUESTIONS_SCHEMA_SQL, pglite: PINNED_QUESTIONS_SCHEMA_SQL },
   { source: 'src/core/belief/schema.ts', expr: 'BELIEF_LEDGER_SCHEMA_SQL', postgres: BELIEF_LEDGER_SCHEMA_SQL, pglite: BELIEF_LEDGER_SCHEMA_SQL },
+  // Its region must stay the last statement of src/schema.sql (regions render where their markers sit, not in this
+  // array's order): a replay's CREATE OR REPLACE resets each function's search_path, so pg_temp is appended after every one (#7632).
+  { source: 'src/core/function-search-path.ts', expr: 'FUNCTION_SEARCH_PATH_HARDENING_SQL', postgres: FUNCTION_SEARCH_PATH_HARDENING_SQL, pglite: FUNCTION_SEARCH_PATH_HARDENING_SQL },
 ];
 
 const fragmentLabel = (f: Fragment) => `${f.source} (${f.expr})`;

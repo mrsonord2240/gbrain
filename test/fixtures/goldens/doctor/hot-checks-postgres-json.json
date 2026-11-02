@@ -285,7 +285,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "Bun <bun-version> (minimum 1.4.0)",
+            "message": "Bun <bun-version> (minimum 1.4.4)",
             "name": "bun_runtime",
             "status": "ok"
           },
@@ -443,7 +443,7 @@
               "next": "report",
               "requires_exclusive": false,
               "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
-              "why": "Register `<absolute path to gbrain> serve --surface full` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+              "why": "Register `<absolute path to gbrain> serve --surface starter --advertise verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
             },
             "message": "No agent harness was detected. Wire one when the user picks an agent app.",
             "name": "harness_wiring",
@@ -568,6 +568,7 @@
                 "window_days": 1
               },
               "inspected": 2,
+              "outstanding": [],
               "paused_producers": [],
               "resources": [],
               "truncated": false,
@@ -1117,6 +1118,13 @@
             "status": "ok"
           },
           {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
+            "message": "Every gbrain function that pins a search_path ends it with pg_temp",
+            "name": "function_search_path",
+            "status": "ok"
+          },
+          {
             "category": "meta",
             "elapsed_ms": "<volatile>",
             "message": "Version <latest> (latest: <latest>)",
@@ -1474,6 +1482,10 @@
                 },
                 {
                   "name": "persistence_requests_request_id",
+                  "state": "valid"
+                },
+                {
+                  "name": "persistence_requests_foreground_committed",
                   "state": "valid"
                 }
               ],
@@ -2009,6 +2021,21 @@
             "elapsed_ms": "<volatile>",
             "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
             "name": "captured_facts_active",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "ambiguous": 0,
+              "docs": "docs/guides/repair.md#agent-session-facts",
+              "evidenced": 0,
+              "excluded": 0,
+              "repair": "agent-session-facts",
+              "unclassifiable": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No active owner-attributed fact from an agent-launched session remains.",
+            "name": "agent_session_facts",
             "status": "ok"
           },
           {
@@ -3300,11 +3327,24 @@
                   "table": "timeline_entries"
                 }
               ],
+              "unknown_pages": 1,
               "unknown_pct": 10
             },
             "elapsed_ms": "<volatile>",
-            "message": "10% of 30 row(s) have an unverified origin (unknown tier); the backfill has classified every row it has a signal for.",
+            "message": "10% of 30 row(s) have an unverified origin (unknown tier); the backfill has classified every row it has a signal for. Remote MCP readers see the 1 unverified-origin page(s) quoted as source material until the backfill classifies them or the owner claims their source (gbrain trust claim-sources); local reads are unchanged.",
             "name": "trust_tiers",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/repair.md#provenance",
+              "sources": [],
+              "truncated": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No page has provenance stamps or a trust marker that another writer removed.",
+            "name": "provenance_stamp_drift",
             "status": "ok"
           },
           {
@@ -3335,6 +3375,17 @@
             "elapsed_ms": "<volatile>",
             "message": "No unclaimed source holds rows from before trust tiers.",
             "name": "trust_sources_unclaimed",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "items": [],
+              "total": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No released fact was confirmed with fence-row fields its release preview did not show.",
+            "name": "trust_release_unpreviewed_fields",
             "status": "ok"
           },
           {
@@ -3724,6 +3775,65 @@
             "status": "ok"
           },
           {
+            "category": "brain",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/repair.md#rows-behind",
+              "sources": [
+                {
+                  "behind": 0,
+                  "checkpoint": null,
+                  "complete": true,
+                  "counts": {},
+                  "pages": 0,
+                  "reason": "no_checkpoint",
+                  "samples": [],
+                  "source_id": "default",
+                  "status": "not_applicable",
+                  "stopped_at": null,
+                  "unproven": 0,
+                  "unproven_samples": []
+                },
+                {
+                  "behind": 0,
+                  "checkpoint": "<fixture-head>",
+                  "complete": true,
+                  "counts": {
+                    "current": 18,
+                    "database_moved": 1
+                  },
+                  "pages": 19,
+                  "samples": [],
+                  "source_id": "notes",
+                  "status": "known",
+                  "stopped_at": null,
+                  "unproven": 0,
+                  "unproven_samples": []
+                },
+                {
+                  "behind": 0,
+                  "checkpoint": null,
+                  "complete": true,
+                  "counts": {},
+                  "pages": 0,
+                  "reason": "no_checkpoint",
+                  "samples": [],
+                  "source_id": "plain",
+                  "status": "not_applicable",
+                  "stopped_at": null,
+                  "unproven": 0,
+                  "unproven_samples": []
+                }
+              ],
+              "timeout_ms": "<volatile>",
+              "unproven": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every file-backed page holds its file as of the sync checkpoint (19 page(s) read).",
+            "name": "sync_rows_behind_checkpoint",
+            "status": "ok"
+          },
+          {
             "category": "meta",
             "details": {
               "rollback": [],
@@ -3806,6 +3916,44 @@
             "elapsed_ms": "<volatile>",
             "message": "No source is strict (git-canonical), so no index trails a commit.",
             "name": "git_index_lag",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/repair.md#outside-content-fences",
+              "items": [],
+              "pages": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No fact, take or link is indexed from a fence on an imported email, calendar, GitHub or transcript page.",
+            "name": "outside_content_fences",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/troubleshooting.md#owner-host-stale",
+              "stale": [],
+              "stale_after_ms": "<volatile>"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No managed write is waiting on an owner host.",
+            "name": "owner_host_stale",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "database_disabled": false,
+              "docs": "docs/guides/troubleshooting.md#embedding-plane-disagreement",
+              "file_disabled": true,
+              "vector_tables": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The config file disables embeddings and the database holds no vectors.",
+            "name": "embedding_plane_disagreement",
             "status": "ok"
           },
           {
@@ -5021,7 +5169,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "Bun <bun-version> (minimum 1.4.0)",
+            "message": "Bun <bun-version> (minimum 1.4.4)",
             "name": "bun_runtime",
             "status": "ok"
           },
@@ -5179,7 +5327,7 @@
               "next": "report",
               "requires_exclusive": false,
               "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
-              "why": "Register `<absolute path to gbrain> serve --surface full` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+              "why": "Register `<absolute path to gbrain> serve --surface starter --advertise verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
             },
             "message": "No agent harness was detected. Wire one when the user picks an agent app.",
             "name": "harness_wiring",
@@ -5304,6 +5452,7 @@
                 "window_days": 1
               },
               "inspected": 2,
+              "outstanding": [],
               "paused_producers": [],
               "resources": [],
               "truncated": false,
@@ -5853,6 +6002,13 @@
             "status": "ok"
           },
           {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
+            "message": "Every gbrain function that pins a search_path ends it with pg_temp",
+            "name": "function_search_path",
+            "status": "ok"
+          },
+          {
             "category": "meta",
             "elapsed_ms": "<volatile>",
             "message": "Version <latest> (latest: <latest>)",
@@ -6210,6 +6366,10 @@
                 },
                 {
                   "name": "persistence_requests_request_id",
+                  "state": "valid"
+                },
+                {
+                  "name": "persistence_requests_foreground_committed",
                   "state": "valid"
                 }
               ],
@@ -6745,6 +6905,21 @@
             "elapsed_ms": "<volatile>",
             "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
             "name": "captured_facts_active",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "ambiguous": 0,
+              "docs": "docs/guides/repair.md#agent-session-facts",
+              "evidenced": 0,
+              "excluded": 0,
+              "repair": "agent-session-facts",
+              "unclassifiable": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No active owner-attributed fact from an agent-launched session remains.",
+            "name": "agent_session_facts",
             "status": "ok"
           },
           {
@@ -8036,11 +8211,24 @@
                   "table": "timeline_entries"
                 }
               ],
+              "unknown_pages": 1,
               "unknown_pct": 12.9
             },
             "elapsed_ms": "<volatile>",
-            "message": "12.9% of 31 row(s) have an unverified origin (unknown tier); the backfill has classified every row it has a signal for.",
+            "message": "12.9% of 31 row(s) have an unverified origin (unknown tier); the backfill has classified every row it has a signal for. Remote MCP readers see the 1 unverified-origin page(s) quoted as source material until the backfill classifies them or the owner claims their source (gbrain trust claim-sources); local reads are unchanged.",
             "name": "trust_tiers",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/repair.md#provenance",
+              "sources": [],
+              "truncated": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No page has provenance stamps or a trust marker that another writer removed.",
+            "name": "provenance_stamp_drift",
             "status": "ok"
           },
           {
@@ -8071,6 +8259,17 @@
             "elapsed_ms": "<volatile>",
             "message": "No unclaimed source holds rows from before trust tiers.",
             "name": "trust_sources_unclaimed",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "items": [],
+              "total": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No released fact was confirmed with fence-row fields its release preview did not show.",
+            "name": "trust_release_unpreviewed_fields",
             "status": "ok"
           },
           {
@@ -8460,6 +8659,65 @@
             "status": "ok"
           },
           {
+            "category": "brain",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/repair.md#rows-behind",
+              "sources": [
+                {
+                  "behind": 0,
+                  "checkpoint": null,
+                  "complete": true,
+                  "counts": {},
+                  "pages": 0,
+                  "reason": "no_checkpoint",
+                  "samples": [],
+                  "source_id": "default",
+                  "status": "not_applicable",
+                  "stopped_at": null,
+                  "unproven": 0,
+                  "unproven_samples": []
+                },
+                {
+                  "behind": 0,
+                  "checkpoint": "<fixture-head>",
+                  "complete": true,
+                  "counts": {
+                    "current": 18,
+                    "database_moved": 1
+                  },
+                  "pages": 19,
+                  "samples": [],
+                  "source_id": "notes",
+                  "status": "known",
+                  "stopped_at": null,
+                  "unproven": 0,
+                  "unproven_samples": []
+                },
+                {
+                  "behind": 0,
+                  "checkpoint": null,
+                  "complete": true,
+                  "counts": {},
+                  "pages": 0,
+                  "reason": "no_checkpoint",
+                  "samples": [],
+                  "source_id": "plain",
+                  "status": "not_applicable",
+                  "stopped_at": null,
+                  "unproven": 0,
+                  "unproven_samples": []
+                }
+              ],
+              "timeout_ms": "<volatile>",
+              "unproven": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every file-backed page holds its file as of the sync checkpoint (19 page(s) read).",
+            "name": "sync_rows_behind_checkpoint",
+            "status": "ok"
+          },
+          {
             "category": "meta",
             "details": {
               "rollback": [],
@@ -8542,6 +8800,44 @@
             "elapsed_ms": "<volatile>",
             "message": "No source is strict (git-canonical), so no index trails a commit.",
             "name": "git_index_lag",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/repair.md#outside-content-fences",
+              "items": [],
+              "pages": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No fact, take or link is indexed from a fence on an imported email, calendar, GitHub or transcript page.",
+            "name": "outside_content_fences",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/troubleshooting.md#owner-host-stale",
+              "stale": [],
+              "stale_after_ms": "<volatile>"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No managed write is waiting on an owner host.",
+            "name": "owner_host_stale",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "database_disabled": false,
+              "docs": "docs/guides/troubleshooting.md#embedding-plane-disagreement",
+              "file_disabled": true,
+              "vector_tables": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The config file disables embeddings and the database holds no vectors.",
+            "name": "embedding_plane_disagreement",
             "status": "ok"
           },
           {
