@@ -20,7 +20,9 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
   // A configured brain that can't be reached is a failed cycle once those
   // phases finish: a scheduled run must not read as success. With no
   // config there is no database to miss, so that run stays exit 0.
-  const { runDream } = await import('../../commands/dream.ts');
+  const { runDream, enforceDreamDailyCap } = await import('../../commands/dream.ts');
+  // Fork: refuse past the daily cap before opening any DB connection.
+  enforceDreamDailyCap(args);
   let eng: BrainEngine | null = null;
   let databaseUnreachable = false;
   try {

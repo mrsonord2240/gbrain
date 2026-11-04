@@ -39,3 +39,11 @@ if (!process.env.GBRAIN_HOME) {
     console.error(`[gbrain-home-preload] GBRAIN_HOME=${dir}`);
   }
 }
+
+// Fork: the dream daily cap (src/core/dream-quota.ts) keeps a per-day ledger
+// in GBRAIN_HOME. Unit tests run dream many times in one process against the
+// same scratch home, so the cap is off for the lane; test/dream-daily-cap.test.ts
+// turns it back on for itself.
+if (process.env.GBRAIN_TEST_DREAM_CAP_OFF === undefined) {
+  process.env.GBRAIN_TEST_DREAM_CAP_OFF = '1';
+}
