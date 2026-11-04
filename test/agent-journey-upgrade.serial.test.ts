@@ -90,7 +90,7 @@ function childEnv(h: DoctorHome, extra: Record<string, string | undefined> = {})
   for (const k of ['DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_REMOTE_CLIENT_SECRET', 'GBRAIN_PGLITE_SNAPSHOT', 'GBRAIN_SKILLS_DIR', 'GBRAIN_SOURCE',
     'GBRAIN_SERVE_FAIL_FAST', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CODEX_SANDBOX', 'CODEX_CI', 'CODEX_HOME', 'OPENCODE', 'OPENCODE_PID', 'XDG_CONFIG_HOME']) delete env[k];
   Object.assign(env, {
-    HOME: h.home, GBRAIN_HOME: h.home, GBRAIN_AUDIT_DIR: join(h.home, 'audit'), GBRAIN_SKIP_STARTUP_HOOKS: '1', NO_COLOR: '1',
+    HOME: h.home, GBRAIN_HOME: h.home, GBRAIN_AUDIT_DIR: join(h.home, 'audit'), GBRAIN_SKIP_STARTUP_HOOKS: '1', NO_COLOR: '1', GBRAIN_TEST_DREAM_CAP_OFF: '1',
     PATH: [join(h.home, 'bin'), '/usr/bin', '/bin'].join(delimiter),
   });
   for (const [k, v] of Object.entries(extra)) {

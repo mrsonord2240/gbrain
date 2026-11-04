@@ -39,6 +39,7 @@ import { usageError, writeCliError, writeCliRefusal } from '../cli/cli-error.ts'
 import { cliRenderContext, renderAction, shellQuote, type Action } from '../core/agent-output.ts';
 import { codeEntry } from '../core/error-catalogue.ts';
 import { fetchSource } from '../core/sources-load.ts';
+import { claimDreamSlot, dreamCapDisabledForTests } from '../core/dream-quota.ts';
 import { existsSync } from 'fs';
 import { isAbsolute, resolve } from 'node:path';
 
@@ -69,6 +70,10 @@ interface DreamArgs {
    * Never auto-applied for --input (codex finding #3).
    */
   bypassDreamGuard: boolean;
+  /** Fork: this is the nightly scheduled run (uses the one scheduled slot). */
+  scheduled: boolean;
+  /** Fork: operator-only override of the dream daily cap; still recorded. */
+  overrideDailyCap: boolean;
   /**
    * v0.41.13: per-source cycle scoping. Threaded into runCycle as
    * `sourceId` so `cycle.ts:1947-1967` writes `last_full_cycle_at`
@@ -113,6 +118,28 @@ const EXIT_DRAIN_INCOMPLETE = BUDGET_STOP_EXIT_CODE;
 /** D2: the human stderr line (unchanged) plus, under --json, the envelope as the document; then exit. */
 function dreamExit(e: OperationError, json = jsonRequested(process.argv.slice(2))): never {
   process.exit(writeCliRefusal(e, 'dream', { json }));
+}
+
+/**
+ * Fork: dream daily cap (src/core/dream-quota.ts). The CLI calls this BEFORE
+ * it connects to the database, so a refused run opens no connection and costs
+ * no egress. --help, --dry-run and the retriage / reset-key subverbs are exempt.
+ */
+export function enforceDreamDailyCap(args: string[]): void {
+  if (dreamCapDisabledForTests()) return;
+  if (args[0] === 'retriage' || args[0] === 'reset-key') return;
+  if (args.includes('--help') || args.includes('-h') || args.includes('--dry-run')) return;
+  const slot = claimDreamSlot({
+    scheduled: args.includes('--scheduled'),
+    override: args.includes('--override-daily-cap'),
+    args,
+  });
+  if (!slot.allowed) {
+    dreamExit(opError('dream_daily_cap', slot.message, slot.suggestion), jsonRequested(args));
+  }
+  if (slot.kind === 'override') {
+    process.stderr.write(`[dream] --override-daily-cap: running past today's cap (override #${slot.ledger.override} today).\n`);
+  }
 }
 
 function sourceError(e: Error): OperationError {
@@ -307,6 +334,8 @@ function parseArgs(args: string[]): DreamArgs {
     from,
     to,
     bypassDreamGuard: args.includes('--unsafe-bypass-dream-guard'),
+    scheduled: args.includes('--scheduled'),
+    overrideDailyCap: args.includes('--override-daily-cap'),
     source,
     drain,
     windowSeconds,
@@ -472,6 +501,16 @@ Options:
                       know the input file is NOT dream-cycle output but the
                       guard is firing. Loud stderr warning + cost reminder
                       fires every run.
+
+  --scheduled         Mark this as the nightly scheduled run. Dream runs are
+                      capped per day to protect database egress: 1 scheduled
+                      run plus N extra (GBRAIN_DREAM_DAILY_EXTRA_RUNS or the
+                      config.json key dream_daily_extra_runs, default 1). A
+                      run counts when it starts, even if it fails; --dry-run
+                      never counts. Ledger: ~/.gbrain/dream-quota.json.
+  --override-daily-cap
+                      Operator only: start a run past the daily cap. The run
+                      is still recorded.
 
   --help, -h          Show this help
 

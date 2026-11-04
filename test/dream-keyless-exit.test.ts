@@ -114,6 +114,9 @@ describe.skipIf(SKIP)('keyless `gbrain dream` exits 0 (nightly-cron contract)', 
       // `gbrain check-update --refresh-cache` per spawn + an
       // UPGRADE_AVAILABLE stderr line that would pollute the posture pins.
       GBRAIN_SKIP_STARTUP_HOOKS: '1',
+      // Fork: this file runs dream several times in one home; the daily cap
+      // (src/core/dream-quota.ts) is pinned by test/dream-daily-cap.test.ts.
+      GBRAIN_TEST_DREAM_CAP_OFF: '1',
     };
 
     // Keyless brain — init --no-embedding's persisted end state.
