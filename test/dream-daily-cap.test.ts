@@ -97,7 +97,9 @@ describe('gbrain dream CLI honors the cap', () => {
   const run = (args: string[], env: Record<string, string>) => {
     const p = Bun.spawnSync(['bun', 'src/cli.ts', 'dream', ...args], {
       cwd: join(import.meta.dir, '..'),
-      env: { ...process.env, GBRAIN_TEST_DREAM_CAP_OFF: '0', ...env },
+      // bun test runs its own clock in UTC; pin the child to it so the
+      // ledger date written above matches the CLI's localDate() late at night.
+      env: { ...process.env, TZ: 'Etc/UTC', GBRAIN_TEST_DREAM_CAP_OFF: '0', ...env },
     });
     return { code: p.exitCode, out: p.stdout.toString(), err: p.stderr.toString() };
   };
