@@ -36,6 +36,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { opError, type OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
+import { isEmbeddedEngine } from '../embedded-engine.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import type { WriteRequest } from './model.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
@@ -320,6 +321,7 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   // #6619: the page's free-text aliases and the redirects that resolve to it; a redirect from this slug to another page stays.
   removed.page_aliases = await count('DELETE FROM page_aliases WHERE source_id=$1 AND slug=$2 RETURNING 1', [sourceId, slug]);
   removed.slug_aliases = await count('DELETE FROM slug_aliases WHERE source_id=$1 AND canonical_slug=$2 RETURNING 1', [sourceId, slug]);
+  removed.slug_rename_history = await count('DELETE FROM slug_rename_history WHERE source_id=$1 AND new_slug=$2 RETURNING 1', [sourceId, slug]);
   // #6511 [R2]: the preparation sweep's targets, plus the tail past its ceiling and the rows pending at scan time, re-tested here.
   const recheck = await lookup('tail_recheck', () => recheckRequestsCarrying(tx, sourceId, needles, prepared.sweep,
     { exclude: row.id, beforePending: () => faultPoint('purge:pending_recheck', { requestId: row.request_id, sourceId, operation: row.operation }) }));
@@ -376,9 +378,17 @@ export async function finishPagePurge(ctx: Pick<OperationContext, 'engine' | 'co
   const remaining: string[] = [];
   if (purge.blobs?.length) {
     try {
-      const { createStorage } = await import('../storage.ts');
-      const storage = await createStorage((ctx.config as { storage?: unknown } | undefined)?.storage as never);
-      for (const path of purge.blobs) { try { await storage.delete(path); } catch { remaining.push(path); } }
+      const { createStorage, settingsStorage } = await import('../storage.ts');
+      const embedded = isEmbeddedEngine(ctx.engine);
+      const storage = embedded ? await settingsStorage(ctx.engine)
+        : await createStorage((ctx.config as { storage?: unknown } | undefined)?.storage as never);
+      if (!storage) throw new Error('This engine was opened with no settings.storage.');
+      for (const path of purge.blobs) {
+        try {
+          if (embedded && !(await storage.exists(path))) { remaining.push(path); continue; }
+          await storage.delete(path);
+        } catch { remaining.push(path); }
+      }
     } catch { remaining.push(...purge.blobs); }
   }
   const { verifyPagePurge } = await import('../facts/purge-verify.ts');

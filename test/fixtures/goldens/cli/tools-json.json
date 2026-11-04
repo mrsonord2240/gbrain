@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 265405,
-    "stdoutSha256": "ce85fa67a616e3c90eda5a73943e277734add153923cd5f19dfef2a8fe026f03",
+    "stdoutBytes": 269862,
+    "stdoutSha256": "572b0651eccad5f6985053264f93a5c88014f50c0e243145dae36e74a73c735c",
     "toolNames": [
       "remember",
       "entity",
@@ -90,6 +90,7 @@
       "file_list",
       "file_upload",
       "file_url",
+      "file_verify",
       "submit_job",
       "get_job",
       "wait_job",
@@ -156,6 +157,8 @@
       "purge_fact",
       "list_page_purges",
       "unpurge_page",
+      "memory_recall",
+      "memory_write",
       "find_contradictions",
       "find_experts",
       "find_trajectory",
@@ -420,7 +423,7 @@
         "scope": "write"
       },
       {
-        "description": "Read a page; `section` or `grep` reads one part. Edit: include_content:true, `content` to put_page, or edit_page. >256 KB: outline+window, then `next`.",
+        "description": "Read a page; `section`/`grep` reads one part. Pass at most one window selector: lines, bytes, around_chunk_id or cursor (context only with grep). Edit: include_content:true, `content` to put_page, or edit_page. >256 KB: outline+window, then `next`.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -454,7 +457,7 @@
         "schema": {
           "properties": {
             "around_chunk_id": {
-              "description": "Window around a search hit chunk_id.",
+              "description": "Window around a search hit chunk_id. One window selector only: not with lines, bytes or cursor.",
               "type": "number"
             },
             "body": {
@@ -470,7 +473,7 @@
             },
             "bytes": {
               "additionalProperties": false,
-              "description": "Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).",
+              "description": "Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start). One window selector only: not with lines, around_chunk_id or cursor.",
               "properties": {
                 "length": {
                   "type": "number"
@@ -490,7 +493,7 @@
               "type": "boolean"
             },
             "context": {
-              "description": "With grep: paragraphs of context either side (default 1, max 5).",
+              "description": "Applies only with grep (ignored without it): paragraphs of context either side (default 1, max 5).",
               "type": "number"
             },
             "context_lines": {
@@ -498,7 +501,7 @@
               "type": "number"
             },
             "cursor": {
-              "description": "next_cursor: read on.",
+              "description": "next_cursor: read on. One window selector only: not with lines, bytes or around_chunk_id.",
               "type": "string"
             },
             "fuzzy": {
@@ -535,7 +538,7 @@
             },
             "lines": {
               "additionalProperties": false,
-              "description": "Window: 1-based lines.",
+              "description": "Window: 1-based lines. One window selector only: not with bytes, around_chunk_id or cursor.",
               "properties": {
                 "count": {
                   "type": "number"
@@ -4291,6 +4294,33 @@
         "scope": "admin"
       },
       {
+        "description": "Check files rows against the storage backend. Without storage_path, lists up to 100 rows (optionally one page's) with whether each object is present; with it, reads that object back and says whether its size and SHA-256 match the row. Runs only on an engine opened from settings. A backend that fails the check is store_unavailable, never a file reported missing.",
+        "idempotent": true,
+        "local_only": true,
+        "mutating": false,
+        "name": "file_verify",
+        "parameters": {
+          "slug": "string?",
+          "storage_path": "string?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "slug": {
+              "description": "List only this page's files",
+              "type": "string"
+            },
+            "storage_path": {
+              "description": "Read back and hash this one object",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "scope": "admin"
+      },
+      {
         "description": "Submit a background job. Remote callers may submit sync, import, lint or lint-fix for their authenticated filesystem source. Other kinds require local CLI or a dedicated operation.",
         "idempotent": false,
         "local_only": false,
@@ -7106,6 +7136,108 @@
         "scope": "admin"
       },
       {
+        "description": "Facts for the person this call serves, one per line: their own recent facts first, then facts matching query. Never page bodies. For QM; agents use recall.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "memory_recall",
+        "parameters": {
+          "acting_user": "string?",
+          "max_chars": "integer?",
+          "query": "string"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "acting_user": {
+              "description": "Set by the trusted system: equal to the x-qm-actor header, or omit.",
+              "type": "string"
+            },
+            "max_chars": {
+              "description": "Text cap in UTF-16 code units, 200-12000 (default 6000).",
+              "type": "integer"
+            },
+            "query": {
+              "description": "What the turn is about; ranks the facts.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
+        "scope": "read"
+      },
+      {
+        "description": "Save facts for the person this call serves, readable by them alone. Needs an attested person. The same idempotency_key replays the first receipt. For QM; agents use remember.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": true,
+        "name": "memory_write",
+        "parameters": {
+          "acting_user": "string?",
+          "facts": "array",
+          "idempotency_key": "string"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "acting_user": {
+              "description": "Set by the trusted system: equal to the x-qm-actor header, or omit.",
+              "type": "string"
+            },
+            "facts": {
+              "description": "1-20 facts.",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "fact": {
+                    "description": "One claim.",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "description": "Default fact.",
+                    "enum": [
+                      "event",
+                      "preference",
+                      "commitment",
+                      "belief",
+                      "fact"
+                    ],
+                    "type": "string"
+                  },
+                  "provenance": {
+                    "description": "Where it came from (<=200 chars).",
+                    "type": "string"
+                  },
+                  "valid_from": {
+                    "description": "When it became true (ISO 8601).",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "fact",
+                  "provenance"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "idempotency_key": {
+              "description": "1-128 visible ASCII characters; the same key replays this write.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "facts",
+            "idempotency_key"
+          ],
+          "type": "object"
+        },
+        "scope": "write"
+      },
+      {
         "description": "Return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. Use this when the user asks 'what's inconsistent in my brain', 'show me contradictions about Acme', 'high-severity issues only', or wants to act on the probe's findings without re-running it. Returns {contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. Remote, source-scoped or min_trust callers get only findings whose two sides they can read now (each side re-read live, with source_id, trust_tier and origin) and total_visible instead of the run total. Reads the stored run without triggering a new probe; users run `gbrain eval suspected-contradictions` for that.",
         "idempotent": true,
         "local_only": false,
@@ -7775,7 +7907,7 @@
         "scope": "admin"
       },
       {
-        "description": "Run SkillOpt against a single skill. Admin scope and remote skill allowlist required. shared_skill stages an exact catalog revision privately and requires explicit skill_editor and put_skill grants; only accepted body changes publish through the original revision CAS. Rate-limited per-skill via DB lock.",
+        "description": "Run SkillOpt against a single skill; its iterative loop (optimizer_mode \"reflect\") is deprecated. Admin scope and remote skill allowlist required. shared_skill stages an exact catalog revision privately and requires explicit skill_editor and put_skill grants; only accepted body changes publish through the original revision CAS. Rate-limited per-skill via DB lock.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -7844,7 +7976,7 @@
               "type": "boolean"
             },
             "optimizer_mode": {
-              "description": "Default one-shot-rewrite: one gated rewrite. reflect opts into the iterative edit loop, which has not yet beaten one-shot on gbrain benchmarks.",
+              "description": "Default one-shot-rewrite: one gated rewrite. reflect runs the iterative edit loop, which is deprecated (removed on or after 2026-12-03) and emits the skillopt_loop_deprecated notice.",
               "enum": [
                 "one-shot-rewrite",
                 "reflect"

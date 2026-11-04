@@ -41,7 +41,7 @@ import { isAvailable } from '../ai/gateway.ts';
 import { ENTITY_HINTS_CAP } from '../facts/extract.ts';
 import { parseTtlShorthand } from '../facts/ttl-parse.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
-import type { SearchResult } from '../types.ts';
+import type { DegradedStageEntry, SearchResult } from '../types.ts';
 import { MAX_SEARCH_LIMIT, type BrainEngine, type FactRow } from '../engine.ts';
 import { collapseFactReads } from '../facts/capture-dedup.ts';
 import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
@@ -54,6 +54,7 @@ import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
 import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { parseSinceParam } from '../facts/since-parse.ts';
+import { callerSessionKey } from '../access/member-facts.ts';
 import { parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
@@ -113,6 +114,7 @@ const extract_facts: Operation = {
     // facts.default_visibility helper (the old ternary coerced unset →
     // 'private' before any config default could run). Garbage stays 'private'.
     const { resolveVisibilityParam, tightenToPage } = await import('../facts/visibility.ts');
+    const { withFolderRestricted } = await import('../search/private-visibility.ts');
     let visibility: 'private' | 'world' = await resolveVisibilityParam(ctx.engine, p.visibility);
 
     // #4206: optional event-time + provenance threading. An unparseable
@@ -136,7 +138,7 @@ const extract_facts: Operation = {
     // facts are also private when it cannot see the source page, so a hidden page and a missing one look the same.
     if (visibility === 'world' && sourceSlug) {
       const origin = await ctx.engine.readPageSnapshot(sourceSlug.replace(/\.md$/, ''), { sourceId });
-      visibility = ctx.remote !== false && !origin ? 'private' : tightenToPage(visibility, origin?.page);
+      visibility = ctx.remote !== false && !origin ? 'private' : tightenToPage(visibility, origin && await withFolderRestricted(ctx.engine, origin.page));
     }
 
     const r = await runFactsPipeline(p.turn_text as string, {
@@ -540,21 +542,7 @@ const recall: Operation = {
       const searchScope = { ...scope, ...(eligibility.floor ? { minTrust: eligibility.floor } : {}) };
       // #4352 — recall's page-search arm enforces `visibility: private` for
       // untrusted callers with the excludePrivate resolved above.
-      const keywordOnly = await recallKeywordOnlyReason(ctx);
-      if (keywordOnly) {
-        searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts);
-        searchDegraded = keywordOnly;
-      } else {
-        searchResults = await hybridSearchCached(ctx.engine, queryText, {
-          limit,
-          expansion: false,
-          excludePrivate,
-          requireSafeChunks: ctx.remote !== false,
-          takesHoldersAllowList: readHolders(ctx),
-          ...searchScope,
-          ...rankCutOpts,
-        });
-      }
+      ({ rows: searchResults, keywordOnly: searchDegraded } = await recallPageRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts));
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
       const applied = recallDeliveryPlan(effectivePlan(evidencePlan, searchResults), p.budget_policy, queryText, budgetTokens, rows);
       if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
@@ -1027,8 +1015,8 @@ const delta: Operation = {
     // for the trusted CLI/hook lane, gated on STRICT ctx.remote === false —
     // anything else (true, undefined via cast bypass) is remote. Remote callers
     // use their auth client id; an auth-LESS or blank-id remote (stdio MCP)
-    // gets the shared 'remote' sentinel — never collapsed into 'local'.
-    const clientId = ctx.remote === false ? null : ctx.auth?.clientId?.trim() || 'remote';
+    // gets the shared 'remote' sentinel — never collapsed into 'local'. GST-359: plus the person an attested or audience call serves.
+    const clientId = ctx.remote === false ? null : callerSessionKey(ctx.auth?.clientId?.trim() || 'remote');
     const includePrivate = p.include_private === true && ctx.remote === false;
     const budgetTokens =
       typeof p.budget_tokens === 'number' && Number.isFinite(p.budget_tokens) && p.budget_tokens > 0
@@ -1445,6 +1433,28 @@ async function recallKeywordOnlyReason(ctx: OperationContext): Promise<string | 
 }
 
 /**
+ * recall's page arm: keyword-only when the brain opted out of embedding or has no provider (`keywordOnly` names
+ * why), otherwise hybrid. GBRA-200: its degraded stages (an embed timeout, a failed arm, the keyword rank bound)
+ * ride _meta.retrieval.degraded like search's, so a partial recall is stamped instead of silent.
+ */
+async function recallPageRows(
+  ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
+  searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier }, rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'>,
+): Promise<{ rows: SearchResult[]; keywordOnly?: string }> {
+  const keywordOnly = await recallKeywordOnlyReason(ctx);
+  const stages: DegradedStageEntry[] = [];
+  const rows = keywordOnly
+    ? await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts, stages)
+    : await hybridSearchCached(ctx.engine, queryText, {
+      limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
+      takesHoldersAllowList: readHolders(ctx), ...searchScope, ...rankCutOpts,
+      onMeta: m => { stages.push(...(m.degraded ?? [])); },
+    });
+  if (stages.length) ctx.emitResponseMeta?.('retrieval', { degraded: stages });
+  return { rows, ...(keywordOnly ? { keywordOnly } : {}) };
+}
+
+/**
  * Keyless recall's page arm: direct keyword FTS, except that a planned
  * multi-relation question (planner on) goes through hybridSearch's keyless
  * path, which runs keyword + title + the relational chain (zero LLM).
@@ -1453,14 +1463,17 @@ async function keylessRecallRows(
   ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
   searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier },
   rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = {},
+  stages: DegradedStageEntry[] = [],
 ): Promise<SearchResult[]> {
   if (await keylessChainQuestion(ctx, queryText)) {
     return hybridSearchCached(ctx.engine, queryText, {
       limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
       takesHoldersAllowList: readHolders(ctx), ...searchScope, ...rankCutOpts,
+      onMeta: m => { stages.push(...(m.degraded ?? [])); },
     });
   }
-  const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope }));
+  const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope,
+    onKeywordIncomplete: reason => { stages.push({ stage: 'keyword_candidates_incomplete', reason }); } }));
   // #3783 — direct FTS path: every row is a keyword hit by construction.
   markKeywordHits(rows);
   stampEvidenceSafe(rows);
