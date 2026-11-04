@@ -1315,6 +1315,14 @@ More: [docs/guides/write-refusals.md#drain-stalled](../../docs/guides/write-refu
 
 More: [docs/operations/spend-controls.md#dream-paid-loop-breaker-dreambreakermax_dead_submissions](../../docs/operations/spend-controls.md#dream-paid-loop-breaker-dreambreakermax_dead_submissions)
 
+### dream_daily_cap
+
+<a id="dream_daily_cap"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| `gbrain dream` refused to start: today's dream runs (1 scheduled plus the configured extra runs, default 1) are already used, so nothing ran. | Each dream run reads the brain over the database connection, and on a metered plan that read traffic is egress against a monthly quota; a cap per day stops loops and one-off reruns from spending it. A run counts when it starts, so failed runs and retries count too. | Batch the work into the next scheduled run. Only the operator may start one more today, with --override-daily-cap. | agent | `repeat the read that failed` | 1 | no |
+
 ### effect_not_failed
 
 <a id="effect_not_failed"></a>
