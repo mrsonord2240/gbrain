@@ -43,10 +43,13 @@ import { privateRequestRefusal } from '../../persistence/visibility-request.ts';
 import { parseMarkdown } from '../../markdown.ts';
 import { OperationError, type OperationContext } from '../../ops/contract.ts';
 import { submitPageMutation } from '../../persistence/page-mutations.ts';
+import { acceptedPendingReceipt } from '../../persistence/accepted-pending.ts';
 
 export interface IngestCaptureResult {
   slug: string;
-  status: 'imported' | 'skipped' | 'deleted' | 'error';
+  /** `pending`: a managed write the owner accepted and will publish under `request_id`; progress, not a failure. */
+  status: 'imported' | 'skipped' | 'deleted' | 'pending' | 'error';
+  request_id?: string;
   chunks: number;
   untrusted_payload: boolean;
   source_kind: string;
@@ -227,7 +230,8 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
       }
       return {
         slug,
-        status: deleted ? 'deleted' : 'skipped',
+        status: typeof deleted === 'string' ? 'pending' : deleted ? 'deleted' : 'skipped',
+        ...(typeof deleted === 'string' ? { request_id: deleted } : {}),
         chunks: 0,
         untrusted_payload: untrustedPayload,
         source_kind: event.source_kind,
@@ -268,16 +272,16 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
           // #2044/#4548: as `remote: untrustedPayload` does unmanaged, an untrusted body keeps the non-world facts rows and takes rows its sender could not see.
           ...(untrustedPayload ? { keep_hidden_rows: true } : {}) });
       };
-      let response: Record<string, unknown>;
+      let response: PutOrPending;
       try {
-        response = await put(sourceId ?? 'default');
+        response = await orPending(() => put(sourceId ?? 'default'));
       } catch (err) {
         // The door refuses a source that vanished or was archived after the pre-check (the managed form of the FK retry).
         const vanished = sourceId !== undefined && err instanceof OperationError && err.code === 'source_changed'
           ? await engine.executeRaw<{ archived: boolean | null }>('SELECT archived FROM sources WHERE id = $1', [sourceId]) : null;
         if (!vanished || (vanished.length > 0 && vanished[0]?.archived !== true)) throw err;
         sourceFallback = { requested: sourceId!, effective: 'default', reason: vanished.length ? 'archived' : 'fk_violation' };
-        response = await put('default');
+        response = await orPending(() => put('default'));
       }
       if (sourceFallback) {
         console.error(
@@ -286,9 +290,11 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
         );
       }
       const outcome = (response.outcome ?? {}) as { noop?: boolean; chunks?: number };
+      const pendingId = response.pending_request_id;
       return {
         slug,
-        status: outcome.noop ? 'skipped' : 'imported',
+        status: pendingId ? 'pending' : outcome.noop ? 'skipped' : 'imported',
+        ...(pendingId ? { request_id: pendingId } : {}),
         chunks: Number(outcome.chunks ?? 0),
         untrusted_payload: untrustedPayload,
         source_kind: event.source_kind,
@@ -357,8 +363,21 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
 }
 
 /** A managed tombstone: delete_page through the door when the page is live in the source; a missing page is skipped. */
+type PutOrPending = Record<string, unknown> & { pending_request_id?: string };
+/**
+ * #5600/#5601: an accepted write that has not committed yet is progress. It publishes later under its request id;
+ * throwing it made the worker retry (a second admission) and dead-letter a capture that then published anyway.
+ */
+async function orPending(write: () => Promise<Record<string, unknown>>): Promise<PutOrPending> {
+  try { return await write(); } catch (err) {
+    const receipt = acceptedPendingReceipt(err);
+    if (!receipt) throw err;
+    return { pending_request_id: receipt.request_id };
+  }
+}
+
 async function managedTombstone(engine: BrainEngine, slug: string, sourceId: string,
-  door: (operation: 'delete_page', sid: string, params: Record<string, unknown>) => Promise<Record<string, unknown>>): Promise<boolean> {
+  door: (operation: 'delete_page', sid: string, params: Record<string, unknown>) => Promise<Record<string, unknown>>): Promise<boolean | string> {
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot || snapshot.page.deleted_at) return false;
   try {
@@ -366,6 +385,9 @@ async function managedTombstone(engine: BrainEngine, slug: string, sourceId: str
     return true;
   } catch (err) {
     if (err instanceof OperationError && err.code === 'page_not_found') return false;
+    // Accepted and still pending: the request id it publishes under (progress, not a failure).
+    const receipt = acceptedPendingReceipt(err);
+    if (receipt) return receipt.request_id;
     throw err;
   }
 }
