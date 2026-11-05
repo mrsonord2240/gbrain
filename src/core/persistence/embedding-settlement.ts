@@ -80,6 +80,9 @@ function configuredSignature(config: GBrainConfig | null): string | null {
   return config?.embedding_model && config.embedding_dimensions ? `${config.embedding_model}:${config.embedding_dimensions}` : null;
 }
 
+/** `freeOnly`: settle only what current verified vectors already cover; anything needing provider work stays as it is. */
+type SettleOpts = { dryRun: boolean; config: GBrainConfig | null; hostId: string; runId?: string; freeOnly?: boolean };
+
 /** The authorization id of one repair run's grant for one effect. */
 export function embeddingGrantId(runId: string, effectId: string | number): string {
   return digest(['embedding-effects-grant-v1', runId, String(effectId)]);
@@ -90,7 +93,7 @@ export function embeddingGrantId(runId: string, effectId: string | number): stri
  * binds an exhausted-retry grant to the repair run that authorized it.
  */
 export async function settleEmbeddingEffect(engine: BrainEngine, candidate: Pick<EmbeddingCandidate, 'effect_id' | 'state' | 'attempts'>,
-  opts: { dryRun: boolean; config: GBrainConfig | null; hostId: string; runId?: string }): Promise<EmbeddingSettlement> {
+  opts: SettleOpts): Promise<EmbeddingSettlement> {
   let requestId: string | undefined;
   const settlement = await settleInTransaction(engine, candidate, opts, id => { requestId = id; });
   // #6696 (A1): the request's reservation shrinks once this commit settled its last effect, outside the settling transaction.
@@ -99,7 +102,7 @@ export async function settleEmbeddingEffect(engine: BrainEngine, candidate: Pick
 }
 
 function settleInTransaction(engine: BrainEngine, candidate: Pick<EmbeddingCandidate, 'effect_id' | 'state' | 'attempts'>,
-  opts: { dryRun: boolean; config: GBrainConfig | null; hostId: string; runId?: string }, settled: (requestId: string) => void): Promise<EmbeddingSettlement> {
+  opts: SettleOpts, settled: (requestId: string) => void): Promise<EmbeddingSettlement> {
   return engine.transaction(async tx => {
     await declarePersistenceProtocol(tx);
     const [effect] = await tx.executeRaw<PersistenceEffect & { request_state: string }>(`SELECT e.*, r.state AS request_state
@@ -174,6 +177,8 @@ function settleInTransaction(engine: BrainEngine, candidate: Pick<EmbeddingCandi
       }
       pendingChunks = pending.length;
     }
+    // A provider-free sweep never grants a retry: it settles only what verified vectors already cover.
+    if (opts.freeOnly) return { outcome: 'blocked', reason: 'needs_provider', ...(pendingChunks !== undefined ? { pending_chunks: pendingChunks } : {}) };
     await tx.executeRaw("SELECT key FROM config WHERE key='embedding_disabled' FOR SHARE");
     try { await assertEmbeddingEffectEnabled(tx, opts.config); }
     catch (error) {
@@ -211,3 +216,20 @@ async function queueRetry(tx: BrainEngine, effect: PersistenceEffect, opts: { dr
 
 /** The retry budget one grant authorizes, for the `--max-usd` estimate. */
 export const EMBEDDING_RETRY_BUDGET_ATTEMPTS = MAX_RATE_LIMIT_RETRIES;
+
+/**
+ * After a stale embed drain the vectors a failed or stale per-write embedding effect asked for are usually already there,
+ * but nothing commits the effect, so doctor keeps counting it and it blocks receipt compaction. This settles every
+ * candidate whose current vectors verify (`reconciled` / `superseded`), with no provider call and no retry grant;
+ * the rest stay for `gbrain repair embedding-effects`. Stops at `signal`.
+ */
+export async function settleVerifiedEmbeddingEffects(engine: BrainEngine, opts: { sourceIds: string[]; config: GBrainConfig | null; hostId: string; signal?: AbortSignal }): Promise<{ candidates: number; settled: number }> {
+  const candidates = await listEmbeddingCandidates(engine, opts.sourceIds);
+  let settled = 0;
+  for (const candidate of candidates) {
+    if (opts.signal?.aborted) break;
+    const { outcome } = await settleEmbeddingEffect(engine, candidate, { dryRun: false, config: opts.config, hostId: opts.hostId, freeOnly: true });
+    if (outcome === 'reconciled' || outcome === 'superseded') settled++;
+  }
+  return { candidates: candidates.length, settled };
+}

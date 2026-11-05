@@ -4,6 +4,7 @@ import type { FenceChunkOverlay } from '../core/eligibility/fence-overlay.ts';
 import { prepareEmbeddingProjections, countArchivedEmbeddingWork, reportBlockedProjections } from '../core/embedding-readiness.ts';
 import { embedStaleFacts, refusedFactsLine, type EmbedFactsResult } from '../core/embed-facts.ts';
 import { embedTakesForStaleDrain, type EmbedTakesResult } from '../core/embed-takes.ts';
+import { settleEffectsAfterStaleDrain } from '../core/embed-settle-effects.ts';
 import { parseFactEmbedArgs } from './embed-facts-delegate.ts';
 import { readProjectionSnapshot, installPageProjection, installPageEmbeddings, PageProjectionConflictError, retryProjectionConflict } from '../core/page-state/projections.ts';
 import { projectionConflictLine } from '../core/agent-output.ts';
@@ -371,6 +372,8 @@ export interface EmbedResult {
   reason?: 'stall_timeout' | 'time_budget' | 'cost_cap';
   /** With `reason: 'time_budget'` (src/core/embed-budget-stop.ts): stale chunks left and the command that finishes them. */
   remaining_stale?: number;
+  /** `--stale`: failed/stale per-write embedding effects settled because their vectors are current (core/embed-settle-effects.ts). */
+  effects_settled?: number;
   resume_command?: string;
   /** With `reason: 'cost_cap'` (src/core/embed-cost-cap.ts): the approved cap, what the run spent, and the refusal's reason. */
   cap_usd?: number;
@@ -751,6 +754,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
           dryRun: !!opts.dryRun, signal: drainSignal, sourceId: opts.sourceId, assertOwned: opts.assertOwned, quiet: opts.quiet,
           takes: opts.takes, onProgress: (_done, _total, embedded) => { takesEmbedded = embedded; },
         }, result);
+        if (opts.stale && !opts.dryRun && !isAborted(drainSignal)) result.effects_settled = await settleEffectsAfterStaleDrain(engine, opts.sourceId, drainSignal, opts.quiet);
       } catch (e) {
         // A heartbeat-triggered abort is a clean, resumable stop (lock_lost is
         // already set + explained on stderr) — not an error to propagate.
