@@ -43,7 +43,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -83,6 +83,9 @@ async function upgradedBrain(prefix: string, initArgs: string[] = ['init', '--pg
 }
 
 /** The hermetic CLI env of test/helpers/doctor-json-golden.ts (no network preload when `net` is set). */
+const WIN_SH = process.platform === 'win32' ? Bun.which('sh') : null;
+const WIN_SH_DIR = WIN_SH ? dirname(WIN_SH) : null;
+
 function childEnv(h: DoctorHome, extra: Record<string, string | undefined> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
@@ -91,7 +94,8 @@ function childEnv(h: DoctorHome, extra: Record<string, string | undefined> = {})
     'GBRAIN_SERVE_FAIL_FAST', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CODEX_SANDBOX', 'CODEX_CI', 'CODEX_HOME', 'OPENCODE', 'OPENCODE_PID', 'XDG_CONFIG_HOME']) delete env[k];
   Object.assign(env, {
     HOME: h.home, GBRAIN_HOME: h.home, GBRAIN_AUDIT_DIR: join(h.home, 'audit'), GBRAIN_SKIP_STARTUP_HOOKS: '1', NO_COLOR: '1', GBRAIN_TEST_DREAM_CAP_OFF: '1',
-    PATH: [join(h.home, 'bin'), '/usr/bin', '/bin'].join(delimiter),
+    // Windows: hooks run under a POSIX shell (Git for Windows' sh), which is not in /usr/bin or /bin there.
+    PATH: [join(h.home, 'bin'), ...(WIN_SH_DIR ? [WIN_SH_DIR] : []), '/usr/bin', '/bin'].join(delimiter),
   });
   for (const [k, v] of Object.entries(extra)) {
     if (v === undefined) delete env[k];

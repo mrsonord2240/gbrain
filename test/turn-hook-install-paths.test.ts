@@ -12,7 +12,7 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, win32 } from 'node:path';
+import { delimiter, dirname, join, resolve, win32 } from 'node:path';
 import { runCli } from './helpers/cli-spawn.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { installerTurnHook, verifyTurnHook } from '../src/core/setup/turn-hook-check.ts';
@@ -20,11 +20,15 @@ import { claudeTurnRuleCommand, syncTurnRuleHook, TURN_RULE_LANE_TOKEN, TURN_RUL
 import { syncHermesTurnHook } from '../src/core/setup/hermes-turn-hook.ts';
 import { BRAIN_FIRST_BEGIN, brainFirstTurnRule } from '../src/core/setup/brain-first.ts';
 import { openclawTurnPluginDir, openclawTurnPluginFiles } from '../src/core/setup/openclaw-turn-plugin.ts';
-import { isHookLauncherPath, shellWords } from '../src/core/setup/hook-launcher.ts';
+import { hookShellPath, isHookLauncherPath, shellWords } from '../src/core/setup/hook-launcher.ts';
 
 const CLI = resolve(import.meta.dir, '..', 'src', 'cli.ts');
 const roots: string[] = [];
 afterAll(() => { for (const r of roots) rmSync(r, { recursive: true, force: true }); });
+
+// Hooks run under a POSIX shell; on Windows that is Git for Windows' sh, which is not in /usr/bin or /bin.
+const WIN_SH = process.platform === 'win32' ? Bun.which('sh') : null;
+const HOOK_PATH = WIN_SH ? [dirname(WIN_SH), '/usr/bin', '/bin'].join(delimiter) : '/usr/bin:/bin';
 
 function box() {
   const root = mkdtempSync(join(tmpdir(), 'gbrain-turn-hook-'));
@@ -37,7 +41,7 @@ function box() {
   const script = (name: string, body: string) => { const p = join(root, 'bin', name); writeFileSync(p, `#!/bin/sh\n${body}\n`); chmodSync(p, 0o755); return p; };
   const bin = script('gbrain', `exec '${process.execPath}' --no-env-file '${CLI}' "$@"`);
   const env: Record<string, string | undefined> = {
-    HOME: home, GBRAIN_HOME: home, PATH: '/usr/bin:/bin', CLAUDE_CONFIG_DIR: undefined, CODEX_HOME: undefined, XDG_CONFIG_HOME: undefined,
+    HOME: home, GBRAIN_HOME: home, PATH: HOOK_PATH, CLAUDE_CONFIG_DIR: undefined, CODEX_HOME: undefined, XDG_CONFIG_HOME: undefined,
     OPENCLAW_STATE_DIR: undefined, OPENCLAW_WORKSPACE_DIR: undefined, OPENCLAW_PROFILE: undefined, OPENCLAW_CONFIG_PATH: undefined, HERMES_HOME: undefined,
     GBRAIN_AGENT_INSTRUCTIONS: undefined, GBRAIN_SURFACE: undefined, GBRAIN_SOURCE: undefined, GBRAIN_HOOKS: undefined, GBRAIN_HOOK_LANE: undefined,
     CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined, CODEX_SANDBOX: undefined, CODEX_CI: undefined,
@@ -65,7 +69,7 @@ describe('setup --instructions-only after a plain mcp add', () => {
     const entries = claudePromptEntries(b);
     expect(entries).toEqual([expect.objectContaining({ _gbrain: TURN_RULE_MARKER })]);
     expect(entries[0].command).toContain(TURN_RULE_LANE_TOKEN);
-    expect(entries[0].command).toContain(`${b.bin} hook user-prompt`);
+    expect(entries[0].command).toContain(`${hookShellPath(b.bin)} hook user-prompt`);
     expect((await setup(b, ['claude-code', '--instructions-only', '--gbrain-bin', b.bin, '--json'])).exitCode).toBe(0);
     expect(claudePromptEntries(b)).toHaveLength(1);
   });
