@@ -44,7 +44,7 @@ import { join, relative, resolve, sep } from 'node:path';
 import type { Notice } from '../agent-output.ts';
 import { literalPathspecs } from '../git-env.ts';
 import { OperationError, opError } from '../ops/contract.ts';
-import { commitMessage, git, gitBytes, gitFailure, gitStepTimeoutMs, ignoredTargetError, reclaimAbandonedIndexLock, withSession, type GitSession } from './effect-git.ts';
+import { commitMessage, commitMessageArgs, git, gitBytes, gitFailure, gitStepTimeoutMs, ignoredTargetError, reclaimAbandonedIndexLock, withSession, type GitSession } from './effect-git.ts';
 import type { GitCommitNote } from './effect-model.ts';
 import { persistenceHome } from './identity.ts';
 import { ignoreCandidates } from './ignore-rules.ts';
@@ -52,6 +52,7 @@ import { hashFile } from './large-file.ts';
 import type { FileRecoveryRecord, SqlEngine } from './model.ts';
 import { nativeFileTarget } from './native-file-target.ts';
 import type { NativeLockHandle } from './native-lock.ts';
+import { recordCommitAsync } from '../git/commit-ledger.ts';
 import { committedBlob, headBlob, headCommit } from './pending-import.ts';
 
 /** Whether `sourceId` is a strict (git-canonical) source; `lock` reads its row FOR SHARE inside a publication. */
@@ -323,10 +324,11 @@ async function doorCommit(session: GitSession, root: string, files: DoorFile[], 
 
       const noted = new Map(changed.flatMap(target => target.note ? [[target.rel, target.note] as const] : []));
       const message = commitMessage(changed.map(target => target.rel), noted).map(stripspace).filter(Boolean);
-      const commit = await git(session, ['commit-tree', tree, '-p', head, ...message.flatMap(paragraph => ['-m', paragraph])]);
+      const commit = await git(session, ['commit-tree', tree, '-p', head, ...commitMessageArgs(message, scratch)]);
       if (commit.code !== 0) throw gitFailure('Cannot commit the canonical Git target.',
         `git commit-tree failed for ${changed.length} file(s); a missing Git identity (user.name, user.email) in that checkout is one cause to check.`);
       const created = commit.stdout.trim();
+      await recordCommitAsync(root, { sha: created, writer: 'door', ref: branch });
       await doorSeams.beforeUpdateRef?.(root, attempt);
       const moved = await git(session, ['update-ref', '-m', `commit: ${message[0]!.split('\n')[0]}`, branch, created, head]);
       if (moved.code === 0) {

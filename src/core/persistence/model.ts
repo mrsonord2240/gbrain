@@ -2,8 +2,11 @@ import type { BrainEngine } from '../engine.ts';
 import { assertRecoveryVersion } from './recovery-version.ts';
 
 export type Principal = { kind: 'oauth_client' | 'legacy_token' | 'local_cli' | 'local_stdio' | 'application'; id: string };
-export type RequestState = 'queued' | 'running' | 'recovering' | 'committed' | 'conflict' | 'failed' | 'cancelled';
+/** `deferred` (PR B, docs/designs/REFRESH_WRITE_BARRIER.md): admitted during a worktree refresh, unclaimable until it is released. */
+export type RequestState = 'queued' | 'deferred' | 'running' | 'recovering' | 'committed' | 'conflict' | 'failed' | 'cancelled';
 export interface WriteAuthority {
+  /** The caller's self-declared agent label (X-Gbrain-Agent-Label). Unverified text: nothing authorizes on it. */
+  agentLabel?: string;
   version: 1;
   principal: Principal;
   remote: boolean;
@@ -71,13 +74,36 @@ export interface BundleRecoveryRecord {
   staging?: never;
   beforeHash?: never;
 }
-export type RecoveryRecord = FileRecoveryRecord | BundleRecoveryRecord;
+/**
+ * GBRA-190 G4 (D2): the page files one publication writes together (a withdrawal's pages), restored together and
+ * committed in one Git commit. Each file is a page file record (version 1 fields, door included on a strict source);
+ * `files[0]` is the request's own page when it has a file. Binaries that predate it refuse version 3 unread.
+ */
+export interface PagesRecoveryRecord {
+  version: 3;
+  target: 'pages';
+  root: string;
+  ownerEpoch: string;
+  attempt: string;
+  files: FileRecoveryRecord[];
+  staging?: never;
+  beforeHash?: never;
+}
+export type RecoveryRecord = FileRecoveryRecord | BundleRecoveryRecord | PagesRecoveryRecord;
+/** The most page files one publication writes together (a withdrawal's bound, withdrawal-discovery.ts). */
+export const PAGES_RECOVERY_MAX_FILES = 256;
 export function recoveryFiles(record: RecoveryRecord): FileRecoveryRecord[] {
   assertRecoveryVersion('persistence_requests', record, null);
   if (record.version === 1) return [record];
   if (record.version === 2 && record.target === 'skill_bundle' && Array.isArray(record.files)
     && record.files.length > 0 && record.files.length <= 128 && record.files.every(file => file.version === 1)) return record.files;
+  if (record.version === 3 && record.target === 'pages' && Array.isArray(record.files)
+    && record.files.length > 0 && record.files.length <= PAGES_RECOVERY_MAX_FILES && record.files.every(file => file.version === 1)) return record.files;
   throw new Error('unsupported_mutation_protocol');
+}
+/** A shared-skill bundle's record, whose files are bundle files (bundle-files.ts), not page files. */
+export function isBundleRecovery(record: RecoveryRecord): record is BundleRecoveryRecord {
+  return record.version === 2;
 }
 export interface WriteRequest {
   id: string;
@@ -98,6 +124,8 @@ export interface WriteRequest {
   authority: WriteAuthority;
   sequence: string | number;
   state: RequestState;
+  /** The refresh a deferred write was admitted behind; kept after it drains, so its claim runs the refresh-change check. */
+  deferred_refresh_id?: string | null;
   execution_token: string | null;
   claim_expires_at: Date | string | null;
   recovery: RecoveryRecord | null;

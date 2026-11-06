@@ -51,10 +51,13 @@ moving again; ask me only about the ones gbrain will not decide by itself."*
    names the process holding its drain lease (a serve pass, a sync job, a CLI
    sync), with its heartbeat, `progress` and `stalled`; null means nothing is
    syncing it now. Holds are bounded: `holds_summary` counts every hold by
-   code and by state (`needs_human`, `actionable`, `held`), and `holds` lists
-   the first 20, needs-human first. When it leaves rows out, `holds_page`
-   names `next_command`; `--detail` pages 100 at a time, `--hold-state
-   needs_human` lists only the holds a person decides. A `last_error` with
+   code, by state (`needs_human`, `actionable`, `held`) and by `fault_code`
+   (the failure a `page_write_failed` hold recorded, which each such hold
+   also names), and `holds` lists the first 20, needs-human first. When it
+   leaves rows out, `holds_page` names `next_command`; `--detail` pages 100
+   at a time, `--hold-state needs_human` lists only the holds a person
+   decides, and `--slug <slug>` or `--code <code>` (a hold code or a
+   `fault_code`) lists the one hold you are looking for without paging. A `last_error` with
    `superseded` (`by`, `age_seconds`) is history: a later attempt got past
    the phase it failed in, so it drives neither `state` nor `next`.
 2. If `needs_human` is false and nothing committed in the last ten minutes,
@@ -149,7 +152,7 @@ Every hold and error has three fields, from one table
 | `legacy_slug_conflict` | page | none | yes | always: only a person decides which legacy page the file takes over |
 | `settle_mismatch` | page | none | yes | always: the pass cannot tell why the path does not settle |
 | `freeze_page_body_segmented` | page | upgrade | yes | always: a sync path read a page stored in segments whole |
-| `freeze_page_body_rows_unreadable` | page | retry | no | the page stays unreadable across syncs (a grant or row-level security policy hides its segment rows) |
+| `freeze_page_body_rows_unreadable` | page | repair | yes | always: the page's segment rows do not cover its stored body, so no sync can read it |
 | `page_write_failed` | page | upgrade | yes | always: the writer cannot place the failure |
 | `file_unreadable` | page | none | yes | always: only a change to the checkout makes the file readable |
 | `visibility_noncanonical` | page | none | yes | always: only an edit to the file clears it |
@@ -451,6 +454,21 @@ Dirtiness is read only for candidates: in committed mode the pass reads a
 file's working copy (`Dp`) only when the path would otherwise be admitted, so
 `dirty` counts only those, and a file whose page already matches its commit
 reads `matched` even when its working copy is edited.
+
+## Writes deferred behind a refresh
+
+With `persistence.refresh_barrier` on (off by default), a page write that
+arrives while `gbrain sources refresh` holds its worktree is not refused
+`worktree_refreshing`: it waits in state `deferred` and the caller gets a
+pending receipt. `gbrain sources writer status <id> --json` lists those rows
+with `state: "deferred"` in `requests`, and the `queue` entry for
+`deferred` carries their count and `oldest_age_ms`. They are not stuck while
+the refresh runs: once it completes or aborts they publish in order, and one
+whose file the refresh changed ends `revision_conflict`. A write still waiting
+after `persistence.refresh_barrier_max_wait_ms` ends
+[`refresh_barrier_expired`](write-refusals.md#refresh_barrier_expired) with
+nothing applied: check the refresh, then submit it again with a new request id.
+Before downgrading gbrain, `gbrain upgrade --check-downgrade` must exit 0.
 
 ## See also
 

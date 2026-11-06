@@ -976,6 +976,12 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // column order; no blob statement or index reads it, and the DCR insert falls
   // back to the unmarked insert while the column is missing.
   'oauth_clients.registered_via',
+  // GBRA-217 page change reasons (v289 page_change_reasons): migration-only so
+  // fresh and upgraded brains share column ordinals; no blob statement or index
+  // reads them, and only post-migration writers and readers name them.
+  'page_versions.change_reason',
+  'page_versions.successor_pruned',
+  'pages.version_history_gap_at',
   // GBRA-156 access_tokens/oauth_clients.private_pages (migration
   // principal_private_pages): migration-only like min_trust, so fresh and
   // upgraded catalogs keep the same column order; no blob statement or index
@@ -1248,6 +1254,13 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'page_versions.body_generation',
   'page_versions.body_bytes',
   'page_versions.content_hash',
+  // PR B refresh write barrier (v292): migration-only columns. The schema blob creates these tables without them
+  // and no blob index, view or trigger reads them, so there is no forward reference; fresh installs and upgrades
+  // both get them (and the deferred index and triggers) from the migration chain, keeping one column order.
+  'persistence_worktree_refreshes.barrier_sequence',
+  'persistence_worktree_refreshes.released_at',
+  'persistence_requests.deferred_refresh_id',
+  'persistence_consumers.capabilities',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

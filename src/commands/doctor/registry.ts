@@ -64,6 +64,7 @@ import {
   derivedVisibilityEntry,
   graphCoverageEntry,
   orphanRatioEntry,
+  segmentedTilingEntry,
   staleMentionsEntry,
   timelineHistoryEntry,
 } from './checks/graph-health.ts';
@@ -101,10 +102,12 @@ import { runtimeBuildSkewEntry } from './checks/runtime-build-skew.ts';
 import { cliSocketRefusalsEntry } from './checks/cli-socket-refusals.ts';
 import { gitConvergenceEntry } from './checks/git-convergence.ts';
 import { gitWriterEntry } from './checks/git-writer.ts';
+import { foreignWritersEntry } from './checks/foreign-writers.ts';
 import { retrievalFeedbackEntry } from './checks/retrieval-feedback.ts';
 import { transcriptSecretExposureEntry } from './checks/transcript-secrets.ts';
 import { autoChronicleEntry } from './checks/auto-chronicle.ts';
 import { factsDrainEntry } from './checks/facts-drain.ts';
+import { wakeshiftEntry } from './checks/wakeshift.ts';
 import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
 import { decideHealthEntry } from './checks/decide.ts';
 import { supersessionCalibrationEntry } from './checks/supersession-calibration.ts';
@@ -237,6 +240,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   graphCoverageEntry,
   orphanRatioEntry,
   staleMentionsEntry,
+  segmentedTilingEntry,
   timelineHistoryEntry,
   extractionDateGroundingEntry,
   integrityEntry,
@@ -269,11 +273,13 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   commitNotifierEntry,
   gitConvergenceEntry,
   gitWriterEntry,
+  foreignWritersEntry,
   decideHealthEntry,
   unlinkedFactsEntry,
   edgeValidityEntry,
   autoChronicleEntry,
   factsDrainEntry,
+  wakeshiftEntry,
   factTakeVectorsEntry,
   plannerStatsEntry,
   retrievalFeedbackEntry,

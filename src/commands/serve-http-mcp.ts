@@ -20,7 +20,8 @@ import { httpInstructionTools } from '../mcp/initialize-context.ts';
 import { installCapabilitiesResource, mcpAdministrationGuidance } from '../mcp/capabilities.ts';
 import { createSkillResources } from '../mcp/skill-resources.ts';
 import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
-import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
+import { ambientOptsFrom, type WritebackConfig } from '../core/facts/writeback-config.ts';
+import { resolveAgentWriteback } from '../core/facts/writeback-settings.ts';
 import { hasScope, operationScopesAllowed } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, requestMetaSessionId, hotMemoryOffIn, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, grantBlockedNotices, admitNotices, audienceRefusal, type ToolResult } from '../mcp/dispatch.ts';
 import { toAgentError } from '../core/agent-output.ts';
@@ -30,6 +31,7 @@ import { scopeDeniedError } from '../core/ops/op-fix.ts';
 import { resolveStrictParamsMode } from '../mcp/validate-params.ts';
 import { GBRAIN_CLIENT_HEADER, isGbrainThinClient, resolveResultRowsMode, resultRowsForRequest, type ResultRowsMode } from '../mcp/result-rows.ts';
 import { buildToolDefs } from '../mcp/tool-defs.ts';
+import { withEngineScope } from '../core/engine-scope.ts';
 import {
   filterOpsForSurface,
   advertisedOps,
@@ -43,6 +45,7 @@ import {
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { ON_BEHALF_OF_HEADER } from '../core/access/audience.ts';
 import { ACTOR_HEADER, EXTERNAL_ID_RE, QM_AUDIENCE_HEADER } from '../core/access/actor-model.ts';
+import { parseAgentLabel, AGENT_LABEL_HEADER } from '../core/persistence/attribution.ts';
 import { qmMemoryToolResult } from '../core/ops/qm-memory.ts';
 import { attestableOp } from '../core/access/actor.ts';
 
@@ -75,6 +78,10 @@ interface McpRequestState {
   actorHeader: string | undefined;
   /** GST-359 D: the x-qm-audience header (QM's channel audience, wave 2); any request carrying it is refused before any work. */
   audienceHeader: string | undefined;
+  /** Wakeshift: the request's User-Agent, which tells it some agent programs apart. Shape only. */
+  userAgent: string | undefined;
+  /** The caller's self-declared agent label (X-Gbrain-Agent-Label): recorded on its write requests, never authority. */
+  agentLabel: string | undefined;
 }
 
 export function mountMcp(app: Express, ctx: ServeHttpContext): void {
@@ -138,7 +145,7 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
   // read-only; grantScopes still caps each grant to the client row's scope.
   app.post('/mcp', withBearerScopeHint(
     requireBearerAuth({ verifier: resourceVerifier, resourceMetadataUrl }), ['read', 'write'],
-  ), (req: Request, res: Response) => withRequestConfigSnapshot(engine, () => handleMcpPost(req, res)));
+  ), (req: Request, res: Response) => withEngineScope(engine, () => withRequestConfigSnapshot(engine, () => handleMcpPost(req, res))));
 
   // #6721: one config snapshot serves every config read of one POST /mcp (the
   // surface, row-shape and writeback reads below, tools/list and a read op's
@@ -173,7 +180,7 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
     const canWrite = hasScope(authInfo.scopes, 'write');
     const [{ ceiling: surfaceCeiling, effective: surface }, writeback, hostResultRows] = await Promise.all([
       resolveEffectiveSurface(authInfo),
-      canWrite ? resolveWritebackConfig(engine, config) : Promise.resolve(null),
+      canWrite ? resolveAgentWriteback(engine, config).then(r => r.bundle) : Promise.resolve(null),
       resolveResultRowsMode(engine, config),
     ]);
     // C1: gbrain's thin client keeps full rows. The header is unverified and
@@ -186,7 +193,8 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
       surface === 'full' && authInfo.allowedOperations == null ? undefined : new Set(mcpOperations.map(o => o.name));
     const thinClient = isGbrainThinClient(req.get(GBRAIN_CLIENT_HEADER));
     const state: McpRequestState = { authInfo, agentName, startTime, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps, resultRows, thinClient,
-      onBehalfOfHeader: req.get(ON_BEHALF_OF_HEADER), actorHeader: req.get(ACTOR_HEADER), audienceHeader: req.get(QM_AUDIENCE_HEADER) };
+      onBehalfOfHeader: req.get(ON_BEHALF_OF_HEADER), actorHeader: req.get(ACTOR_HEADER), audienceHeader: req.get(QM_AUDIENCE_HEADER),
+      userAgent: req.get('user-agent'), agentLabel: parseAgentLabel(req.get(AGENT_LABEL_HEADER)) };
     const server = createMcpRequestServer(ctx, state, writeback);
     await serveMcpRequest(server, req, res);
   }
@@ -195,7 +203,7 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
 function createMcpRequestServer(
   ctx: ServeHttpContext,
   state: McpRequestState,
-  writeback: Awaited<ReturnType<typeof resolveWritebackConfig>> | null,
+  writeback: WritebackConfig | null,
 ): Server {
   const { engine, config, mcpResourceUrl } = ctx;
   const { authInfo, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps } = state;
@@ -369,10 +377,12 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   // 'tools/list'. Pre-existing string-shaped rows are normalized by
   // migration v41 in src/core/migrate.ts.
   const safeParamsSummary = summarizeMcpParams(name, params);
+  // Wakeshift's session_key is a conversation credential: never logged, even under --log-full-params.
+  const fullParams = params && typeof params === 'object' && 'session_key' in params ? { ...params, session_key: '[redacted]' } : params;
   const logParamsObj: unknown = logFullParams
-    ? (params || null)
+    ? (fullParams || null)
     : (safeParamsSummary || null);
-  const broadcastParams = logFullParams ? (params || {}) : safeParamsSummary;
+  const broadcastParams = logFullParams ? (fullParams || {}) : safeParamsSummary;
 
   // v0.31 (D12 / eE1): refactor the inlined op.handler call to go through
   // src/mcp/dispatch.ts so HTTP MCP shares the same dispatch path as
@@ -436,7 +446,9 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
       ...(sessionId ? { sessionId } : {}),
       ...(hotMemoryOffIn(request.params) ? { hotMemoryOff: true } : {}),
       onBehalfOf: { header: state.onBehalfOfHeader, requestMeta: (request.params as { _meta?: unknown })._meta },
+      mcpCaller: { client: authInfo.clientName, userAgent: state.userAgent, meta: (request.params as { _meta?: Record<string, unknown> })._meta },
       actor: { header: state.actorHeader, audience: state.audienceHeader },
+      ...(state.agentLabel ? { agentLabel: state.agentLabel } : {}),
       takesHoldersAllowList: tokenAllowList,
       sourceId: tokenSourceId,
       ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
@@ -636,7 +648,7 @@ async function recordMcpToolResult(
       `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
       [authInfo.clientId, agentName, name, latency, successStatus],
-      [logParamsObj],
+      [successStatus === 'accepted_pending' ? { ...(logParamsObj && typeof logParamsObj === 'object' ? logParamsObj : {}), write_request_id: acceptedPendingReceipt(toolResult)?.request_id } : logParamsObj],
     );
   } catch { /* best effort */ }
   broadcastEvent({

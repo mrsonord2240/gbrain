@@ -53,9 +53,9 @@ describe('PHASE_SCOPE coverage', () => {
     // Temporal typed edges adds 'edge_contradictions' for 26; C4 pinned
     // questions adds 'standing_questions' for 27.
     // #6188 adds 'fence_repair' for 28; #6377 adds 'content_repair' for 29; #6865 adds 'unindexed_files' for 30.
-    // Fork carry adds 'inbox_triage' for 31.
-    expect(ALL_PHASES.length).toBe(31);
-    expect(Object.keys(PHASE_SCOPE).length).toBe(31);
+    // GBRA-216 adds 'claim_conflicts' for 31. Fork carry adds 'inbox_triage' for 32.
+    expect(ALL_PHASES.length).toBe(32);
+    expect(Object.keys(PHASE_SCOPE).length).toBe(32);
   });
 
   test('embed remains global (the headline brain-wide phase)', () => {
