@@ -251,6 +251,9 @@ describe('(3) harness configs registered before the upgrade', () => {
     h = await upgradedBrain('upgrade-harness');
     writeFileSync(join(h.home, 'bin', 'gbrain'), `#!/bin/sh\nexec "${process.execPath}" --no-env-file "${CLI}" "$@"\n`);
     chmodSync(join(h.home, 'bin', 'gbrain'), 0o755);
+    // Windows finds commands by PATHEXT and cannot run a #!/bin/sh script.
+    if (process.platform === 'win32') writeFileSync(join(h.home, 'bin', 'gbrain.cmd'), `@"${process.execPath}" --no-env-file "${CLI}" %*
+`);
   }, 180_000);
 
   const clear = () => {
