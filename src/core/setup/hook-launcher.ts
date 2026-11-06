@@ -77,7 +77,8 @@ export function hookLauncherState(path: string): { state: HookLauncherState; det
     const st = lstatSync(path);
     if (!st.isFile()) return { state: 'stale', detail: `${path} is not a regular file` };
     if (readFileSync(path, 'utf8') !== HOOK_LAUNCHER_SCRIPT) return { state: 'stale', detail: `${path} differs from the launcher this gbrain writes` };
-    if ((st.mode & 0o100) === 0) return { state: 'stale', detail: `${path} is not executable` };
+    // Windows has no exec bit (the shell runs the launcher by its #! line), so the mode only means something on POSIX.
+    if (process.platform !== 'win32' && (st.mode & 0o100) === 0) return { state: 'stale', detail: `${path} is not executable` };
   } catch { return { state: 'missing', detail: `no hook launcher at ${path}` }; }
   return { state: 'current', detail: `hook launcher ${path}` };
 }

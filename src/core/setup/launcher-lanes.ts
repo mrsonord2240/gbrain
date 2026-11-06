@@ -17,7 +17,7 @@ import { CLAUDE_SETTINGS_FILE_RELPATH, GBRAIN_HOOK_MARKER_KEY, GBRAIN_HOOK_MARKE
 import { opencodeEntryKind, parseOpencodeConfig } from '../bootstrap/opencode-json.ts';
 import { readInterviewState } from '../bootstrap/interview.ts';
 import { resolveGbrainHome } from '../gbrain-home.ts';
-import { hookLauncherInCommand, hookLauncherState, isHookLauncherPath, type HookLauncherState } from './hook-launcher.ts';
+import { hookLauncherInCommand, hookLauncherState, isAbsoluteHookPath, isHookLauncherPath, type HookLauncherState } from './hook-launcher.ts';
 import { localSetupRecords } from './local-receipts.ts';
 import { ownedEntryFingerprint } from '../bootstrap/adopted-connections.ts';
 import { readSetupReceipt, type ClaudeSetupReceipt } from './claude-code.ts';
@@ -78,7 +78,7 @@ function state(launcher: string | null): { reason: LauncherLaneFinding['reason']
 export function setupRerunArgv(harness: 'claude-code' | 'codex', receipt: Pick<ClaudeSetupReceipt, 'name' | 'consent' | 'source_id'> & Partial<Pick<ClaudeSetupReceipt, 'launcher'>>, projectDir?: string): string[] {
   return ['gbrain', 'setup', harness, ...(receipt.name === 'gbrain' ? [] : ['--name', receipt.name]), ...(projectDir ? ['--scope', 'project'] : []),
     ...(receipt.consent.wiring_scope.value.hooks === 'none' ? ['--no-hooks'] : []), ...(receipt.source_id ? ['--source', receipt.source_id] : []),
-    ...(receipt.launcher?.startsWith('/') && existsSync(receipt.launcher) ? ['--gbrain-bin', receipt.launcher] : [])];
+    ...(receipt.launcher && isAbsoluteHookPath(receipt.launcher) && existsSync(receipt.launcher) ? ['--gbrain-bin', receipt.launcher] : [])];
 }
 
 function mcpFindings(): LauncherLaneFinding[] {

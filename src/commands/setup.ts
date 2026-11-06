@@ -37,7 +37,7 @@ import { writeJsonDocument } from '../core/cli-force-exit.ts';
 import { configDir, gbrainPath, isThinClient, loadConfig, type GBrainConfig } from '../core/config.ts';
 import { resolveGbrainBin } from '../core/gbrain-bin.ts';
 import { isRegistrationSurface, isValidName, REGISTRATION_SURFACE, registrationAdvertise, stdioServeArgv } from '../core/mcp-registration.ts';
-import { hookLauncherPath } from '../core/setup/hook-launcher.ts';
+import { hookLauncherPath, isAbsoluteHookPath } from '../core/setup/hook-launcher.ts';
 import { isValidSourceId } from '../core/source-id.ts';
 import { peekLock } from '../core/pglite-lock.ts';
 import { claudePluginProvidesName, codexPluginProvidesName } from '../core/bootstrap/plugin-lanes.ts';
@@ -244,7 +244,7 @@ function parseFlags(args: string[]): SetupFlags | string {
   if (args.includes('--providers') && args.includes('--no-providers')) return 'pass --providers or --no-providers, not both';
   if (args.includes('--instructions') && args.includes('--no-instructions')) return 'pass --instructions or --no-instructions, not both';
   const workspace = value('--workspace');
-  if (workspace !== undefined && !workspace.startsWith('/') && !workspace.startsWith('~')) return '--workspace needs an absolute path';
+  if (workspace !== undefined && !isAbsoluteHookPath(workspace) && !workspace.startsWith('~')) return '--workspace needs an absolute path';
   const skillLoading = value('--skill-loading');
   if (skillLoading !== undefined && !isSkillLoading(skillLoading)) return `unknown --skill-loading '${skillLoading}'; pass off or spring`;
   const envLoading = process.env[SKILL_LOADING_ENV]?.trim();

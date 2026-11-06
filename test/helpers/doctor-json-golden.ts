@@ -23,7 +23,7 @@
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { defineNormalizer, mapStrings, scrubKeys, scrubPaths, scrubTimestamps } from './golden.ts';
 import { PROVIDER_ENV_KEYS } from './provider-env.ts';
 import { MIGRATIONS } from '../../src/core/schema-migrations/registry.generated.ts';
@@ -100,6 +100,9 @@ function settleRepoIndex(): void {
   Bun.spawnSync(['git', 'update-index', '-q', '--refresh'], { cwd: REPO_ROOT, stdout: 'ignore', stderr: 'ignore' });
 }
 
+const WIN_SH = process.platform === 'win32' ? Bun.which('sh') : null;
+const WIN_SH_DIR = WIN_SH ? dirname(WIN_SH) : null;
+
 export async function runGbrain(h: DoctorHome, args: string[], env: Record<string, string | undefined> = {}, timeoutMs = 120_000): Promise<GbrainRun> {
   const childEnv: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined) childEnv[k] = v;
@@ -115,7 +118,8 @@ export async function runGbrain(h: DoctorHome, args: string[], env: Record<strin
     GBRAIN_SKIP_STARTUP_HOOKS: '1',
     GBRAIN_TEST_NET_LOG: h.netLog,
     NO_COLOR: '1',
-    PATH: [join(h.home, 'bin'), '/usr/bin', '/bin'].join(delimiter),
+    // Windows: hooks run under Git for Windows' sh, which is not in /usr/bin or /bin there.
+    PATH: [join(h.home, 'bin'), ...(WIN_SH_DIR ? [WIN_SH_DIR] : []), '/usr/bin', '/bin'].join(delimiter),
   });
   delete childEnv.GBRAIN_TEST_CLOCK_OFFSET_MS;
   if (h.clockOffsetMs !== undefined) childEnv.GBRAIN_TEST_CLOCK_OFFSET_MS = String(h.clockOffsetMs);
