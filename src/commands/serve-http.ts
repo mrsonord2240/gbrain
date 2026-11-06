@@ -30,6 +30,7 @@ import type { OAuthTokenVerifier } from '@modelcontextprotocol/sdk/server/auth/p
 import { createAdminLimiters } from './serve-http-admin-limits.ts';
 import { mountOAuth, mountOAuthConsent, mountOwnerLoginLinks } from './serve-http-oauth.ts';
 import { createRequireAdmin, mountAdminApi, mountAdminLogin } from './serve-http-admin-api.ts';
+import { loadAdminSessions, type AdminSessions } from './serve-http-admin-session.ts';
 import { mountSpa } from './serve-http-spa.ts';
 import { mountMcp } from './serve-http-mcp.ts';
 import { createWebhookLimiters, mountWebhooks } from './serve-http-webhooks.ts';
@@ -489,8 +490,8 @@ export interface ServeHttpContext {
   /** Access-token verifier that also rejects tokens bound to a different resource. */
   resourceVerifier: OAuthTokenVerifier;
   bootstrapHash: string;
-  /** Admin cookie sessions: sessionId -> expiresAt. */
-  adminSessions: Map<string, number>;
+  /** Signed owner cookie sessions ("remember this device"). */
+  adminSessions: AdminSessions;
   adminCookie: (req: Request, maxAge: number) => CookieOptions;
   /** Magic-link nonces: nonce -> expiresAt. */
   magicLinkNonces: Map<string, number>;
@@ -731,7 +732,8 @@ export async function buildServeHttpApp(app: express.Express, engine: BrainEngin
     forcePrint: options.printAdminToken === true,
     isTty: process.stderr.isTTY === true,
   });
-  const adminSessions = new Map<string, number>(); // sessionId → expiresAt
+  // Signed "remember this device" owner sessions; survive restarts (serve-http-admin-session.ts).
+  const adminSessions = await loadAdminSessions(engine, bootstrapToken);
 
   // SSE clients for live activity feed
   const sseClients = new Set<express.Response>();
@@ -818,7 +820,7 @@ export async function buildServeHttpApp(app: express.Express, engine: BrainEngin
   // The HTTP MCP surface never sees localOnly operations; serve-http-mcp.ts
   // narrows this list further per request (surface, grants, scope).
   const mcpOperationsBase = operations.filter(op => !op.localOnly);
-  const requireAdmin = createRequireAdmin(adminSessions);
+  const requireAdmin = createRequireAdmin(adminSessions, adminCookie);
   const { ingestRateLimiter, githubWebhookLimiter } = createWebhookLimiters();
   const ctx: ServeHttpContext = {
     noticeLedger: new NoticeLedger(), readinessCache: createReadinessCache(), engine, config, sql, bind, enableDcr, logFullParams, surface: options.surface, advertise: options.advertise ?? null, mcpOperationsBase,
@@ -834,7 +836,7 @@ export async function buildServeHttpApp(app: express.Express, engine: BrainEngin
   mountHealth(app, ctx);
   mountAdminLogin(app, ctx);
   mountOwnerLoginLinks(app, ctx);
-  mountOAuthConsent(app, oauthProvider, requireAdmin, adminLimits.consent);
+  mountOAuthConsent(app, oauthProvider, requireAdmin, adminLimits.consent, cookie => adminSessions.sessionId(cookie));
   mountMetrics(app, ctx);
   mountAdminApi(app, ctx);
   await mountSpa(app, ctx);

@@ -70,9 +70,17 @@ Interactive startup prints it; captured/non-TTY startup hides it. Starting
 `gbrain serve --http --print-admin-token` separately does **not** reveal the
 credential of the already running process. If that process's generated value is
 unavailable, use the host's normal maintenance procedure to restart the existing
-service with a protected configured credential. Existing login sessions, links,
-and pending OAuth approvals do not survive a restart; restart the connection
-from the native client afterward.
+service with a protected configured credential. Login links and pending OAuth
+approvals do not survive a restart; restart the connection from the native
+client afterward.
+
+### Owner sessions (remember this device)
+
+Signing in, by credential or login link, remembers that browser for 90 days, and
+each day of use pushes the expiry out again. Sessions survive a server restart
+while the owner credential stays the same. Changing the credential signs every
+browser out, and so does **Sign out everywhere** in the dashboard, which also
+holds across restarts.
 
 ## Open the owner dashboard
 

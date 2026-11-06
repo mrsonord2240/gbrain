@@ -4,8 +4,9 @@
  * the /admin/events SSE feed. Every /admin/api route here carries requireAdmin
  * first (test/serve-http-admin-route-guard.test.ts).
  */
-import express, { type Express, type Request, type RequestHandler, type Response } from 'express';
-import { createHash, randomBytes } from 'crypto';
+import express, { type CookieOptions, type Express, type Request, type RequestHandler, type Response } from 'express';
+import { createHash } from 'crypto';
+import { ADMIN_SESSION_TTL_MS, type AdminSessions } from './serve-http-admin-session.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { safeHexEqual } from '../core/timing-safe.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
@@ -164,20 +165,18 @@ export async function queryAgentClientSpend(engine: BrainEngine): Promise<AgentC
   }));
 }
 
-/** Admin auth middleware over the server's cookie-session map (sessionId -> expiresAt). */
-export function createRequireAdmin(adminSessions: Map<string, number>): RequestHandler {
+/** Admin auth middleware over the signed owner session cookie; slides the expiry on use. */
+export function createRequireAdmin(
+  adminSessions: AdminSessions,
+  adminCookie: (req: express.Request, maxAge: number) => CookieOptions,
+): RequestHandler {
   return function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
-      const sessionId = (req.cookies as Record<string, string>)?.gbrain_admin;
-      if (!sessionId || !adminSessions.has(sessionId)) {
-        res.status(401).json({ error: 'Admin authentication required' });
+      const check = adminSessions.verify((req.cookies as Record<string, string>)?.gbrain_admin);
+      if (!check.ok) {
+        res.status(401).json({ error: check.reason === 'expired' ? 'Session expired' : 'Admin authentication required' });
         return;
       }
-      const expiresAt = adminSessions.get(sessionId)!;
-      if (Date.now() > expiresAt) {
-        adminSessions.delete(sessionId);
-        res.status(401).json({ error: 'Session expired' });
-        return;
-      }
+      if (check.refreshed) res.cookie('gbrain_admin', check.refreshed, adminCookie(req, ADMIN_SESSION_TTL_MS));
       next();
   };
 }
@@ -206,11 +205,7 @@ export function mountAdminLogin(app: Express, ctx: ServeHttpContext): void {
     }
 
     res.locals.ownerAuthenticated = true;
-    const sessionId = randomBytes(32).toString('hex');
-    const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
-    adminSessions.set(sessionId, expiresAt);
-
-    res.cookie('gbrain_admin', sessionId, adminCookie(req, 24 * 60 * 60 * 1000));
+    res.cookie('gbrain_admin', adminSessions.issue(), adminCookie(req, ADMIN_SESSION_TTL_MS));
     res.json({ status: 'authenticated' });
   });
 }
@@ -240,14 +235,18 @@ function mountAdminOverviewApi(app: Express, ctx: ServeHttpContext): void {
   // Admin API endpoints
   // ---------------------------------------------------------------------------
 
-  // Sign-out-everywhere: nuke ALL active admin sessions in-memory. Every
-  // browser/tab fails its next request, gets 401, redirects to login.
-  // The bootstrap token itself is unaffected (still valid for new
-  // magic-link mints) — this only revokes existing cookie sessions.
-  app.post('/admin/api/sign-out-everywhere', requireAdmin, (_req: Request, res: Response) => {
-    const count = adminSessions.size;
-    adminSessions.clear();
-    res.json({ revoked_sessions: count });
+  // Sign-out-everywhere: bump the persisted session epoch, so every issued
+  // cookie fails its next request (also after a restart), gets 401 and
+  // redirects to login. The bootstrap token itself is unaffected (still valid
+  // for new logins and magic-link mints).
+  app.post('/admin/api/sign-out-everywhere', requireAdmin, async (_req: Request, res: Response) => {
+    try {
+      await adminSessions.revokeAll();
+      res.json({ revoked_sessions: 'all' });
+    } catch {
+      // Already revoked in this process; only the restart-proof record failed.
+      res.status(500).json({ error: 'Sessions are revoked until this server restarts, but the revocation could not be saved. Try again.' });
+    }
   });
 
   app.get('/admin/api/agents', requireAdmin, async (_req: Request, res: Response) => {

@@ -20,6 +20,7 @@ import { mcpAdministrationGuidance } from '../mcp/capabilities.ts';
 import { AGENT_LABEL_HEADER } from '../core/persistence/attribution.ts';
 import { VERSION } from '../version.ts';
 import type { ServeHttpContext } from './serve-http.ts';
+import { ADMIN_SESSION_TTL_MS } from './serve-http-admin-session.ts';
 
 /**
  * Parse `GBRAIN_HTTP_CORS_ORIGIN` into a Set of allowed origins for OAuth
@@ -340,12 +341,7 @@ export function mountOwnerLoginLinks(app: Express, ctx: ServeHttpContext): void 
     magicLinkNonces.delete(nonce);
     consumedNonces.add(nonce);
 
-    res.locals.ownerAuthenticated = true;
-    const sessionId = randomBytes(32).toString('hex');
-    const sessionExpiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days for magic link
-    adminSessions.set(sessionId, sessionExpiresAt);
-
-    res.cookie('gbrain_admin', sessionId, adminCookie(req, 7 * 24 * 60 * 60 * 1000));
+    res.cookie('gbrain_admin', adminSessions.issue(), adminCookie(req, ADMIN_SESSION_TTL_MS));
     const pendingId = req.query.oauth_request;
     if (pendingId !== undefined && !oauthProvider.grants.hasPending(pendingId)) {
       res.status(410).send('This OAuth request expired, completed, or the server restarted. Restart authorization in the native client and ask the server administrator for a new login link with the new pending-request ID.');
@@ -472,10 +468,18 @@ export function mountConfidentialOAuth(app: Express, provider: GBrainOAuthProvid
   });
 }
 
-export function mountOAuthConsent(app: Express, provider: GBrainOAuthProvider, requireAdmin: RequestHandler, rateLimiter: RequestHandler): void {
+/**
+ * `sessionKey` maps the owner cookie to the login it belongs to, so a sliding
+ * cookie refresh keeps the consent CSRF valid while a new login does not.
+ * Defaults to the raw cookie value.
+ */
+export function mountOAuthConsent(app: Express, provider: GBrainOAuthProvider, requireAdmin: RequestHandler, rateLimiter: RequestHandler,
+  sessionKey: (cookie: string) => string | null = cookie => cookie): void {
   const csrfKey = randomBytes(32);
-  const csrfFor = (req: Request, id: string): string => createHmac('sha256', csrfKey)
-    .update(String(req.cookies?.gbrain_admin ?? '')).update('\0').update(id).digest('hex');
+  const csrfFor = (req: Request, id: string): string => {
+    const cookie = String(req.cookies?.gbrain_admin ?? '');
+    return createHmac('sha256', csrfKey).update(sessionKey(cookie) ?? cookie).update('\0').update(id).digest('hex');
+  };
   const handleError = (res: Response, error: unknown): void => {
     if (error instanceof OAuthConsentError) {
       res.status(error.status).json({ error: error.code, message: error.message });

@@ -169,11 +169,47 @@ describe('owner administration vs OAuth admin tokens', () => {
     const second = await ownerCookie(app);
     const signOut = await fetch(`${app.base}/admin/api/sign-out-everywhere`, { method: 'POST', headers: { Cookie: first } });
     expect(signOut.status).toBe(200);
-    expect(await signOut.json()).toEqual({ revoked_sessions: 2 });
+    expect(await signOut.json()).toEqual({ revoked_sessions: 'all' });
     for (const cookie of [first, second]) {
       expect((await fetch(`${app.base}/admin/api/stats`, { headers: { Cookie: cookie } })).status).toBe(401);
     }
     expect((await fetch(`${app.base}/admin/api/stats`, { headers: { Cookie: await ownerCookie(app) } })).status).toBe(200);
+  });
+});
+
+describe('remember this device: owner sessions outlive a server restart', () => {
+  test('a cookie from one server process is accepted by the next one on the same credential, for 90 days', async () => {
+    const credential = 'synthetic-owner-credential-0123456789abcdef';
+    await withEnv({ GBRAIN_ADMIN_BOOTSTRAP_TOKEN: credential }, async () => {
+      const before = await startApp();
+      const login = await fetch(`${before.base}/admin/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: credential }),
+      });
+      const setCookie = login.headers.get('set-cookie')!;
+      expect(setCookie).toContain(`Max-Age=${90 * 24 * 60 * 60}`);
+      const cookie = setCookie.split(';')[0];
+      await before.close();
+      const after = await startApp();
+      expect((await fetch(`${after.base}/admin/api/stats`, { headers: { Cookie: cookie } })).status).toBe(200);
+    });
+  });
+
+  test('sign-out-everywhere also holds across a restart; a different credential accepts no old cookie', async () => {
+    const credential = 'synthetic-owner-credential-fedcba9876543210';
+    await withEnv({ GBRAIN_ADMIN_BOOTSTRAP_TOKEN: credential }, async () => {
+      const first = await startApp();
+      const cookie = await ownerCookie(first);
+      expect((await fetch(`${first.base}/admin/api/sign-out-everywhere`, { method: 'POST', headers: { Cookie: cookie } })).status).toBe(200);
+      await first.close();
+      const restarted = await startApp();
+      expect((await fetch(`${restarted.base}/admin/api/stats`, { headers: { Cookie: cookie } })).status).toBe(401);
+      const fresh = await ownerCookie(restarted);
+      expect((await fetch(`${restarted.base}/admin/api/stats`, { headers: { Cookie: fresh } })).status).toBe(200);
+      await withEnv({ GBRAIN_ADMIN_BOOTSTRAP_TOKEN: `${credential}-rotated` }, async () => {
+        const rotated = await startApp();
+        expect((await fetch(`${rotated.base}/admin/api/stats`, { headers: { Cookie: fresh } })).status).toBe(401);
+      });
+    });
   });
 });
 
