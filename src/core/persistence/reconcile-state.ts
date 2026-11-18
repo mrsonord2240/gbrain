@@ -10,7 +10,7 @@ import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { REVISION_BACKFILL_PENDING, type PageSnapshot } from '../page-state/types.ts';
 import { revisionBackfillExhausted, REVISION_BACKFILL_RESUME_COMMAND } from '../page-state/revision-backfill-schema.ts';
-import { isWriteTargetContained } from '../path-confine.ts';
+import { isWriteTargetContained, relativeEscapesRoot } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { absentCanonicalPath, findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
 import { wholeBodySnapshot } from './segmented-apply.ts';
@@ -109,7 +109,7 @@ export function canonicalDeletionState(root: string, path: string): 'in_head' | 
   if (!head.ok) return head.reason === 'exit' && head.status === 1 ? 'gone' : 'unknown';
   let repoPath: string;
   try { repoPath = relative(realpathSync(top.stdout.toString('utf8').trim()), absentCanonicalPath(path)).split(sep).join('/'); } catch { return 'unknown'; }
-  if (!repoPath || repoPath.startsWith('..')) return 'unknown';
+  if (!repoPath || relativeEscapesRoot(repoPath)) return 'unknown';
   const listed = hardenedGitSync(root, ['ls-tree', '-z', '--full-tree', 'HEAD', '--', repoPath], limits);
   if (!listed.ok) return 'unknown';
   return listed.stdout.toString('utf8').split('\0').some(entry => entry.split('\t')[1] === repoPath) ? 'in_head' : 'gone';
@@ -214,6 +214,18 @@ async function assertSoleFileClaim(engine: BrainEngine, target: FileClaimTarget)
       { argv: originTwinsPreviewArgv(target.sourceId) }) });
 }
 /**
+ * #6394: the file at a page's slug path that `adoptSlugPath` reconciles it against, or null when the page records a file
+ * origin, publishes database-only by design (a declared db_only slug, a never-filed derive-phase page), is mirror-only, or
+ * its slug path cannot be derived inside the source. `root` is the realpath of the source root. Throws
+ * `slug_path_ambiguous` when several files import as the slug. liveFileDrift reads an origin twin's drift with it.
+ */
+export async function adoptableSlugOrigin(engine: BrainEngine, sourceId: string, root: string, snapshot: PageSnapshot,
+  mode: 'git-root' | 'source-root'): Promise<{ path: string; sourcePath: string } | null> {
+  if (!recordsNoFileOrigin(snapshot.page) || publishesDatabaseOnly(root, snapshot.page.slug, snapshot) || await isMirrorOnlyPage(engine, sourceId, snapshot.page.slug)) return null;
+  const derived = slugDerivedOrigin(root, snapshot.page.slug, mode);
+  return derived && isWriteTargetContained(derived.path, root) ? derived : null;
+}
+/**
  * #6394: `adoptSlugPath` lets a live page with no recorded origin and no database-only marker reconcile against the file
  * at its slug path (mode-aware, as discovery names it). A page that publishes database-only by design (a declared db_only
  * slug, a never-filed derive-phase page) or a mirror-only page never adopts one.
@@ -239,9 +251,8 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
   const recordedPath = recordedReconcilePath(root, snapshot.page, mode);
   const marked = !recordedPath && (isDatabaseOnlyPage({ ...snapshot.page,
     database_only_reason: await isUnboundSourcePage(engine, sourceId, slug) ? 'unbound_source' : null }) || await staleMirrorPage(engine, sourceId, snapshot.page));
-  const adoptable = !recordedPath && !marked && opts.adoptSlugPath === true && recordsNoFileOrigin(snapshot.page)
-    && !publishesDatabaseOnly(root, slug, snapshot) && !await isMirrorOnlyPage(engine, sourceId, slug);
-  const derived = marked || adoptable ? slugDerivedOrigin(root, slug, mode) : null;
+  const adoptable = !recordedPath && !marked && opts.adoptSlugPath === true;
+  const derived = marked ? slugDerivedOrigin(root, slug, mode) : adoptable ? await adoptableSlugOrigin(engine, sourceId, root, snapshot, mode) : null;
   const origin = derived ? 'slug_derived' : 'recorded';
   const path = recordedPath ?? derived?.path ?? null;
   if (!path || !isWriteTargetContained(path, root)) throw opError('source_changed', 'The page has no unambiguous confined recorded Markdown origin.',

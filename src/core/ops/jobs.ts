@@ -1,6 +1,6 @@
 import { prepareRemoteJob, prepareRemoteAgent, assertRemoteJobControl } from '../minions/submission-authority.ts';
 import type { MinionJob } from '../minions/types.ts';
-import { jobActorSql, NO_JOB_ACTOR, type JobActor } from '../minions/types.ts';
+import { jobActorSql, jobAudienceKey, type JobActor } from '../minions/types.ts';
 import { currentCallerAccess } from '../search/private-visibility.ts';
 
 function publicJob(job: MinionJob) {
@@ -54,6 +54,7 @@ import { opError, type OperationError } from './contract.ts';
 import type { Action } from '../agent-output.ts';
 import { hostFix, invalidParam, readFix, scopeDeniedError } from './op-fix.ts';
 import { hasScope } from '../scope.ts';
+import { emitReportBackNotice } from '../report-back-notice.ts';
 import { LIST_JOBS_DEFAULT_LIMIT, LIST_JOBS_REMOTE_MAX_LIMIT, pagingLimit, reportJobPage } from './read-paging.ts';
 import { SOURCE_ID_RE } from '../source-id.ts';
 import {
@@ -270,6 +271,7 @@ const submit_job: Operation = {
     // fail-open). The job is already persisted; a probe failure degrades to
     // {probe_failed: true}, never an error on a successful submission.
     await emitNoWorkerNotice(ctx, job.queue);
+    emitReportBackNotice(ctx, job.id);
     return { ...publicJob(job), queue_state: await probeQueueStateSafe(ctx, job.queue, [name]) };
   },
 };
@@ -349,12 +351,13 @@ function delegationDenied(ctx: OperationContext, error: Error & { reasons: strin
 //   3. The dispatcher is the subagent handler with the gateway-native loop
 //      (agent.use_gateway_loop is auto-on for submit_agent jobs).
 /**
- * GST-359 C2: the caller's attested actor, matched against a job's accepted grant (jobActorSql in minions/types.ts). A remote
- * agent job never coalesces (queue.add coalesces application jobs only), so two people's submissions stay two jobs.
+ * GST-359 C2: the caller's attested actor, else its audience, matched against a job's accepted grant (jobActorSql in
+ * minions/types.ts) the way prepareRemoteAgent stores them. A remote agent job never coalesces (queue.add coalesces
+ * application jobs only), so two people's submissions stay two jobs.
  */
 function callerJobActor(): JobActor {
-  const actor = currentCallerAccess().actor;
-  return actor ? [actor.system, actor.external_id, actor.member] : NO_JOB_ACTOR;
+  const { actor, audience } = currentCallerAccess();
+  return actor ? [actor.system, actor.external_id, actor.member, ''] : ['', '', '', jobAudienceKey(audience)];
 }
 
 const submit_agent: Operation = {
@@ -493,6 +496,7 @@ const submit_agent: Operation = {
       });
     } catch { /* never block submission */ }
 
+    emitReportBackNotice(ctx, job.id);
     // Amendments 24/25: the returned job id means nothing if the lane is
     // dead — attach a time-bounded, fail-open queue-state probe.
     return {

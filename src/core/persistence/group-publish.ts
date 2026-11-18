@@ -207,7 +207,7 @@ export function preparationReads(engine: BrainEngine, imports?: ImportGroupReads
   };
   return new Proxy(engine, { get(target, key) {
     // A shared read takes no member's signal: a caller's own signal bypasses the memo, and (#6278) a bounded preparation read
-    // (`timeoutMs`, whose signal only covers its connection wait) is answered once with the member's bound and signal dropped.
+    // (`timeoutMs`, ended by its bound or its signal) is answered once with the member's bound and signal dropped.
     if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number }) =>
       stable.has(flat(sql)) && (!opts?.signal || opts.timeoutMs !== undefined)
         ? once(JSON.stringify([flat(sql), params ?? null]), () => target.executeRaw(sql, params)) : target.executeRaw(sql, params, opts);
@@ -500,8 +500,9 @@ function seam(name: PublicationBoundary, row: WriteRequest): Promise<void> {
 export async function publishSingleWrite(engine: BrainEngine, row: WriteRequest, prepared: PreparedMutation, hostId = hostIdFor(engine), hooks: GroupHooks = {},
   transaction?: TransactionRunner): Promise<WriteRequest> {
   const single: PublicationHooks = hooks.projectionPending ? { projectionPending: hooks.projectionPending } : {};
-  // PR B: a write deferred behind a refresh takes the plain path, whose refresh-change check runs before anything publishes.
-  if (engine.kind !== 'postgres' || row.deferred_refresh_id || !singleWrite(row) || !groupable(row, prepared) || !await writeSwitchOn(engine, 'single_write_group').catch(() => true)) {
+  // PR B: a write deferred behind a refresh takes the plain path, whose refresh-change check runs before anything publishes;
+  // GST-1623: so does one held for an import, whose check for a later write that committed first runs there too.
+  if (engine.kind !== 'postgres' || row.deferred_refresh_id || row.deferred_import_from != null || !singleWrite(row) || !groupable(row, prepared) || !await writeSwitchOn(engine, 'single_write_group').catch(() => true)) {
     return publishMutation(engine, row, prepared, hostId, single);
   }
   try { assertMutationProtocol(row); } catch { return publishMutation(engine, row, prepared, hostId, single); }

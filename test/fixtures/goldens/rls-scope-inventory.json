@@ -385,12 +385,12 @@
       },
       "deletePages#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -2945,6 +2945,34 @@
         ],
         "flagOnScopes": []
       },
+      "sealChunks#default": {
+        "flagOffLanes": [
+          "tx"
+        ],
+        "flagOffOpensTransaction": true,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx",
+          "tx>sp"
+        ],
+        "flagOnScopes": [
+          "default"
+        ]
+      },
+      "sealChunks#expectedRevision": {
+        "flagOffLanes": [
+          "tx"
+        ],
+        "flagOffOpensTransaction": true,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx",
+          "tx>sp"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
       "searchKeyword#cjk": {
         "flagOffLanes": [
           "pool",
@@ -3739,6 +3767,7 @@
         "getTimelineForDate": "none",
         "getUnverifiedExtractionPageIds": "none",
         "getVersions": "none",
+        "holdSchemaMigrationLock": "none",
         "initSchema": "none",
         "insertFact": "none",
         "insertFacts": "none",
@@ -3819,6 +3848,7 @@
         "runMigration": "none",
         "runUnsafe": "none",
         "runVectorAttempt": "direct",
+        "sealChunks": "none",
         "searchKeyword": "direct",
         "searchKeywordChunks": "direct",
         "searchKeywordPages": "direct",

@@ -39,7 +39,7 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import { PoolCapacityError } from '../pool-budget.ts';
 import { READ_WRITE_BEGIN } from '../postgres-engine/read-write-transactions.ts';
-import { withReadDeadline } from '../read-deadline.ts';
+import { ReadDeadlineError, withReadDeadline } from '../read-deadline.ts';
 import { recordClaimSql, type ClaimPhaseClock } from './claim-phase.ts';
 import { registerEngineView, viewedEngine } from './switches.ts';
 
@@ -101,7 +101,7 @@ export function boundedReads(engine: BrainEngine, clock: ClaimPhaseClock | undef
         throw new PreparationDeadlineError(clock!.step, null);
       }
       try {
-        // The clock's signal ends only the wait for a free connection (a saturated pool); the statement itself ends at the bound.
+        // The clock's signal ends the wait for a free connection (a saturated pool) and cancels a reserved statement (#8155); otherwise the statement ends at the bound.
         return await target.executeRaw(sql, params, { ...opts, timeoutMs: Math.max(1, deadlineAt - Date.now()), ...(clock!.signal ? { signal: clock!.signal } : {}) });
       } catch (error) {
         // A connection the engine discarded after the budget's cancel (a pooler that never completed the round-trip) is the deadline too.
@@ -117,9 +117,10 @@ export function boundedReads(engine: BrainEngine, clock: ClaimPhaseClock | undef
     return (...args: unknown[]) => {
       const result = withReadDeadline(deadlineAt, () => value.apply(target, args));
       return result instanceof Promise ? result.catch(error => {
-        if (!isStatementTimeout(error) || isSharedReadFailure(error) || Date.now() < deadlineAt) throw error;
+        const refused = error instanceof ReadDeadlineError;
+        if (!refused && (!isStatementTimeout(error) || isSharedReadFailure(error) || Date.now() < deadlineAt)) throw error;
         if (clock!.signal?.aborted) throw clock!.signal.reason;
-        throw new PreparationDeadlineError(clock!.step, error.code, error);
+        throw new PreparationDeadlineError(clock!.step, refused ? null : error.code, error);
       }) : result;
     };
   } }), viewedEngine(engine));

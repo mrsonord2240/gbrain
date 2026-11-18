@@ -32,18 +32,18 @@ export const LEDGER_ROTATE_BYTES = 4 * 1024 * 1024;
 const LINE_MAX_BYTES = 1023;
 const LOCK_WAIT_MS = 2_000;
 
-export interface LedgerCommit { sha: string; writer: LedgerWriter; ref?: string | null; request_id?: string | null; worktree_id?: string | null }
+export interface LedgerCommit { sha: string; writer: LedgerWriter; ref?: string | null; request_id?: string | null; worktree_id?: string | null; supersedes?: string[]; adopted?: string[]; verified?: true }
 export interface LedgerIntent { writer: LedgerWriter; head_before: string | null; message: string }
 
 export type LedgerRecord =
   | { v: 1; e: 'start'; t: string }
-  | { v: 1; e: 'commit'; t: string; sha: string; writer: LedgerWriter; request_id: string | null; worktree: string | null; worktree_id: string | null; ref: string | null; pid: number; host: string | null }
+  | { v: 1; e: 'commit'; t: string; sha: string; writer: LedgerWriter; request_id: string | null; worktree: string | null; worktree_id: string | null; ref: string | null; pid: number; host: string | null; supersedes?: string[]; adopted?: string[]; verified?: true }
   | { v: 1; e: 'intent'; t: string; writer: LedgerWriter; head_before: string | null; msg_sha256: string; worktree: string | null; pid: number; host: string | null };
 
 interface Location { common: string; gitDir: string; worktree: string | null }
-const locations = new Map<string, Location | null>();
+const locations = new Map<string, Location>();
 
-/** The repository's common dir, this checkout's git dir and toplevel (null for a bare repository); null outside git. */
+/** The repository's common dir, this checkout's git dir and toplevel (null for a bare repository); null outside git. Only a found location is remembered. */
 export function ledgerLocation(root: string): Location | null {
   let key = resolve(root);
   try { key = realpathSync(key); } catch { /* resolved below */ }
@@ -59,7 +59,7 @@ export function ledgerLocation(root: string): Location | null {
       found = { gitDir, common, worktree };
     }
   } catch { found = null; }
-  locations.set(key, found);
+  if (found) locations.set(key, found);
   return found;
 }
 
@@ -109,7 +109,9 @@ function line(record: LedgerRecord): string {
 
 function commitRecord(loc: Location, entry: LedgerCommit): LedgerRecord {
   return { v: 1, e: 'commit', t: new Date().toISOString(), sha: entry.sha, writer: entry.writer, request_id: entry.request_id ?? null,
-    worktree: loc.worktree, worktree_id: entry.worktree_id ?? null, ref: entry.ref === undefined ? headRef(loc.gitDir) : entry.ref, pid: process.pid, host: hostId() };
+    worktree: loc.worktree, worktree_id: entry.worktree_id ?? null, ref: entry.ref === undefined ? headRef(loc.gitDir) : entry.ref, pid: process.pid, host: hostId(),
+    ...(entry.supersedes?.length ? { supersedes: entry.supersedes } : {}), ...(entry.adopted?.length ? { adopted: entry.adopted } : {}),
+    ...(entry.verified ? { verified: true } : {}) };
 }
 
 function intentRecord(loc: Location, intent: LedgerIntent): LedgerRecord {
@@ -167,13 +169,22 @@ export async function recordIntentAsync(root: string, intent: LedgerIntent): Pro
   await writeLockedAsync(root, loc => intentRecord(loc, intent));
 }
 
-/** The retained ledger lines, oldest first (the rotated file, then the current one); unparseable lines are skipped. */
+/** One ledger file's text; null when it does not exist, and any other read error is thrown (GST-1623). */
+function readLedgerFile(file: string): string | null {
+  try { return readFileSync(file, 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+}
+
+/**
+ * The retained ledger lines, oldest first (the rotated file, then the current one); unparseable lines are skipped. Only a
+ * missing file reads as empty: any other read error throws (GST-1623), so doctor never reads an unreadable ledger as
+ * "nothing ledgered".
+ */
 export function readLedger(common: string): LedgerRecord[] {
   const files = ledgerFiles(common);
   const out: LedgerRecord[] = [];
-  for (const file of [files.rotated, files.current]) {
-    let text: string;
-    try { text = readFileSync(file, 'utf8'); } catch { continue; }
+  for (const text of [readLedgerFile(files.rotated), readLedgerFile(files.current)]) {
+    if (text === null) continue;
     for (const raw of text.split('\n')) {
       if (!raw) continue;
       try {

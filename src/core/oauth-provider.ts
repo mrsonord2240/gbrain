@@ -574,6 +574,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   // for both the SDK's public-client route and our confidential-client route.
   readonly skipLocalPkceValidation = true;
   private sql: SqlQuery;
+  private transaction?: OAuthTransaction;
   private _clientsStore: GBrainClientsStore;
   private readonly dcrDisabled: boolean;
   private tokenTtl: number;
@@ -582,6 +583,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
   constructor(options: GBrainOAuthProviderOptions) {
     this.sql = options.sql;
+    this.transaction = options.transaction;
     this.dcrDisabled = options.dcrDisabled === true;
     this.tokenTtl = options.tokenTtl || 3600;
     this.refreshTtl = options.refreshTtl || 30 * 24 * 3600;
@@ -885,7 +887,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         token,
         clientId: row.client_id as string,
         principal: { kind: 'oauth_client', id: row.client_id as string },
-        ...withAttestRight(await tokenMemberBinding(this.sql, currentGrant.member_id, currentGrant.may_act_for), currentGrant, row.token_grant),
+        ...withAttestRight(await tokenMemberBinding(this.sql, currentGrant, currentGrant.client_id_issued_at), currentGrant, row.token_grant),
         clientName: (row.client_name as string | null) ?? undefined,
         scopes: effectiveScopes,
         issuedScopes,
@@ -924,7 +926,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         ...(rowSurfaceSetBy !== undefined ? { surfaceSetBy: rowSurfaceSetBy } : {}),
         // #5575 (CEO-18): the client's read floor; current_grant is the whole row, so no projection rung needs it.
         ...(storedMinTrust(currentGrant.min_trust) ? { minTrust: storedMinTrust(currentGrant.min_trust) } : {}),
-        // GBRA-156: private pages in the sources the client's grant names (source_id + federated_read), never its bound source.
+        // GBRA-156 / GBRA-575: private pages and private facts in the sources the client's grant names (source_id + federated_read), never its bound source.
         ...(sourcesNone || rowSourceId === undefined ? {} : privatePagesAuth(grantFromClient(grantFromRow({ ...currentGrant, source_id: rowSourceId, federated_read: allowedSources ?? [] })))),
       } as CoreAuthInfo as SdkAuthInfo;
     }
@@ -957,7 +959,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         token,
         clientId: name,
         principal: { kind: 'legacy_token', id: String(legacyRows[0].id) },
-        ...withAttestRight(await tokenMemberBinding(this.sql, legacyRows[0].member_id, legacyRows[0].may_act_for), legacyRows[0], 'legacy'),
+        ...withAttestRight(await tokenMemberBinding(this.sql, legacyRows[0], legacyRows[0].created_at), legacyRows[0], 'legacy'),
         clientName: name,
         scopes: grant.scopes,
         ...(grant.allowedOperations === null ? {} : { allowedOperations: grant.allowedOperations }),
@@ -1127,7 +1129,9 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       const grant = { ...initial, ...changes, revision: 1 };
       grant.boundBrainId = normalizeGrantBrain(grant.boundBrainId);
       validateClientGrant(grant, await grantValidationContext(this.sql));
-      await insertClientGrant(this.sql, grant, { secretHash, redirectUris, grantTypes, authMethod, issuedAt: now });
+      // GST-1113: with a transaction, the scope-source check and the insert commit together under the source row locks.
+      const metadata = { secretHash, redirectUris, grantTypes, authMethod, issuedAt: now };
+      await (this.transaction ? this.transaction(sql => insertClientGrant(sql, grant, metadata)) : insertClientGrant(this.sql, grant, metadata));
       return { clientId, clientSecret };
     }
     if (grantPatch || hasScope(parseScopeString(scopes), 'agent')) {

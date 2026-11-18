@@ -74,7 +74,8 @@ describe('setup --instructions-only after a plain mcp add', () => {
     expect(claudePromptEntries(b)).toHaveLength(1);
   });
 
-  test('codex: writes the hooks.json group and its config.toml trust entry, runs it and passes', async () => {
+  // Codex runs hooks without a POSIX shell on Windows, so setup refuses its turn hook there (upstream W-H2).
+  test.skipIf(process.platform === 'win32')('codex: writes the hooks.json group and its config.toml trust entry, runs it and passes', async () => {
     const b = box();
     const r = await setup(b, ['codex', '--instructions-only', '--gbrain-bin', b.bin, '--json']);
     expect(r.exitCode).toBe(0);
@@ -96,7 +97,8 @@ describe('setup --instructions-only after a plain mcp add', () => {
     expect(text.stderr + text.stdout).toContain('exited non-zero (no output)');
   });
 
-  test('a hook that runs but adds no rule exits 1 (no_rule)', async () => {
+  // Codex runs hooks without a POSIX shell on Windows, so setup refuses its turn hook there (upstream W-H2).
+  test.skipIf(process.platform === 'win32')('a hook that runs but adds no rule exits 1 (no_rule)', async () => {
     const b = box();
     const silent = b.script('gbrain-silent', 'exit 0');
     const r = await setup(b, ['codex', '--instructions-only', '--gbrain-bin', silent, '--json']);

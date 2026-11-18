@@ -33,9 +33,9 @@ import {
   COLUMN_NAME_REGEX,
   EmbeddingColumnNotRegisteredError,
 } from '../search/embedding-column.ts';
-import { chunkDocumentOrder, chunkGenerationFilter, chunkManifestJoin, chunkVisibleFilter, chunkWriteInvalidations, currentTextProjectionFilter, movableChunkSql, requiresSafeChunks, safeChunksFilter } from '../search/safe-chunks.ts';
+import { chunkDocumentOrder, chunkGenerationFilter, chunkManifestJoin, chunkVisibleFilter, chunkWriteInvalidations, movableChunkSql, requiresSafeChunks, safeChunksFilter, servedTextProjectionFilter } from '../search/safe-chunks.ts';
 import { privatePagesFilterForCaller } from '../search/private-visibility.ts';
-import { splitEmbeddingSignature, lockEmbeddingSources } from '../embedding-invalidation.ts';
+import { currentSpaceChunkPredicate, splitEmbeddingSignature, lockEmbeddingSources } from '../embedding-invalidation.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from '../embed-skip.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from '../quarantine.ts';
 import { pageBudgetLimitedFilter } from '../page-size-policy.ts';
@@ -46,6 +46,7 @@ import type { LegacyUnscopedRead, ScopedRead } from './brands.ts';
 import { joinFragments, renderFragment, sqlFragment, trustedSql, type SqlFragment } from './fragment.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { compileRowNormalizer } from './normalize.ts';
+import { sealPageTextProjection } from '../page-state/text-seal.ts';
 
 /** The engine's page-state guards, run on the same (transaction) engine. */
 export interface ChunkPageGuards {
@@ -127,7 +128,8 @@ export async function upsertChunksOnce(
         if ((await exec.unsafe(invalidation.sql, invalidation.params)).rows.length > 0) break;
       }
       if (chunks.length === 0) {
-        await exec.run(sqlFragment`DELETE FROM content_chunks WHERE page_id = ${pageId}`);
+        await exec.run(sqlFragment`WITH gone AS (DELETE FROM content_chunks WHERE page_id = ${pageId} RETURNING page_id)
+          UPDATE pages SET text_projection_revision = NULL WHERE id = (SELECT page_id FROM gone LIMIT 1) AND text_projection_revision IS NOT NULL`);
         return;
       }
     } else if (chunks.length === 0) return;
@@ -501,12 +503,22 @@ export async function getChunkPage(
  * embedding_signature drift (NULL grandfathered). `includeNullSignature`
  * (#3391) lifts the grandfather clause so pre-stamp pages count as stale
  * too (provider-migration paths). Shared by countStaleChunks +
- * sumStaleChunkChars so they can't drift.
+ * sumStaleChunkChars so they can't drift. #8811: `arm` narrows it to one of
+ * its two disjoint halves, an unembedded chunk or an embedded chunk of a page
+ * whose signature drifted.
  */
-function staleChunkWhere(column: string, opts?: StaleChunkOpts): SqlFragment {
+function staleChunkWhere(column: string, opts?: StaleChunkOpts, arm?: 'unembedded' | 'drifted'): SqlFragment {
   const staleColRef = trustedSql(`cc.${quoteIdentifier(column)}`);
   const conds: SqlFragment[] = [sqlFragment`p.deleted_at IS NULL`, sqlFragment`${trustedSql(chunkGenerationFilter('p', 'cc'))}`];
-  if (opts?.signature !== undefined) {
+  if (arm === 'unembedded') {
+    conds.push(sqlFragment`${staleColRef} IS NULL`);
+  } else if (arm === 'drifted') {
+    conds.push(
+      opts?.includeNullSignature
+        ? sqlFragment`${staleColRef} IS NOT NULL AND (p.embedding_signature IS NULL OR p.embedding_signature <> ${opts.signature})`
+        : sqlFragment`${staleColRef} IS NOT NULL AND p.embedding_signature <> ${opts?.signature}`,
+    );
+  } else if (opts?.signature !== undefined) {
     conds.push(
       opts.includeNullSignature
         ? sqlFragment`(${staleColRef} IS NULL OR p.embedding_signature IS NULL OR p.embedding_signature <> ${opts.signature})`
@@ -538,10 +550,16 @@ export async function countStaleChunks(exec: ScopedRead, column: string, opts?: 
 export async function sumStaleChunkChars(exec: LegacyUnscopedRead, column: string, opts?: StaleChunkOpts): Promise<number> {
     // Sibling of countStaleChunks: same stale predicate, summing chunk_text
     // length for the sync cost preview. ::bigint guards int4 overflow.
-    const { text, params } = renderFragment(sqlFragment`SELECT COALESCE(SUM(LENGTH(cc.chunk_text)), 0)::bigint AS chars
+    // #8811: with a signature the predicate ORs a chunk column with a page
+    // column, which no index serves, so every content_chunks row was read on
+    // each sync. Its two disjoint halves are summed apart instead: unembedded
+    // chunks through the partial stale index, drifted pages' chunks by page.
+    const stale = (arm?: 'unembedded' | 'drifted') => sqlFragment`SELECT LENGTH(cc.chunk_text) AS chars
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
-        WHERE ${staleChunkWhere(column, opts)}`);
+        WHERE ${staleChunkWhere(column, opts, arm)}`;
+    const { text, params } = renderFragment(sqlFragment`SELECT COALESCE(SUM(chars), 0)::bigint AS chars FROM (${
+      opts?.signature === undefined ? stale() : sqlFragment`${stale('unembedded')} UNION ALL ${stale('drifted')}`}) stale`);
     const { rows } = await exec.unsafe<{ chars?: number | string }>(text, params);
     return Number(rows[0]?.chars ?? 0);
   }
@@ -554,16 +572,12 @@ export async function setPageEmbeddingSignature(exec: SqlExecutor, slug: string,
   }
 
 /**
- * `currentSpaceChunkPredicate` (embedding-invalidation.ts) as a fragment:
- * identical text, values bound in place of its hand-numbered `$model` /
- * `$dims`. `test/engine-sql-chunks.test.ts` pins the two against each other.
+ * `currentSpaceChunkPredicate` (embedding-invalidation.ts) as a fragment: built from its text, with values bound in
+ * place of its `$model` / `$dims` parameters, so the two cannot drift. `test/engine-sql-chunks.test.ts` pins them.
  */
 export function currentSpaceChunkFragment(column: string, model: string, dims: number | null): SqlFragment {
-  const colId = trustedSql(quoteIdentifier(column));
-  return sqlFragment`COALESCE(cc.${colId} IS NOT NULL
-              AND cc.model = ${model}
-              AND cc.embedded_text_hash = md5(cc.chunk_text)
-              AND vector_dims(cc.${colId}) = ${dims}::int, false)`;
+  const strings = currentSpaceChunkPredicate(quoteIdentifier(column), 9001, 9002).split(/\$900[12]/);
+  return sqlFragment(Object.assign([...strings], { raw: [...strings] }), model, dims);
 }
 
 export async function invalidateStaleSignatureEmbeddings(
@@ -801,7 +815,11 @@ export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
 
 /**
  * Shared chunkless-page-with-content predicate. Excludes quarantined pages,
- * which are chunkless by design. An embed_skip page is not: every write keeps
+ * which are chunkless by design, and pages whose current revision's text
+ * projection is sealed (#8473): the writer chunked that revision to nothing,
+ * as for a body holding only a protected takes fence, so a heal cannot
+ * produce a chunk. Deleting a page's chunks clears its seal (deleteChunks, an
+ * empty fragment replacement), so a page emptied after sealing stays healable. An embed_skip page is not excluded: every write keeps
  * its chunks for keyword search (#6722), so one with none (an older gbrain's
  * size skip, or a backfill rewrite that never landed) is drift the safety net
  * chunks; its chunks get no vectors (#7174).
@@ -815,6 +833,7 @@ function chunklessPagesWhere(opts?: { sourceId?: string }): SqlFragment {
     // body columns are NULL; its body_bytes says it has one.
     sqlFragment`(p.compiled_truth <> '' OR p.timeline <> '' OR (p.body_storage = 'segmented' AND p.body_bytes > 0))`,
     sqlFragment`${trustedSql(QUARANTINE_FILTER_FRAGMENT)}`,
+    sqlFragment`(p.text_projection_revision IS DISTINCT FROM p.knowledge_revision OR COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
     sqlFragment`NOT EXISTS (SELECT 1 FROM content_chunks cc WHERE cc.page_id = p.id)`,
   ];
   if (opts?.sourceId) conds.push(sqlFragment`p.source_id = ${opts.sourceId}`);
@@ -871,7 +890,7 @@ function chunkEmbeddingState(column: string): SqlFragment {
       ELSE 'keyword_only' END`;
 }
 
-/** A live page with no chunk row: quarantined, healable with a body (`chunklessPagesWhere`, embed_skip included: #7174), else empty. */
+/** A live page with no chunk row: quarantined, healable with a body (`chunklessPagesWhere`, embed_skip included: #7174), else empty (no body, or a sealed projection with no chunks: #8473). */
 function chunklessPageState(): SqlFragment {
   return sqlFragment`CASE
       WHEN NOT ${trustedSql(QUARANTINE_FILTER_FRAGMENT)} THEN 'quarantined'
@@ -1027,12 +1046,51 @@ export async function listEmbeddingStateRows(exec: ScopedRead, column: string,
   return rows.map(row => normalizeStateRow(row));
 }
 
+/** The transaction engine's own steps `sealChunks` runs (its page guard, chunk delete and sealing chunk insert). */
+export interface ChunkSealSteps extends ChunkPageGuards, Pick<BrainEngine, 'executeRaw'> {
+  deleteChunks(slug: string, opts: { sourceId: string }): Promise<void>;
+  upsertChunks(slug: string, chunks: ChunkInput[], opts: { sourceId: string; sealChunkerVersion: number }): Promise<void>;
+}
+
+/**
+ * BrainEngine.sealChunks, run inside the caller's page transaction: replace a page's chunks and seal its text
+ * projection at its current revision, the projection write `installPageProjection` makes with `seal: true`
+ * (page-state/projections.ts) without its embedding-context conflict checks. It refuses a missing or deleted page,
+ * a page in an archived source, a segmented page (its projection is built from its segments) and a stale
+ * `expectedRevision`. The text seal is `sealPageTextProjection` (page-state/text-seal.ts).
+ */
+export async function sealChunks(exec: SqlExecutor, steps: ChunkSealSteps, slug: string, chunks: ChunkInput[],
+  opts?: { sourceId?: string; expectedRevision?: string }): Promise<void> {
+  slug = validateSlug(slug);
+  const sourceId = opts?.sourceId ?? 'default';
+  await steps.lockPageKeys([{ sourceId, slug }]);
+  const current = await steps.readPageSnapshot(slug, { sourceId, requireLiveSource: true });
+  if (!current || current.page.deleted_at) throw new Error(`Page not found: ${slug} (source=${sourceId})`);
+  if (current.page.body_storage === 'segmented') throw new Error(`sealChunks refuses segmented page ${slug} (source=${sourceId}): its projection is built from its segments`);
+  if (opts?.expectedRevision !== undefined) assertPageRevision(current, { expectedRevision: opts.expectedRevision });
+  await steps.deleteChunks(slug, { sourceId });
+  await steps.upsertChunks(slug, chunks, { sourceId, sealChunkerVersion: SAFE_FENCE_CHUNKER_VERSION });
+  await sealPageTextProjection(steps, slug, sourceId, current);
+  await exec.run(sqlFragment`DELETE FROM page_projection_jobs
+    WHERE source_incarnation = ${current.sourceIncarnation}::uuid AND slug = ${slug} AND revision = ${current.revision}::uuid`);
+}
+
 export async function deleteChunks(exec: SqlExecutor, slug: string, opts?: { sourceId?: string }): Promise<void> {
     const sourceId = opts?.sourceId ?? 'default';
     // Source-qualify the page-id subquery; slugs are only unique per source.
+    // Removing chunks voids the text projection seal that certified them; a
+    // writer that reinstalls the projection seals it again (#8502). The page
+    // row is locked before any chunk row (the DELETE needs its id), the order
+    // every writer takes them in, so this never deadlocks against one.
     await exec.run(sqlFragment`
-      DELETE FROM content_chunks
-      WHERE page_id = (SELECT id FROM pages WHERE slug = ${slug} AND source_id = ${sourceId})
+      WITH page AS (SELECT id FROM pages WHERE slug = ${slug} AND source_id = ${sourceId} FOR UPDATE),
+      gone AS (
+        DELETE FROM content_chunks
+        WHERE page_id = (SELECT id FROM page)
+        RETURNING page_id
+      )
+      UPDATE pages SET text_projection_revision = NULL
+      WHERE id = (SELECT page_id FROM gone LIMIT 1) AND text_projection_revision IS NOT NULL
     `);
   }
 
@@ -1135,7 +1193,7 @@ export async function getChunkWindows(exec: ScopedRead, requests: ChunkWindowReq
         FROM pages p
         JOIN sources s ON s.id = p.source_id
        WHERE p.id = ANY(${[...new Set(requests.map(r => r.page_id))]}::int[]) ${scopeSql}
-         AND p.deleted_at IS NULL AND ${trustedSql(currentTextProjectionFilter('p'))} AND NOT s.archived
+         AND p.deleted_at IS NULL AND ${trustedSql(servedTextProjectionFilter('p'))} AND NOT s.archived
          AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)} ${privateSql} ${safeSql}
     ), chunk_rows AS (
       SELECT cc.page_id, cc.id AS chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.projected_byte_start, cc.projected_byte_end, cc.occurrence_id, a.prio

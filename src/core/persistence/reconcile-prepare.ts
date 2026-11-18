@@ -6,7 +6,7 @@ import type { GBrainConfig } from '../config.ts';
 import { importFromContent, type ParsedPage } from '../import-file.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import { alignWithStored } from './align-stored.ts';
-import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, restoreHiddenFactRows, type ParsedFact } from '../facts-fence.ts';
+import { parseFactsFenceFor, renderFactsTable, replaceOrInsertFactsFence, restoreHiddenFactRows, type ParsedFact } from '../facts-fence.ts';
 import { opError } from '../ops/contract.ts';
 import { privateRequestRefusal } from './visibility-request.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
@@ -30,6 +30,7 @@ import { assertAutoDecisions } from './reconcile-additive.ts';
 import { admissionAllows, readSyncAdmission } from './sync-admission.ts';
 import { bindOrigin } from './origin-guard.ts';
 import { materializedSnapshot } from './segmented-apply.ts';
+import { sourceMirrorReadOnly } from './mirror-read-only.ts';
 
 const pageFix = (sourceId: string, slug: string): Action => readFix(`Shows page ${slug} in source ${sourceId} as stored now, with its revision, read-only.`,
   { argv: ['gbrain', 'get', '--source', sourceId, '--', slug] });
@@ -77,7 +78,7 @@ export function privateFactViolation(next: readonly ParsedFact[], prior: readonl
 }
 
 function preservePrivateFacts(incoming: string, stored: string, section: string, sourceId: string, slug: string): string {
-  const next = parseFactsFence(incoming), prior = parseFactsFence(stored);
+  const next = parseFactsFenceFor(incoming, { slug }), prior = parseFactsFenceFor(stored, { slug });
   if (next.warnings.length || prior.warnings.length) throw opError('invalid_params', 'Fact fences must parse losslessly before reconciliation.',
     'The ## Facts table of the file or of the stored page has rows that do not parse cleanly, so reconciliation cannot prove its private facts are kept; nothing was written. Repair the malformed rows in the file, then generate a fresh preview and apply it.');
   const row = privateFactViolation(next.facts, prior.facts);
@@ -167,9 +168,11 @@ export async function prepareReconcileMutation(engine: BrainEngine, row: WriteRe
     ? fileWinsContent(state.raw.toString('utf8'), state.file, prepared.result, text => readCanonicalFileText(state, row.slug, text), { sourceId: row.source_id, slug: row.slug })
     : serializePageToMarkdown({ ...state.snapshot.page, ...prepared.result }, prepared.result.tags);
   const ready = prepared.ready;
+  // A read-only mirror's checkout is never written: a file-wins result that keeps the file's exact bytes imports into the page database-only.
+  const mirror = row.intent.keep_file_bytes === true && !absent && sha256(content) === state.pins.raw_file_hash && await sourceMirrorReadOnly(engine, row.source_id);
   return {
     observedRevision: state.snapshot.revision, trust: await ownerImportTrust(engine, row, prepared.result.frontmatter, state.path),
-    file: { path: state.path, root: state.root, content, expectedBeforeHash: absent ? null : state.pins.raw_file_hash },
+    ...(mirror ? { databaseOnlyReason: 'mirror_read_only' as const } : { file: { path: state.path, root: state.root, content, expectedBeforeHash: absent ? null : state.pins.raw_file_hash } }),
     // A database-only page matched by its slug path always records that file as its origin.
     noop: ready.noop && sha256(content) === state.pins.raw_file_hash && state.origin === 'recorded',
     ...(ready.afterCommit ? { afterCommit: (target: BrainEngine) => ready.afterCommit!(target) } : {}),

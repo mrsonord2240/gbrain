@@ -28,11 +28,10 @@
 # removes the whole class for anyone working here.
 *.md text eol=lf
 
-# TSV baselines get the pin too: the ratchet parsers (engine-sql, function-size,
-# agent-contract) split rows on LF, so a CRLF checkout leaves a trailing "\r"
-# on each row's last field. The engine-sql ratchet then rejects every row as
-# malformed and the function-size ratchet matches no baseline key, so both
-# report every grandfathered entry as a new violation.
+# Ratchet baselines (scripts/*.tsv) get the pin too: their parsers split rows
+# on LF, so under a CRLF checkout every row's last field ends in "\r", no
+# baseline row matches, and verify reports every grandfathered entry as a new
+# violation on a clean checkout.
 *.tsv text eol=lf
 
 # Native source hashes and prebuilds must survive Windows checkout unchanged.

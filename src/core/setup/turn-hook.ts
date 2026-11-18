@@ -31,14 +31,15 @@
  * inspect command when it does not.
  */
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, win32 } from 'node:path';
 import { bunSpawnSync } from '../spawn.ts';
 import { ownedEntryFingerprint } from '../bootstrap/adopted-connections.ts';
 import { codexHookCensus, codexHookGroupRuns, codexHookTrustHash, codexSetupHookGroup, codexSetupTrustEntry, writeCodexSetupHooks, type CodexHookGroup } from '../bootstrap/codex-hooks.ts';
 import { appendCodexTomlTable, readCodexTomlTable, removeCodexTomlTable } from '../bootstrap/codex-toml.ts';
 import { buildClaudeHookCommand, classifyHarnessHook, hookEntryHash, removeClaudeHooksAt, writeClaudeHooksAt } from '../bootstrap/hooks.ts';
 import { CLAUDE_HOOK_DEFAULT_TIMEOUT_SECS, GBRAIN_HOOK_MARKER_KEY, claudeManagedSettingsPaths, claudeUserSettingsPath, codexConfigPath, codexHooksPath } from '../bootstrap/host-specs.ts';
-import { ensureHookLauncher, hookLauncherPath, hookLauncherState, hookShellPath, isAbsoluteHookPath } from './hook-launcher.ts';
+import { ensureHookLauncher, hookLauncherPath, hookLauncherState, hookShellPath } from './hook-launcher.ts';
+import { isSkillResolverEntry } from './skill-resolver-lane.ts';
 
 export const TURN_RULE_LANE = 'turn-rule';
 export const TURN_RULE_MARKER = 'turn-rule-v1';
@@ -76,7 +77,7 @@ export function claudeTurnRuleCommand(gbrainBin: string, gbrainHome: string | un
 }
 
 export function codexTurnRuleGroup(gbrainBin: string, gbrainHome: string | undefined, launcher: string): CodexHookGroup {
-  return codexSetupHookGroup(hookShellPath(gbrainBin), EVENT, gbrainHome ? { GBRAIN_HOME: gbrainHome } : {}, TURN_RULE_LANE, hookShellPath(launcher));
+  return codexSetupHookGroup(gbrainBin, EVENT, gbrainHome ? { GBRAIN_HOME: gbrainHome } : {}, TURN_RULE_LANE, launcher);
 }
 
 /** A Claude Code hook entry that is this lane's: marked, or (marker dropped) its command shape. */
@@ -106,7 +107,7 @@ function claudePromptEntries(path: string): Array<Record<string, unknown>> {
 
 /** An entry another gbrain lane owns (setup, workspace bootstrap, bootstrap harness). A repo's committed settings.json counts only a command that parses as gbrain's hook, never a bare marker. */
 export function isOtherGbrainEntry(e: Record<string, unknown>, committed = false): boolean {
-  if (isTurnRuleEntry(e)) return false;
+  if (isTurnRuleEntry(e) || isSkillResolverEntry(e)) return false;
   return (!committed && typeof e[GBRAIN_HOOK_MARKER_KEY] === 'string') || !!classifyHarnessHook(e, EVENT, 'any');
 }
 
@@ -131,7 +132,8 @@ export function syncTurnRuleHook(opts: { harness: TurnRuleHarness; gbrainBin: st
   const paths = opts.paths ?? {};
   const where = opts.harness === 'codex' ? codexPaths(paths).hooks : claudePath(paths);
   const print = (why: string): TurnHookOutcome => ({ harness: opts.harness, action: 'print', path: where, detail: `per-turn rule hook not installed: ${why}`, next: opts.rerun });
-  if (!opts.gbrainBin || !isAbsoluteHookPath(opts.gbrainBin)) return print('no absolute gbrain binary was found (harnesses inherit no PATH); install gbrain globally or pass --gbrain-bin');
+  if (!opts.gbrainBin || !(opts.gbrainBin.startsWith('/') || win32.isAbsolute(opts.gbrainBin))) return print('no absolute gbrain binary was found (harnesses inherit no PATH); install gbrain globally or pass --gbrain-bin');
+  if (opts.harness === 'codex' && !opts.gbrainBin.startsWith('/')) return print('Codex runs hook commands on Windows without a POSIX shell, so it cannot run gbrain\'s hook launcher');
   try {
     const launcher = paths.hookLauncher ?? hookLauncherPath();
     // The launcher goes down first: a hook that names it must find it.
