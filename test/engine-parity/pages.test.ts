@@ -195,6 +195,44 @@ describe('engine parity: pages', () => {
     return { code, body: read?.page.compiled_truth };
   });
 
+  parityTest('putPage records source_path and refuses a second live page of the same file',
+    { methods: ['putPage', 'getPage', 'softDeletePage', 'restorePage', 'deletePage'] }, async (engine, backend) => {
+      const attempt = async (run: () => Promise<unknown>) => {
+        try {
+          await run();
+          return 'ok';
+        } catch (error) {
+          const e = error as { code?: string; detail?: string; message?: string };
+          return { code: e.code ?? 'threw', detail: e.detail ?? null, message: e.message ?? null };
+        }
+      };
+      await engine.putPage('notes/a', { ...NOTE, source_path: 'notes/a.md' });
+      const recorded = (await engine.getPage('notes/a'))?.source_path ?? null;
+      const second = await attempt(() => engine.putPage('notes/b', { ...NOTE, source_path: 'notes/a.md' }));
+      const secondStored = await engine.getPage('notes/b');
+      // Writing the page again without a path keeps its path.
+      await engine.putPage('notes/a', { ...NOTE, compiled_truth: 'Edited.' });
+      const kept = (await engine.getPage('notes/a'))?.source_path ?? null;
+      // Another source may record the same path.
+      await createSource(engine, backend, 'work');
+      const otherSource = await attempt(() => engine.putPage('notes/b', { ...NOTE, source_path: 'notes/a.md' }, { sourceId: 'work' }));
+      // A soft-deleted page frees the path; reviving it while another page holds the path is refused.
+      await engine.softDeletePage('notes/a');
+      const afterDelete = await attempt(() => engine.putPage('notes/b', { ...NOTE, source_path: 'notes/a.md' }));
+      const restore = await attempt(() => engine.restorePage('notes/a'));
+      const revive = await attempt(() => engine.putPage('notes/a', NOTE));
+      const tombstone = (await engine.getPage('notes/a', { includeDeleted: true }))?.deleted_at != null;
+      await engine.deletePage('notes/b');
+      const restoredOnceFree = await attempt(() => engine.restorePage('notes/a'));
+      const final = (await engine.getPage('notes/a'))?.source_path ?? null;
+      expect(recorded).toBe('notes/a.md');
+      expect(second).toMatchObject({ code: 'page_identity_changed', detail: 'origin_already_claimed' });
+      expect(secondStored).toBeNull();
+      expect(restore).toMatchObject({ code: 'page_identity_changed' });
+      expect(final).toBe('notes/a.md');
+      return { recorded, second, secondStored, kept, otherSource, afterDelete, restore, revive, tombstone, restoredOnceFree, final };
+    });
+
   parityTest('lockPageKeys holds keys inside a transaction', { methods: ['lockPageKeys', 'transaction'] }, async (engine) => {
     await seed(engine, [['people/alice-example', ALICE]]);
     const result = await engine.transaction(async (tx) => {
@@ -265,6 +303,74 @@ describe('engine parity: pages', () => {
       dry: { slugs: dry.slugs, count: dry.count, pages: dry.pages?.map((p) => ({ slug: p.slug, source_id: p.source_id })) },
       stillThere,
       real: { slugs: real.slugs, count: real.count },
+    };
+  });
+
+  // `purgeDeletedPages(0)` takes tombstones strictly older than the statement clock, and PGLite's clock can stamp the
+  // last soft delete with the same instant as the next statement. Waiting a few milliseconds moves the clock past it.
+  const tombstonesSettle = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+  // The retirement holds (src/core/persistence/{atom,derived}-retirement-hold.ts). Neither arm can stand a tombstone days
+  // in the past here, so every stamped page is inside its window; the store unit tests in
+  // rust/crates/gbrain-store/src/page_ops.rs cover the windows closing and the atom "still restorable" rules.
+  parityTest(
+    'purgeDeletedPages keeps retired pages inside their hold windows',
+    { methods: ['purgeDeletedPages', 'softDeletePage', 'setConfig'] },
+    async (engine) => {
+      const atom: PageInput = {
+        type: 'atom' as PageInput['type'], title: 'An atom', compiled_truth: 'A claim.', timeline: '',
+        frontmatter: { retired_by: 'managed-reextract', source_slug: 'notes/origin', source_hash: 'pending:h1', retired_at: '2026-01-01' },
+      };
+      await seed(engine, [
+        ['notes/origin', NOTE],
+        ['atoms/held', atom],
+        ['notes/derived', { ...NOTE, frontmatter: { retired_by: 'extract-atoms' } }],
+        ['notes/chronicle', { ...NOTE, frontmatter: { retired_by: 'life-chronicle' } }],
+        ['notes/plain', NOTE],
+        ['notes/other', { ...NOTE, frontmatter: { retired_by: 'someone-else' } }],
+      ]);
+      for (const slug of ['atoms/held', 'notes/derived', 'notes/chronicle', 'notes/plain', 'notes/other']) await engine.softDeletePage(slug);
+      await tombstonesSettle();
+      const dryRuns: Record<string, string[]> = {};
+      for (const restoreDays of ['unset', '3', '365', 'abc', '2']) {
+        if (restoreDays !== 'unset') await engine.setConfig('generations.restore_days', restoreDays);
+        const dry = await engine.purgeDeletedPages(0, { dryRun: true });
+        expect(dry.count).toBe(dry.slugs.length);
+        dryRuns[restoreDays] = dry.slugs;
+      }
+      for (const slugs of Object.values(dryRuns)) expect(sorted(slugs)).toEqual(['notes/other', 'notes/plain']);
+      const real = await engine.purgeDeletedPages(0);
+      const purged = sorted(real.slugs);
+      expect(purged).toEqual(['notes/other', 'notes/plain']);
+      const kept: string[] = [];
+      for (const slug of ['atoms/held', 'notes/derived', 'notes/chronicle', 'notes/origin']) {
+        if (await engine.getPage(slug, { includeDeleted: true })) kept.push(slug);
+      }
+      expect(kept).toEqual(['atoms/held', 'notes/derived', 'notes/chronicle', 'notes/origin']);
+      const again = await engine.purgeDeletedPages(0, { dryRun: true });
+      return { dryRuns: Object.fromEntries(Object.entries(dryRuns).map(([k, v]) => [k, sorted(v)])), purged, count: real.count, kept, again: again.slugs };
+    },
+  );
+
+  parityTest('purgeDeletedPages skips excludeIds and treats an empty list as no filter', { methods: ['purgeDeletedPages', 'softDeletePage'] }, async (engine) => {
+    await seed(engine, [['notes/a', NOTE], ['notes/b', NOTE], ['notes/c', NOTE]]);
+    for (const slug of ['notes/a', 'notes/b', 'notes/c']) await engine.softDeletePage(slug);
+    await tombstonesSettle();
+    const idOf = async (slug: string) => (await engine.getPage(slug, { includeDeleted: true }))!.id;
+    const excludeIds = [await idOf('notes/b'), 987654321];
+    const dry = await engine.purgeDeletedPages(0, { dryRun: true, excludeIds });
+    const dryEmpty = await engine.purgeDeletedPages(0, { dryRun: true, excludeIds: [] });
+    const real = await engine.purgeDeletedPages(0, { excludeIds });
+    expect(sorted(real.slugs)).toEqual(['notes/a', 'notes/c']);
+    const rest = await engine.purgeDeletedPages(0, { excludeIds: [] });
+    expect(rest.slugs).toEqual(['notes/b']);
+    return {
+      dry: sorted(dry.slugs),
+      dryPages: sorted((dry.pages ?? []).map((p) => `${p.source_id}:${p.slug}:${p.deleted_at instanceof Date}`)),
+      dryEmpty: sorted(dryEmpty.slugs),
+      real: sorted(real.slugs),
+      realHasPages: 'pages' in real && real.pages !== undefined,
+      rest: rest.slugs,
     };
   });
 
@@ -357,4 +463,54 @@ describe('engine parity: pages', () => {
     expect(sampleSlugs).toEqual(['wiki/bio/one', 'wiki/vc/one']);
     return { prefixedView, sampleSlugs };
   });
+  parityTest(
+    'listEntityKeyRows: live, unretired pages of the types, only the named keys, keyset-paged',
+    { methods: ['putPage', 'softDeletePage', 'listEntityKeyRows'] },
+    async (engine) => {
+      await seed(engine, [
+        ['people/alice-example', { ...ALICE, frontmatter: { email: 'alice@example.com', role: 'pm', emails: ['a@example.com'] } }],
+        ['people/bob-example', { type: 'person', title: 'Bob Example', compiled_truth: 'Bob.', frontmatter: { merged_into: 'people/alice-example', email: 'b@example.com' } }],
+        ['people/carol-example', { type: 'person', title: 'Carol Example', compiled_truth: 'Carol.', frontmatter: {} }],
+        ['companies/acme-example', ACME],
+        ['notes/acme-example', { type: 'note', title: 'Acme note', compiled_truth: 'Note.', frontmatter: { email: 'n@example.com' } }],
+      ]);
+      await engine.softDeletePage('people/carol-example');
+      const args = { types: ['company', 'person'], keys: ['email', 'emails'] };
+      const first = await engine.listEntityKeyRows({ ...args, limit: 1 });
+      const rest = await engine.listEntityKeyRows({ ...args, after: { source_id: first[0]!.source_id, slug: first[0]!.slug }, limit: 10 });
+      expect([...first, ...rest].map((r) => r.slug)).toEqual(['companies/acme-example', 'people/alice-example']);
+      expect(rest[0]!.keys).toEqual({ email: 'alice@example.com', emails: ['a@example.com'] });
+      expect([...first, ...rest].every(r => /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(r.created_at))).toBe(true);
+      const untimed = (rows: typeof first) => rows.map(({ created_at: _at, page_id: _id, generation: _gen, ...r }) => r);
+      return { first: untimed(first), rest: untimed(rest) };
+    },
+  );
+  parityTest(
+    'listIdentityDecisions / applyIdentityDecisions: decisions by (source, slug), confirmed members linked, missing pages pending',
+    { methods: ['putPage', 'applyIdentityDecisions', 'listIdentityDecisions', 'listRestrictedIdentityMembers'] },
+    async (engine) => {
+      await seed(engine, [['people/alice-example', ALICE], ['people/bob-example', { type: 'person', title: 'Bob Example', compiled_truth: 'Bob.', frontmatter: {} }]]);
+      const ref = (slug: string) => ({ source_id: 'default', slug });
+      const decision = (decision_id: string, verdict: 'same' | 'different', slugs: string[]) => ({
+        decision_id, verdict, members: slugs.map(ref), group_id: `dedupe/${decision_id}`, entity_id: verdict === 'same' ? `dedupe/${decision_id}` : null,
+        canonical: verdict === 'same' ? ref(slugs[0]!) : null, decided_by: 'owner', decided_at: '2026-11-18T00:00:00Z', origin: 'database' as const,
+        home_source_id: null, git_blob: null,
+      });
+      const applied = await engine.applyIdentityDecisions({ upsert: [
+        decision('0000000000000001', 'same', ['people/alice-example', 'people/bob-example']),
+        decision('0000000000000002', 'same', ['people/carol-example', 'people/dan-example']),
+        decision('0000000000000003', 'different', ['people/alice-example', 'people/erin-example']),
+      ] });
+      expect(applied).toEqual({ upserted: 3, removed: 0, linked: 2, unlinked: 0 });
+      const read = await engine.listIdentityDecisions();
+      expect(read.decisions.map(d => [d.decision_id, d.verdict, d.members.length, d.canonical?.slug ?? null]))
+        .toEqual([['0000000000000001', 'same', 2, 'people/alice-example'], ['0000000000000002', 'same', 2, 'people/carol-example'], ['0000000000000003', 'different', 2, null]]);
+      expect(read.pending.map(p => [p.decision_id, p.slug, p.reason])).toEqual([['0000000000000002', 'people/carol-example', 'page_missing'], ['0000000000000002', 'people/dan-example', 'page_missing']]);
+      expect(await engine.listRestrictedIdentityMembers([])).toEqual([]);
+      expect(await engine.listRestrictedIdentityMembers([ref('people/alice-example'), ref('people/carol-example')])).toEqual([]);
+      const removed = await engine.applyIdentityDecisions({ remove: ['0000000000000001'] });
+      expect(removed).toEqual({ upserted: 0, removed: 1, linked: 0, unlinked: 2 });
+      return { applied, decisions: read.decisions.map(d => ({ ...d, decided_at: d.decided_at.slice(0, 10) })), pending: read.pending, removed };
+    },
+  );
 });

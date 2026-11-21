@@ -12,12 +12,16 @@
  * `coverage.test.ts` fails when the checked-in list is stale.
  *
  * A method counts as covered only through a harness case: those run on every
- * arm (PGLite always, Postgres with DATABASE_URL, Rust later) and the harness
+ * arm (PGLite always, Postgres with DATABASE_URL, Rust with GBRAIN_TEST_RUST_ARM=1) and the harness
  * proves each declared method was really called.
  *
  * The per-arm columns say what each arm must do for the method: `yes` (runs
- * and is compared), `same` (the Rust arm, once it exists, must return the same
- * answer), `refuses:<capability>` (the arm must throw the typed
+ * and is compared), `serves` (the Rust engine serves the member, so with
+ * GBRAIN_TEST_RUST_ARM=1 it must return the same answer, or end on the typed refusal of an
+ * option or input it declines (a served member can refuse part of its surface: a
+ * `source_path` write, `listColumnsOnly`, a vector, a fuzzy `resolveSlugs`, a
+ * multi-source `getChunks`), or differ only the way a row in
+ * test/rust-expected-divergence/ names), `refuses:<capability>` (the arm must throw the typed
  * `engine_capability_missing` refusal) or `n/a:<why>` (the method does not
  * exist on that arm). They come from each case's `requires` declaration and
  * test/engine-parity/arm-capabilities.ts.
@@ -26,6 +30,7 @@ import ts from 'typescript';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { PARITY_ARMS, armHas, missingCapability, type EngineCapability, type ParityArmName } from './arm-capabilities.ts';
+import { rustRefusal } from './rust-arm.ts';
 
 const REPO = join(import.meta.dir, '..', '..');
 const PARITY_DIR = import.meta.dir;
@@ -44,28 +49,31 @@ export const FAMILIES: Record<string, readonly string[]> = {
     'registerBeforeDisconnect', 'withReservedConnection'],
   pages: ['getPage', 'readPageSnapshot', 'readPageSnapshotsBatch', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'findDuplicatePages',
     'deletePage', 'deletePages', 'resolveSlugsByPaths', 'softDeletePage', 'softDeletePages', 'restorePage', 'purgeDeletedPages',
-    'listPages', 'findPages', 'countPagesBy', 'resolveSlugs', 'getAllSlugs', 'listAllPageRefs', 'listAllSources', 'updateSourceConfig',
-    'listPrefixSampledPages', 'listCorpusSample'],
+    'listPages', 'findPages', 'countPagesBy', 'resolveSlugs', 'getAllSlugs', 'listAllPageRefs', 'listEntityKeyRows', 'listIdentityDecisions', 'listRestrictedIdentityMembers', 'applyIdentityDecisions', 'listAllSources', 'listSourceLocalPaths', 'updateSourceConfig', 'getSource',
+    'listPrefixSampledPages', 'listCorpusSample', 'getPageSealState', 'refreshPageOrigin'],
   search: ['searchKeyword', 'countKeywordPages', 'searchKeywordPages', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
     'searchKeywordChunks'],
+  search_reads: ['cosinesByChunkIds', 'hasSupersedeEdges', 'supersedingPageSlugs', 'aliasCanonicalRefs', 'pageCollapseFacts',
+    'slugsEndingIn', 'generatedPagesIn', 'livePageIdsAt', 'pagesLinkingTo'],
   chunks: ['upsertChunks', 'sealChunks', 'getChunks', 'getChunkPage', 'getChunkWindows', 'countStaleChunks', 'sumStaleChunkChars',
     'setPageEmbeddingSignature', 'invalidateStaleSignatureEmbeddings', 'invalidateContentDriftEmbeddings', 'listStaleChunks',
     'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'readEmbeddingStateCounts', 'listEmbeddingStateRows',
-    'deleteChunks', 'getChunksWithEmbeddings'],
+    'deleteChunks', 'getChunksWithEmbeddings', 'deleteChunksExcept', 'setChunkerVersion', 'writeTextProjectionSeal',
+    'moveChunkIndexes', 'getChunkReuseRows'],
   extraction: ['countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch', 'markPagesAttendanceBlocked',
     'countStaleFrontmatterKeyPages', 'listStaleFrontmatterKeyPages', 'stripStaleFrontmatterKeys'],
   links: ['addLink', 'addLinksBatch', 'replaceDerivedLinks', 'replaceDerivedLinksBatch', 'removeLink', 'removeLinksByPagesAndSource',
     'getLinks', 'getBacklinks', 'listLinkSources', 'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed',
     'relationalFanout', 'relationalChainHop', 'getBacklinkCounts', 'getAdjacencyBoosts', 'getContentFlagsByPageIds',
     'getUnverifiedExtractionPageIds', 'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages'],
-  tags: ['addTag', 'removeTag', 'getTags'],
+  tags: ['addTag', 'removeTag', 'getTags', 'pruneFrontmatterTags', 'addPageTagsById'],
   timeline: ['addTimelineEntry', 'addTimelineEntriesBatch', 'getTimeline', 'getTimelineForDate', 'getSince', 'getOnThisDay',
-    'getLastSeen', 'upsertEventProjection'],
+    'getLastSeen', 'upsertEventProjection', 'removeTimelineRows', 'updateTimelineDetails'],
   ontology: ['mergeOntologyFact', 'getOntology', 'discoverOntologyDimensions', 'findOntologyConflicts'],
-  raw_files: ['putRawData', 'getRawData', 'upsertFile', 'getFile', 'listFilesForPage'],
+  raw_files: ['putRawData', 'getRawData', 'upsertFile', 'getFile', 'listFilesForPage', 'listFiles'],
   takes: ['addTakesBatch', 'updateTakeEmbeddings', 'listTakes', 'searchTakes', 'searchTakesVector', 'getTakeEmbeddings',
     'countStaleTakes', 'listStaleTakes', 'updateTake', 'supersedeTake', 'resolveTake', 'getScorecard', 'getCalibrationCurve',
-    'addSynthesisEvidence', 'listActiveTakesForPages'],
+    'addSynthesisEvidence', 'listActiveTakesForPages', 'matchTakeRows', 'deleteTakeRows'],
   dream: ['getDreamVerdict', 'putDreamVerdict', 'sweepDreamVerdicts'],
   contradictions: ['writeContradictionsRun', 'loadContradictionsTrend', 'getContradictionCacheEntry', 'putContradictionCacheEntry',
     'sweepContradictionCache'],
@@ -73,17 +81,45 @@ export const FAMILIES: Record<string, readonly string[]> = {
     'listFactsBySession', 'listSupersessions', 'countUnconsolidatedFacts', 'findCandidateDuplicates', 'consolidateFact',
     'findTrajectory', 'getFactsHealth'],
   segmented_body: ['allocateBodyOccurrenceIds', 'stageSegmentTexts', 'readSegmentTexts', 'stageManifestRows', 'readManifest',
-    'stageSegmentChunks', 'createSegmentedPageShell', 'flipBodyGeneration', 'openBodyStaging', 'setBodyStagingState', 'sweepSegments',
+    'stageSegmentChunks', 'createSegmentedPageShell', 'flipBodyGeneration', 'sealSegmentedPage', 'openBodyStaging', 'setBodyStagingState', 'sweepSegments',
     'readSegmentDerivations', 'upsertSegmentDerivations', 'retireSegmentDerivations'],
   versions: ['createVersion', 'getVersions', 'revertToVersion'],
-  stats_ingest: ['getStats', 'getHealth', 'logIngest', 'getIngestLog'],
+  stats_ingest: ['getStats', 'getHealth', 'countOnboardSignal', 'logIngest', 'getIngestLog'],
   sync_aliases: ['updateSlug', 'rewriteLinks', 'resolveSlugWithAlias', 'resolveSlugWithAliasDetailed', 'resolveAliases',
-    'setPageAliases', 'refreshPageBody', 'updatePageContextualRetrievalState', 'migrateFactsToCanonical'],
-  config: ['getConfig', 'setConfig', 'unsetConfig', 'listConfigKeys', 'getAllConfig'],
+    'setPageAliases', 'replaceDerivedAliases', 'refreshPageBody', 'updatePageContextualRetrievalState', 'migrateFactsToCanonical'],
+  config: ['getConfig', 'setConfig', 'unsetConfig', 'listConfigKeys', 'getAllConfig', 'getConfigValues'],
+  // withdrawal_pages: the page statements a fact withdrawal runs on the pages that carry the claim
+  withdrawal_pages: ['listSegmentedPages', 'invalidateWithdrawnPages'],
+  // withdrawal_fence: the withdrawal check a prepared import runs on a malformed facts fence
+  withdrawal_fence: ['hasWithdrawnFenceClaim'],
+  import_guards: ['readManagedModeRows', 'getSourceStrictness', 'readPersistenceBrainId', 'readLocalWriterRow', 'insertLocalWriterRow',
+    'readTransactionSettings', 'applyTransactionSettings', 'readLedgerSource', 'isFolderRestricted'],
+  cycle_locks: ['acquireCycleLock', 'refreshCycleLock', 'releaseCycleLock', 'readCycleLocks', 'deleteCycleLock', 'deleteCycleLockIfStale'],
   raw_sql: ['runMigration', 'executeRaw', 'executeRawDirect', 'keywordBoundedRead'],
-  code_edges: ['addCodeEdges', 'deleteCodeEdgesForChunks', 'getCallersOf', 'getCalleesOf', 'getEdgesByChunk'],
+  code_edges: ['addCodeEdges', 'deleteCodeEdgesForChunks', 'getCallersOf', 'getCalleesOf', 'getEdgesByChunk',
+    // group D (code traversal cache)
+    'getCodeTraversalCache', 'putCodeTraversalCache', 'clearCodeTraversalCache'],
   eval_capture: ['logEvalCandidate', 'listEvalCandidates', 'deleteEvalCandidatesBefore', 'logEvalCaptureFailure',
     'listEvalCaptureFailures'],
+  // large_page: the remote put_page large-page guard's stored body size read (engine-sql/large-page.ts)
+  large_page: ['readStoredBodyBytes', 'readPageBodySizes'],
+  // field_usage: schema detect --fields page samples (engine-sql/field-usage.ts)
+  field_usage: ['readFieldUsageSamples'],
+  // the decide proposal tables (engine-sql/decide-proposals.ts)
+  decide_proposals: [
+    'applyDecideReviewQueue', 'applyDecideSweepDeferred', 'getDecideProposal', 'getDecideReviewProposal',
+    'insertDecideProposal', 'insertDecideReviewProposal', 'listDecideProposalIds', 'listDecideProposals',
+    'listDecideProposedPairs', 'listDecideReviewProposalIds', 'listDecideReviewProposals', 'listDueDecideReviewQueue',
+    'listDueDecideSweepDeferred', 'readProposalReviewRates', 'transitionDecideProposal', 'transitionDecideReviewProposal'],
+  // the decide state, spend, receipt and calibration tables (engine-sql/decide-store.ts)
+  decide_store: [
+    'dailyDecideSpend', 'decideConflictNoEntityCounts', 'decideSlotUsage', 'deleteDecideState', 'ensureDecideState',
+    'getDecideCalibration', 'insertDecideCalibration', 'insertDecideReceipts', 'insertDecideSpend',
+    'listDecideCalibrations', 'listDecideMixedModelDecisions', 'listDecideReceiptStats', 'listDecideReplayReceipts',
+    'listDecideResolvedModels', 'listDecideSpendBySlot', 'pruneDecideReceipts', 'readDecideState',
+    'setDecideCalibrationRetired', 'storeDecideQualification', 'upsertDecideState'],
+  owner_only: ['ownerOnlyMarkTriggers'],
+  wanted_links: ['lockRegisteredSourceIds', 'replaceWantedLinkRows'],
   salience_enrich: ['batchLoadEmotionalInputs', 'setEmotionalWeightBatch', 'getRecentSalience', 'listEnrichCandidates', 'findAnomalies'],
 };
 
@@ -190,7 +226,12 @@ export function buildCoverage(): CoverageReport {
   const armCell = (m: string, arm: ParityArmName): string => {
     const reqs = requirements.get(m);
     if (!reqs) return '-';
-    if (reqs.some((r) => armHas(arm, r))) return arm === 'rust' ? 'same' : 'yes';
+    if (arm === 'rust') {
+      // The Rust engine serves the member (it must match PGLite, bar a row in test/rust-expected-divergence/) or refuses its capability.
+      const refusal = rustRefusal(m);
+      return refusal === null ? 'serves' : `refuses:${refusal}`;
+    }
+    if (reqs.some((r) => armHas(arm, r))) return 'yes';
     return missingCapability(reqs.find((r) => r !== undefined)!).label;
   };
   const legacy = legacyMethods(methods);
@@ -206,7 +247,10 @@ export function buildCoverage(): CoverageReport {
     '# BrainEngine parity coverage. GENERATED by `bun test/engine-parity/coverage.ts --write`; do not edit.',
     '# covered = called by a test/engine-parity harness case; the per-arm columns say where that case runs.',
     '# legacy_e2e = called by the Postgres-gated test/e2e/engine-parity*.test.ts suite (informational).',
-    '# pglite/postgres/rust = what each arm must do: yes (runs, compared), same (Rust must match once its arm exists),',
+    '# pglite/postgres/rust = what each arm must do: yes (runs, compared), serves (the Rust engine serves the member: with',
+    '#   GBRAIN_TEST_RUST_ARM=1 its case must match PGLite, end on the typed refusal of an option or input the member declines',
+    '#   (source_path writes, listColumnsOnly, vectors, fuzzy resolveSlugs, multi-source getChunks), or differ only as a row in',
+    '#   test/rust-expected-divergence/ names),',
     '#   refuses:<capability> (throws engine_capability_missing), n/a:<why> (no such member on that arm), - (not covered).',
     `# covered: ${covered.length}/${methods.length}`,
     ...perFamily,

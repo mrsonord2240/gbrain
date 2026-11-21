@@ -32,7 +32,7 @@ import { ruleCoversSql, validPrefix, validQualifiedRuleId } from '../access/fold
 import { holdingSlugSql } from '../facts-fence.ts';
 import { NAME_KEY_PAGE_DIRS } from '../entities/basename-dirs.ts';
 import { atomMovedOriginPrivateSql, atomOriginSlugsSql } from '../persistence/atom-origin.ts';
-import { ownerOnlyFactSql, ownerOnlyForm, ownerOnlyPageSql, ownerOnlySourcesPresent } from '../access/owner-only.ts';
+import { ownerOnlyFactSql, ownerOnlyForm, ownerOnlyPageSql, ownerOnlySourcesPresent, ownerOnlyTakeSql, ownerOnlyTimelineSql } from '../access/owner-only.ts';
 
 export const REMOTE_PRIVATE_PAGES_KEY = 'search.remote_private_pages';
 
@@ -366,6 +366,8 @@ export interface CallerAccess {
   privateFactSources: readonly string[];
   hidePrivate: boolean;
   owner: boolean;
+  /** GST-3058: set only by dispatch, for a direct remote call from an owner-bound credential with no room declared: the owner's widenings apply (ownerWidened). */
+  ownerReads?: boolean;
   /**
    * GST-2490 / GBRA-108 design 3: a lineage read, one member speaking for itself in a non-mutating operation: the owner
    * always, any other member only under access.members_read_lineage. Derived pages and facts pass when that member reads
@@ -438,6 +440,7 @@ export function withCallerAccess<T>(access: Partial<CallerAccess>, fn: () => T):
     applyRemoteReadPolicy: access.applyRemoteReadPolicy ?? base.applyRemoteReadPolicy,
     restricted: access.restricted ?? base.restricted,
     remotePolicy: access.remotePolicy ?? base.remotePolicy,
+    ownerReads: access.ownerReads ?? (fresh ? false : base.ownerReads === true),
   }), fn);
 }
 
@@ -450,6 +453,11 @@ function lineageReads(owner: boolean, single: boolean, lineage: boolean, readsRe
   const ownerRead = owner && read;
   return { lineage: read, ownerReadsRestricted: ownerRead && readsRestricted,
     audienceKindMembers: Object.freeze(ownerRead && audienceKind.every(id => ACCESS_ID_RE.test(id)) ? [...new Set(audienceKind)].sort() : []) };
+}
+
+/** The current read's own caller-access record, or null outside one (currentCallerAccess fills in a default instead). */
+export function callerAccessRecord(): CallerAccess | null {
+  return callerAccessStore.getStore() ?? null;
 }
 
 /** Runs `fn` outside any caller's record, for work a request spawns that must not inherit its view. */
@@ -470,6 +478,35 @@ export function privateReadableSources(): readonly string[] {
 /** GST-2059: is the current caller the brain owner (CallerAccess.owner)? False outside a remote record or a local --as of the owner. */
 export function callerIsOwner(): boolean {
   return currentCallerAccess().owner;
+}
+
+/**
+ * GST-3058: whether the owner's widenings apply: the Facts fence as stored on get_page and fetch_page, a segmented
+ * page's markdown view, every take holder for a credential with no holders list, and graph-hop text cut from fenced
+ * evidence. Off unless dispatch switched it on for a direct remote call from an owner-bound credential with no room
+ * declared; every other context (agent jobs, on-behalf-of audiences, stdio, attested actors) reads as before them.
+ */
+export function ownerWidened(): boolean {
+  const access = currentCallerAccess();
+  return access.owner && access.ownerReads === true;
+}
+
+/**
+ * GST-3064: whether a full-body read by this caller (reading these take holders, readHolders(ctx)) shows the Facts fence
+ * as stored, private and held rows included: to the owner's widened read (ownerWidened) on an inline page, and on a
+ * segmented page only when it reads every holder (that page's markdown view is paged from the stored body only then).
+ */
+export function storedFactsShown(holders: readonly string[] | undefined, segmented: boolean): boolean {
+  return ownerWidened() && (!segmented || holders === undefined);
+}
+
+/**
+ * GST-3064: sanitizeRemoteBody's `owner` option for an inline body this caller reads (storedFactsShown), keeping takes
+ * only for a caller that reads every holder. get_page, fetch and get_page as_of read an inline body through it, so
+ * they show the owner the same rows.
+ */
+export function ownerFenceView(holders: readonly string[] | undefined): { keepTakes: boolean } | undefined {
+  return storedFactsShown(holders, false) ? { keepTakes: holders === undefined } : undefined;
 }
 
 /**
@@ -887,18 +924,16 @@ export function folderRestrictedSql(alias: string): string {
  * folderRestrictedSql for a page known by its slug (a parsed page, a row read without the column, a page about to be
  * written): judged against the applied folder rules, not the stamp. A failed read counts as restricted.
  */
-export async function folderRestricted(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, slug: string): Promise<boolean> {
+export async function folderRestricted(engine: Pick<BrainEngine, 'isFolderRestricted'>, sourceId: string, slug: string): Promise<boolean> {
   try {
-    const [row] = await engine.executeRaw<{ restricted: boolean }>(
-      'SELECT (gbrain_access_folder_rules($1, $2) IS NOT NULL OR gbrain_access_pending_covers($1, $2) OR gbrain_access_state_unreadable()) AS restricted', [sourceId, slug]);
-    return row?.restricted === true;
+    return await engine.isFolderRestricted(sourceId, slug);
   } catch {
     return true;
   }
 }
 
 /** `page` with folder_restricted looked up (folderRestricted), for a page read without it, such as a page snapshot. */
-export async function withFolderRestricted(engine: Pick<BrainEngine, 'executeRaw'>, page: { source_id: string; slug: string; type?: string | null; frontmatter?: unknown }): Promise<{ type?: string | null; frontmatter?: unknown; folder_restricted: boolean }> {
+export async function withFolderRestricted(engine: Pick<BrainEngine, 'isFolderRestricted'>, page: { source_id: string; slug: string; type?: string | null; frontmatter?: unknown }): Promise<{ type?: string | null; frontmatter?: unknown; folder_restricted: boolean }> {
   return { type: page.type, frontmatter: page.frontmatter, folder_restricted: await folderRestricted(engine, page.source_id, page.slug) };
 }
 
@@ -947,11 +982,24 @@ export function privateLinkOriginFilterForCaller(linkAlias: string): string {
 
 /** privateTimelineEventFilterFragment for a remote read. */
 export function privateTimelineEventFilterForCaller(timelineAlias: string): string {
-  return `(${timelineAlias}.event_page_id IS NULL OR EXISTS (
+  return `((${timelineAlias}.event_page_id IS NULL OR EXISTS (
     SELECT 1 FROM pages event_private
     WHERE event_private.id = ${timelineAlias}.event_page_id
       AND ${privatePagesFilterForCaller('event_private')}
-  ))`;
+  ))${ownerOnlyTimelineAllowedSql(timelineAlias)})`;
+}
+
+/**
+ * A timeline row whose own recorded inputs reach owner-only data (a meeting in an owner-only source fanned onto an
+ * attendee page in another source) passes only for an owner read; its page is tested apart. Empty for the owner.
+ */
+export function ownerOnlyTimelineAllowedSql(timelineAlias: string): string {
+  return currentCallerAccess().owner ? '' : ` AND NOT ${ownerOnlyTimelineSql(timelineAlias, ownerOnlyForm(readSchemaVersion()))}`;
+}
+
+/** A take whose own recorded inputs reach owner-only data passes only for an owner read; its page is tested apart. Empty for the owner. */
+export function ownerOnlyTakeAllowedSql(takeAlias: string): string {
+  return currentCallerAccess().owner ? '' : ` AND NOT ${ownerOnlyTakeSql(takeAlias, ownerOnlyForm(readSchemaVersion()))}`;
 }
 
 /**
@@ -1198,7 +1246,7 @@ export async function remotePrivacyRelaxed(engine: BrainEngine): Promise<boolean
   return expose;
 }
 
-/** GST-363: whom the brain serves, as a remote request reads it from config (no query). `since` is epoch seconds. */
+/** GST-363: whom the brain serves, as a remote request reads it from config (no query). `since` is epoch seconds, with the fraction access.serves_since records since v329 (GST-3199). */
 export interface ServesPolicy { several: boolean; from: 'config' | 'members'; since: number | null; enforce: boolean }
 
 /** `servesUnknown`: the config read failed, so whom the brain serves is not known (never read as one person, GST-363). */
@@ -1213,7 +1261,7 @@ export function servesPolicyFrom(config: Record<string, string | undefined>): Se
   return {
     several: (fromConfig ? explicit : config[SERVES_DERIVED_KEY]?.trim()) === 'several',
     from: fromConfig ? 'config' : 'members',
-    since: Number.isFinite(since) ? Math.floor(since / 1000) : null,
+    since: Number.isFinite(since) ? since / 1000 : null,
     enforce: !['false', '0', 'off', 'no'].includes(config[REQUESTER_SCOPE_ENFORCE_KEY]?.trim().toLowerCase() ?? ''),
   };
 }
