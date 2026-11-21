@@ -58,7 +58,7 @@ export async function managedSynthesisFixture(engines: BrainEngine[], run: (f: S
         const quote = 'we charge for durability because reliable memories should survive every tool';
         writeFileSync(inputFile, `User: ${quote}.\n${'Assistant: Discuss the long term roadmap.\n'.repeat(15)}`);
         for (const [key, value] of Object.entries({
-          'dream.synthesize.enabled': 'true', 'dream.synthesize.cooldown_hours': '0',
+          'dream.synthesize.enabled': 'true', 'dream.synthesize.summary_page': 'true', 'dream.synthesize.cooldown_hours': '0',
           'dream.synthesize.min_chars': '100', 'dream.synthesize.link_manifest': 'false',
           'dream.synthesize.mode': 'oneshot', 'dream.synthesize.quote_verify': 'true',
           'models.dream.synthesize': 'anthropic:claude-sonnet-4-6',

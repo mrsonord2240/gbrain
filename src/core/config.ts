@@ -1588,6 +1588,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.synthesize.mode',
   'dream.synthesize.link_manifest',
   'dream.synthesize.quote_verify',
+  'dream.synthesize.summary_page', // fork: cycle summary page, default off
   'dream.quote_verify',
   'think.quote_verify', 'dream.attribution_checks', // #5425 [UC4] mechanical attribution checks, default off (cycle/attribution-checks.ts)
   'dream.synthesize.inline_concurrency',
@@ -1609,6 +1610,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.propose_takes.retry_max_tokens',
   // #5958: per-call extractor timeout (whole ms 1000..300000; unset scales with the output cap); cycle/phase-config-values.ts.
   'dream.propose_takes.call_timeout_ms',
+  'dream.propose_takes.receipt_page', // fork: takes.proposed receipt page, default off
   'dream.patterns.lookback_days',
   'dream.patterns.min_evidence',
   // #2782-family: patterns-phase subagent timeouts (mirror of the

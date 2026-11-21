@@ -111,6 +111,25 @@ describe('#2138 per-claim proposal idempotency', () => {
     expect(await countProposals('wiki/essays/thesis')).toBe(2);
   });
 
+  test('writes no takes.proposed receipt page unless dream.propose_takes.receipt_page is on (fork)', async () => {
+    const receipts = async () => (await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM pages WHERE slug LIKE 'extracts/%/takes.proposed/%' AND deleted_at IS NULL`,
+    ))[0]!.n;
+    await putThesis();
+    const off = await runPhaseProposeTakes(context(), { extractor: proposals });
+    expect((off.details as Record<string, unknown>).proposals_inserted).toBe(2);
+    expect(await receipts()).toBe('0');
+
+    await engine.setConfig('dream.propose_takes.receipt_page', 'true');
+    await engine.putPage('wiki/essays/second', {
+      title: 'second', type: 'analysis' as never,
+      compiled_truth: 'Two more strong claims live here.', frontmatter: {}, timeline: '',
+    });
+    const on = await runPhaseProposeTakes(context(), { extractor: proposals });
+    expect((on.details as Record<string, unknown>).proposals_inserted).toBe(2);
+    expect(await receipts()).toBe('1');
+  });
+
   test('migration v125 replaces the old-shaped index', async () => {
     await engine.executeRaw('DROP INDEX IF EXISTS take_proposals_idempotency_idx');
     await engine.executeRaw(
