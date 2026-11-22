@@ -14,6 +14,7 @@ import { localCallErrorEnvelope } from '../mcp/dispatch.ts';
 import { setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { OperationError } from '../core/ops/contract.ts';
 import { isWriteErrorCode } from '../core/persistence/types.ts';
+import { readStdinPayload } from '../core/stdin-read.ts';
 
 /**
  * Write-path failures (a receipt, a write_error, a write refusal code, the
@@ -73,7 +74,22 @@ export async function runCall(
 
   // `-` reads params from stdin: large payloads (skill files, transcripts) overflow the
   // OS command-line limit when passed inline (Windows fails or crashes past ~16 KB).
-  const raw = jsonStr === '-' ? await Bun.stdin.text() : jsonStr;
+  // Backlog 10b: read through the shared bounded reader (the one `gbrain put` uses), not
+  // Bun.stdin.text(), which came back empty on Windows; and an empty or failed read is an
+  // error, never a call with no parameters.
+  let raw = jsonStr;
+  if (jsonStr === '-') {
+    const read = await readStdinPayload(`echo '{"slug":"x"}' | gbrain call ${tool} -`, { maxBytes: Infinity });
+    if (!read.ok) {
+      console.error(read.message);
+      process.exit(1);
+    }
+    if (!read.text.replace(/^\uFEFF/, '').trim()) {
+      console.error(`gbrain call ${tool} -: stdin was empty, so nothing was called. Pipe the JSON parameters on stdin.`);
+      process.exit(1);
+    }
+    raw = read.text.replace(/^\uFEFF/, ''); // Windows PowerShell can prefix piped text with a BOM
+  }
   const params = raw ? JSON.parse(raw) : {};
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('Tool parameters must be a JSON object.');
   // Parse and submit before acquiring PGLite. Keep the generated request ID

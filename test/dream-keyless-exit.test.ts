@@ -35,10 +35,20 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join, resolve, dirname } from 'path';
+import { join, resolve, dirname, delimiter } from 'path';
 import { spawnSync, execFileSync } from 'child_process';
 
 const REPO = resolve(import.meta.dir, '..');
+const IS_WINDOWS = process.platform === 'win32';
+// Backlog 18f: the child env used to be POSIX-only (a ':'-joined /usr/bin PATH, HOME, TMPDIR), so on
+// Windows the child found no git and the test failed in setup. Windows keeps the parent's PATH
+// (where git lives there; PATH holds no credentials) and the variables its programs need to start.
+const SYSTEM_PATH = IS_WINDOWS
+  ? (process.env.PATH ?? '').split(delimiter).filter(Boolean)
+  : ['/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+const WINDOWS_BASE_ENV: Record<string, string> = IS_WINDOWS
+  ? Object.fromEntries(['SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT'].flatMap((k) => (process.env[k] ? [[k, process.env[k]!]] : [])))
+  : {};
 const CLI = join(REPO, 'src', 'cli.ts');
 const SKIP = process.env.GBRAIN_TEST_SKIP_SUBPROCESS === '1';
 
@@ -81,7 +91,7 @@ describe.skipIf(SKIP)('keyless `gbrain dream` exits 0 (nightly-cron contract)', 
    * exactly '{'.
    */
   function parseReport(stdout: string): CycleReportish {
-    const lines = stdout.split('\n');
+    const lines = stdout.split(/\r?\n/);
     const start = lines.findIndex((l) => l === '{');
     if (start === -1) throw new Error(`no JSON object found on stdout:\n${stdout.slice(-2000)}`);
     return JSON.parse(lines.slice(start).join('\n')) as CycleReportish;
@@ -105,10 +115,13 @@ describe.skipIf(SKIP)('keyless `gbrain dream` exits 0 (nightly-cron contract)', 
     env = {
       // Allowlist-built env: NO inherited vars, so every ambient provider
       // key/endpoint is stripped by construction (see file docstring).
-      PATH: `${bunDir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+      PATH: [bunDir, ...SYSTEM_PATH].join(delimiter),
+      ...WINDOWS_BASE_ENV,
       HOME: home,
       GBRAIN_HOME: home,
       TMPDIR: tmpdir(),
+      // Windows reads the home folder from USERPROFILE and the temp folder from TEMP/TMP.
+      ...(IS_WINDOWS ? { USERPROFILE: home, TEMP: tmpdir(), TMP: tmpdir() } : {}),
       // Keep the startup update-check marker off: env -i children have no
       // NODE_ENV=test, and a stale cache would fire a detached, real-network
       // `gbrain check-update --refresh-cache` per spawn + an
@@ -165,7 +178,12 @@ describe.skipIf(SKIP)('keyless `gbrain dream` exits 0 (nightly-cron contract)', 
   }, 240_000);
 
   afterAll(() => {
-    rmSync(home, { recursive: true, force: true });
+    // Windows can hold the PGLite files a moment after the last child exits.
+    try {
+      rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (e) {
+      if (!IS_WINDOWS) throw e;
+    }
   });
 
   test('1. full keyless dream --json exits 0 with the documented degraded posture', () => {

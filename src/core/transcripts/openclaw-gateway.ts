@@ -32,6 +32,8 @@
  * and throws once the reads already running have ended, so a failed run changes no ledger row.
  */
 
+import { readFileSync, statSync } from 'node:fs';
+import { dirname, extname, isAbsolute, join } from 'node:path';
 import { execFileBounded } from '../bounded-child-exec.ts';
 import { opError } from '../ops/contract.ts';
 import { applyRedaction, planRedaction } from '../secret-scan.ts';
@@ -106,8 +108,74 @@ export function parseGatewayCliOutput(stdout: string, exitCode: number | null): 
 
 const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
 
-/** The parent variables the openclaw child gets: where binaries and the home folder are, and the locale. */
-const CHILD_ENV_ALLOW = new Set(['PATH', 'HOME', 'USERPROFILE', 'SYSTEMROOT', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES']);
+/**
+ * The parent variables the openclaw child gets: where binaries, the home folder and the temp folder are, and the
+ * locale. Matched without case: Windows names them case-insensitively and usually spells PATH as Path.
+ */
+const CHILD_ENV_ALLOW = new Set(['PATH', 'PATHEXT', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'SYSTEMROOT', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES']);
+
+/** What actually runs for the openclaw command: a file and the arguments that go before gbrain's. */
+export interface OpenclawLaunch { file: string; prefix: string[] }
+
+function isFile(path: string): boolean {
+  try { return statSync(path).isFile(); } catch { return false; }
+}
+
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const key = Object.keys(env).find(k => k.toUpperCase() === name);
+  return key === undefined ? undefined : env[key];
+}
+
+/** Where Windows would find `name` (PATH order, then PATHEXT order), or null. A bare name without an extension never matches as is. */
+export function findOnWindowsPath(name: string, env: NodeJS.ProcessEnv, exists: (path: string) => boolean = isFile): string | null {
+  const exts = (envValue(env, 'PATHEXT') ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
+  const named = exts.some(e => e.toLowerCase() === extname(name).toLowerCase());
+  const candidates = (base: string) => [...(named ? [base] : []), ...exts.map(e => base + e.toLowerCase())];
+  if (isAbsolute(name) || /[\\/]/.test(name)) return candidates(name).find(exists) ?? null;
+  for (const dir of (envValue(env, 'PATH') ?? '').split(';').filter(Boolean)) {
+    const hit = candidates(join(dir, name)).find(exists);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * The script an npm (or pnpm / yarn) .cmd shim runs: the last quoted path under the shim's own folder (%dp0% or
+ * %~dp0) that is followed by %*. Null when the file is not such a shim.
+ */
+export function cmdShimEntry(shimPath: string, text: string): string | null {
+  const matches = [...text.matchAll(/"%~?dp0%?[\\/]?([^"%]+)"\s*%\*/gi)];
+  const rel = matches.at(-1)?.[1];
+  return rel ? join(dirname(shimPath), ...rel.split(/[\\/]+/).filter(Boolean)) : null;
+}
+
+/**
+ * Backlog 20b: on Windows `openclaw` is npm's openclaw.cmd shim, and a .cmd file runs through cmd.exe, which cannot
+ * take the JSON in --params: the runtime refuses arguments with cmd.exe special characters (ERR_INVALID_ARG_VALUE), so
+ * every archive run failed. There the shim is read and its script is run with node directly, the way the shim itself
+ * would, so the arguments never pass through cmd.exe. Everywhere else, and for an .exe, `bin` runs as given.
+ */
+export function resolveOpenclawLaunch(bin: string, opts: {
+  platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv;
+  exists?: (path: string) => boolean; readText?: (path: string) => string;
+} = {}): OpenclawLaunch {
+  if ((opts.platform ?? process.platform) !== 'win32') return { file: bin, prefix: [] };
+  const env = opts.env ?? process.env;
+  const exists = opts.exists ?? isFile;
+  const found = findOnWindowsPath(bin, env, exists);
+  if (!found) throw gatewayError('unreachable', bin + ' is not on PATH');
+  if (!/\.(cmd|bat)$/i.test(found)) return { file: found, prefix: [] };
+  let text = '';
+  try { text = (opts.readText ?? (p => readFileSync(p, 'utf8')))(found); } catch { /* reported below */ }
+  const entry = cmdShimEntry(found, text);
+  if (!entry) {
+    throw gatewayError('failed', found + ' is a batch file gbrain cannot read as an npm shim, and Windows batch files cannot take the JSON gbrain passes; reinstall OpenClaw with npm (npm install -g openclaw)');
+  }
+  const besideShim = join(dirname(found), 'node.exe');
+  const node = exists(besideShim) ? besideShim : findOnWindowsPath('node', env, exists);
+  if (!node) throw gatewayError('unreachable', 'node is not on PATH, and ' + found + ' needs it to run OpenClaw');
+  return { file: node, prefix: [entry] };
+}
 
 /** The default transport: the documented CLI on this machine. The token, when gbrain holds one, goes through the environment, never argv. */
 export function cliGatewayTransport(opts: {
@@ -116,6 +184,8 @@ export function cliGatewayTransport(opts: {
   maxOutputBytes?: number;
   /** Test seam: the child launcher (default execFileBounded: array arguments, no shell, SIGKILL after the TERM grace). */
   spawn?: typeof execFileBounded;
+  /** Test seam: the platform the launch is resolved for (default process.platform). */
+  platform?: NodeJS.Platform;
 } = {}): GatewayTransport {
   const bin = opts.bin ?? 'openclaw';
   const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
@@ -126,20 +196,26 @@ export function cliGatewayTransport(opts: {
   const urlVar = opts.url !== undefined || GBRAIN_OPENCLAW_GATEWAY_URL !== undefined ? 'GBRAIN_OPENCLAW_GATEWAY_URL' : 'OPENCLAW_GATEWAY_URL';
   const token = opts.token ?? GBRAIN_OPENCLAW_GATEWAY_TOKEN ?? OPENCLAW_GATEWAY_TOKEN;
   const timeoutMs = opts.timeoutMs ?? 60_000;
+  let launchSpec: OpenclawLaunch | null = null;
   return {
     call(method, params) {
       if (url && !/^(wss?|https?):\/\/[^\s]+$/i.test(url)) {
         return Promise.reject(gatewayError('failed', urlVar + ' must use the ws, wss, http or https scheme; nothing was run'));
       }
-      const args = ['gateway', 'call', method, '--json', '--params', JSON.stringify(params), '--timeout', String(timeoutMs)];
+      try {
+        launchSpec ??= resolveOpenclawLaunch(bin, { platform: opts.platform });
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      const args = [...launchSpec.prefix, 'gateway', 'call', method, '--json', '--params', JSON.stringify(params), '--timeout', String(timeoutMs)];
       // The URL goes through OPENCLAW_GATEWAY_URL: OpenClaw refuses a --url override whose credential comes only from
       // the environment (gateway_credentials_required, 2026.10.9 and 2026.11.3), and accepts the environment pair.
       // Only the allow-listed parent variables pass, so no inherited OPENCLAW_* value (a cwd .env's included) redirects the child.
       const env: NodeJS.ProcessEnv = {};
-      for (const [k, v] of Object.entries(process.env)) if (v !== undefined && CHILD_ENV_ALLOW.has(k)) env[k] = v;
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined && CHILD_ENV_ALLOW.has(k.toUpperCase())) env[k] = v;
       if (url) env.OPENCLAW_GATEWAY_URL = url;
       if (token) env.OPENCLAW_GATEWAY_TOKEN = token;
-      return launch(bin, args, { env, timeout: timeoutMs + 10_000, maxBuffer: maxOutputBytes, killTree: true }).then(({ error, stdout }) => {
+      return launch(launchSpec.file, args, { env, timeout: timeoutMs + 10_000, maxBuffer: maxOutputBytes, killTree: true }).then(({ error, stdout }) => {
         const code = error && typeof (error as NodeJS.ErrnoException).code === 'string' ? (error as NodeJS.ErrnoException).code : null;
         if (code === 'ENOENT') throw gatewayError('unreachable', bin + ' is not on PATH');
         if (code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw gatewayError('failed', 'openclaw gateway call wrote more than ' + maxOutputBytes + ' bytes, so it was stopped and nothing it wrote was read');

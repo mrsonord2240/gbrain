@@ -1,0 +1,6 @@
+**Three Windows-only failures are fixed: `gbrain call <tool> -`, the OpenClaw conversation archive, and the keyless dream test.**
+
+### Fixed
+- `gbrain call <tool> -` reads its JSON parameters from stdin through the same bounded reader `gbrain put` uses. On Windows the old read came back empty, so pages too large for the command line could not be written this way. An empty stdin is now an error instead of a call with no parameters, and a leading byte-order mark (Windows PowerShell adds one) is ignored.
+- The conversation archive's OpenClaw reader works on Windows. There `openclaw` is npm's `openclaw.cmd` shim, and a batch file cannot take the JSON gbrain passes in `--params` (the runtime refused it with `ERR_INVALID_ARG_VALUE`, so every archive run ended in an error). gbrain now reads the shim and runs its script with node directly. A batch file that is not an npm, pnpm or yarn shim is refused with a clear `archive_gateway_failed` message. The child's environment allow-list also matches names without case (Windows spells PATH as Path) and passes PATHEXT, APPDATA, LOCALAPPDATA, TEMP and TMP.
+- `test/dream-keyless-exit.test.ts` builds its child environment for the platform it runs on, so on Windows the child finds git and the system folders it needs.
