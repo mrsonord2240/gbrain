@@ -1204,13 +1204,25 @@ class ProposeTakesPhase extends BaseCyclePhase {
   }
 }
 
+/**
+ * Fork: whether propose_takes writes its `extracts/<date>/takes.proposed/...`
+ * receipt page. Config `dream.propose_takes.receipt_page`, default OFF; only
+ * an explicit 'true'/'1'/'on' turns it on.
+ */
+async function receiptPageEnabled(engine: BrainEngine): Promise<boolean> {
+  const raw = (await engine.getConfig('dream.propose_takes.receipt_page'))?.trim().toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'on';
+}
+
 /** The takes.proposed receipt and rollup of one run; returns whether the run halted (any cap or halt). */
 async function recordProposeTakesRun(engine: BrainEngine, result: ProposeTakesResult, sourceIdForReceipt: string, proposalRunId: string): Promise<boolean> {
   // v0.42 Wave B3: receipt + rollup for propose_takes. Source-scoped
   // via the read scope. Receipt only when proposals actually written.
   // Managed brains skip the receipt page (a legacy putPage the coordinator
   // refuses), like extract_atoms and synthesize_concepts; the rollup stays.
-  if (result.proposals_inserted > 0 && !await managedPersistenceEnabled(engine)) {
+  // Fork: the receipt page is opt-in (dream.propose_takes.receipt_page,
+  // default off); the rollup below still records every run.
+  if (result.proposals_inserted > 0 && await receiptPageEnabled(engine) && !await managedPersistenceEnabled(engine)) {
     try {
       await writeReceipt(engine, {
         kind: 'takes.proposed',

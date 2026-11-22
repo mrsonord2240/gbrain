@@ -53,7 +53,7 @@ interface Rig {
 async function setupRig(): Promise<Rig> {
   const brainDir = mkdtempSync(join(tmpdir(), 'gbrain-cap-brain-'));
   const corpusDir = mkdtempSync(join(tmpdir(), 'gbrain-cap-corpus-'));
-  await engine.setConfig('dream.synthesize.enabled', 'true');
+  await engine.setConfig('dream.synthesize.enabled', 'true'); await engine.setConfig('dream.synthesize.summary_page', 'true');
   await engine.setConfig('dream.synthesize.session_corpus_dir', corpusDir);
   return {
     engine,
@@ -175,6 +175,24 @@ describe('cycle summary date (#4348)', () => {
       });
 
       expect(await rig.engine.getPage('dream-cycle-summaries/2026-08-20')).not.toBeNull();
+      expect(await rig.engine.getPage('dream-cycle-summaries/2026-08-19')).toBeNull();
+    } finally {
+      await rig.cleanup();
+    }
+  }, 60_000);
+});
+
+describe('cycle summary page is opt-in (fork)', () => {
+  test('no dream-cycle-summaries page when dream.synthesize.summary_page is unset', async () => {
+    const rig = await setupRig();
+    try {
+      await rig.engine.unsetConfig('dream.synthesize.summary_page');
+      await seedPassingFile(rig, '2026-08-19-no-summary.txt');
+
+      // Same rig and seed as the #4348 test above, which does get a summary
+      // with the key on.
+      await runPhase(rig, { now: () => new Date('2026-08-19T12:00:00.000Z') });
+
       expect(await rig.engine.getPage('dream-cycle-summaries/2026-08-19')).toBeNull();
     } finally {
       await rig.cleanup();

@@ -77,7 +77,6 @@ describe('#2415: loadAllowedSlugPrefixes remap', () => {
       'wiki/personal/reflections/*',
       'wiki/originals/*',
       'wiki/personal/patterns/*',
-      'wiki/people/*',
       'dream-cycle-summaries/*',
     ]);
   });

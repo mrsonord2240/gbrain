@@ -80,7 +80,7 @@ async function fixture(managed: boolean, seed: (f: Fixture) => Promise<void>, ru
         await engine.setConfig('sync.write_through', 'true');
         await claimWorktree(engine, f.sourceId, f.root);
         for (const [key, value] of Object.entries({
-          'dream.synthesize.enabled': 'true', 'dream.synthesize.cooldown_hours': '0',
+          'dream.synthesize.enabled': 'true', 'dream.synthesize.summary_page': 'true', 'dream.synthesize.cooldown_hours': '0',
           'dream.synthesize.min_chars': '100', 'dream.synthesize.link_manifest': 'false',
           'dream.synthesize.mode': 'oneshot', 'dream.synthesize.session_corpus_dir': f.corpus,
           'dream.synthesize.meeting_transcripts_dir': f.meetings, 'dream.synthesize.conversation_pages': 'true',

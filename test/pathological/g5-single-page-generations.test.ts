@@ -87,7 +87,7 @@ async function synthesisRig(engine: BrainEngine, dir: string) {
   await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
   await engine.setConfig('sync.write_through', 'true');
   await claimWorktree(engine, 'g5src', root);
-  for (const [k, v] of Object.entries({ 'dream.synthesize.enabled': 'true', 'dream.synthesize.cooldown_hours': '0', 'dream.synthesize.min_chars': '100',
+  for (const [k, v] of Object.entries({ 'dream.synthesize.enabled': 'true', 'dream.synthesize.summary_page': 'true', 'dream.synthesize.cooldown_hours': '0', 'dream.synthesize.min_chars': '100',
     'dream.synthesize.link_manifest': 'false', 'dream.synthesize.mode': 'oneshot', 'dream.synthesize.session_corpus_dir': corpus, 'dream.synthesize.quote_verify': 'false',
     'dream.synthesize.budget_usd': 'unlimited', 'models.dream.synthesize': 'anthropic:claude-sonnet-4-6', 'models.dream.triage': 'anthropic:claude-sonnet-4-6', 'agent.use_gateway_loop': 'true' })) await engine.setConfig(k, v);
   const usage = { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 };

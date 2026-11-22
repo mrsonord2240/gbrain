@@ -91,7 +91,7 @@ describe('E2E synthesize — disabled / not_configured', () => {
   test('not_configured when enabled=true but session_corpus_dir is empty', async () => {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       const result = await runPhaseSynthesize(rig.engine, {
         brainDir: rig.brainDir,
         dryRun: false,
@@ -108,7 +108,7 @@ describe('E2E synthesize — empty corpus', () => {
   test('ok status with zero transcripts when corpus dir is empty', async () => {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       const result = await runPhaseSynthesize(rig.engine, {
         brainDir: rig.brainDir,
@@ -145,7 +145,7 @@ describe('E2E synthesize — gateway-adapter mid-run AIConfigError catch (v0.41 
       });
 
       try {
-        await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+        await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
         await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
         writeFileSync(
           join(rig.corpusDir, '2026-04-25-mid-run.txt'),
@@ -181,7 +181,7 @@ describe('E2E synthesize — no API key skip path', () => {
   test('without provider credentials, every transcript verdict is "no key" and zero pages written', async () => {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       writeFileSync(
         join(rig.corpusDir, '2026-04-25-session.txt'),
@@ -219,7 +219,7 @@ describe('E2E synthesize — no API key skip path', () => {
   test('3A: a time-boxed cold pass labels deferred files "not yet triaged" in the headline', async () => {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       // Advance the triage clock past the 1ms budget on the first cache miss.
       // Cache lookup speed varies with machine load, so real elapsed time
@@ -258,7 +258,7 @@ describe('E2E synthesize — dry-run skips Sonnet (Codex finding #8)', () => {
   test('dry-run reports planned action with zero pages_written', async () => {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       writeFileSync(
         join(rig.corpusDir, '2026-04-25-session.txt'),
@@ -284,7 +284,7 @@ describe('E2E synthesize — cooldown', () => {
   test('cooldown_active when last_completion_ts is fresh', async () => {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       await rig.engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
       await rig.engine.setConfig('dream.synthesize.cooldown_hours', '12');
@@ -303,7 +303,7 @@ describe('E2E synthesize — cooldown', () => {
     // Two engine setups + a synth run; default 5s is tight under full-suite pressure.
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       await rig.engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
       const adHoc = join(tmpdir(), `gbrain-synth-ad-hoc-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
@@ -364,7 +364,7 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
     // (with a stderr log so the operator can debug).
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
 
       // 1. Insert a reflection page in the DB the way the subagent would.
@@ -430,7 +430,7 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
     // function-pair level the unit tests cover.
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
 
       const slug = 'wiki/personal/reflections/2026-04-30-bypass-test-def456';
@@ -482,7 +482,7 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
     // and let the real one through.
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
 
       // Leaked reflection.
@@ -538,7 +538,7 @@ describe('E2E synthesize — internal inputs never re-enter discovery (#5413, #5
     const savedClaude = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = claudeHome;
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       const selfId = '11111111-2222-4333-8444-555555555555';
       const userId = '66666666-7777-4888-9999-000000000000';
@@ -568,7 +568,7 @@ describe('E2E synthesize — internal inputs never re-enter discovery (#5413, #5
   test('unmarked dream outputs under the brain tree are not discovered; a transcript naming their paths is (#5471)', async () => {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.brainDir);
       await rig.engine.setConfig('dream.patterns.output_slug_prefix', 'notes/patterns');
       const { mkdirSync, symlinkSync } = require('node:fs') as typeof import('node:fs');
@@ -610,7 +610,7 @@ describe('E2E synthesize — verdict cache (Q-2)', () => {
     // Two synth runs through the verdict-cache path; default 5s is tight.
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       const filePath = join(rig.corpusDir, '2026-04-25-session.txt');
       const body = 'a meaningful conversation\n'.repeat(200);
@@ -696,7 +696,7 @@ describe('E2E synthesize — degenerate verdicts are NOT cached in dream_verdict
   }): Promise<{ verdictRow: unknown; stderr: string }> {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       const filePath = join(rig.corpusDir, '2026-05-01-session.txt');
       const body = 'a meaningful conversation\n'.repeat(200);
@@ -784,7 +784,7 @@ describe('E2E synthesize — degenerate verdicts are NOT cached in dream_verdict
   test('legacy boolean-era cached row (score NULL) is a MISS — re-judged and overwritten', async () => {
     const rig = await setupRig();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       const filePath = join(rig.corpusDir, '2026-05-02-legacy.txt');
       const body = 'a meaningful conversation\n'.repeat(200);
@@ -946,7 +946,7 @@ describe('E2E synthesize — cooperative abort (#4077)', () => {
     const rig = await setupRig();
     const abort = new AbortController();
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       // deepseek: makeJudgeClient needs no local key (A9) — auth is the
       // gateway's problem, and the transport below is stubbed anyway.
@@ -1067,7 +1067,7 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     const savedKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'sk-test-oneshot-e2e';
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       await rig.engine.setConfig('cycle.timezone', 'Asia/Kolkata');
       const content = 'User: an important new idea about widget scaling\n'.repeat(120);
@@ -1161,7 +1161,7 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     const savedKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'sk-test-oneshot-e2e';
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       const content = 'User: a verbatim paste of an existing page\n'.repeat(120);
       const filePath = join(rig.corpusDir, '2026-08-16-paste.txt');
@@ -1212,7 +1212,7 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     const savedKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'sk-test-oneshot-fallback';
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       // Route the fallback through the gateway loop so the stubbed transport
       // serves it too (no real network in tests).
@@ -1270,7 +1270,7 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     const savedKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'sk-test-agentic-dial';
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       await rig.engine.setConfig('dream.synthesize.mode', 'agentic');
       await rig.engine.setConfig('agent.use_gateway_loop', 'true');
@@ -1320,7 +1320,7 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     const savedKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'sk-test-mixed-outcome';
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       await rig.engine.setConfig('agent.use_gateway_loop', 'true');
 
@@ -1403,7 +1403,7 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     const savedKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'sk-test-summary-preserve';
     try {
-      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true'); await rig.engine.setConfig('dream.synthesize.summary_page', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
       await rig.engine.setConfig('agent.use_gateway_loop', 'true');
 

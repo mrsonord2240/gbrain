@@ -1192,7 +1192,8 @@ async function runPhaseSynthesizeInner(
 
     const summarySlug = buildDreamSummarySlug(config.outputRoot, summaryDate);
     const writtenSlugs = writtenRefs.map(r => r.slug);
-    if (SUMMARY_SLUG_RE.test(summarySlug) && !publishPending) {
+    // Fork: the cycle summary page is opt-in (dream.synthesize.summary_page).
+    if (config.summaryPage && SUMMARY_SLUG_RE.test(summarySlug) && !publishPending) {
       const preserveSummary = !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
       if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance, summaryRevision)
         .then(held => held && fileHolds.push(held), (e: unknown) => { deferPublishOrThrow(e, summarySlug); publishPending++; });
@@ -1392,7 +1393,7 @@ async function runPhaseSynthesizeInner(
       estimated_spend_usd: synthMeter.totalSpent,
       // D5 cap hits + D8 legacy-key skips + daily_cap_reached. Empty when nothing skipped.
       skips: skipReports,
-      summary_slug: summarySlug,
+      summary_slug: config.summaryPage ? summarySlug : null,
       verdicts,
       triage: triageDetails,
       synthesis_state: synthesisState,
@@ -1571,6 +1572,13 @@ export interface SynthConfig {
    * Revert dial: `gbrain config set dream.synthesize.mode agentic`.
    */
   mode: 'agentic' | 'oneshot';
+  /**
+   * Fork: write the `dream-cycle-summaries/<date>` index page. Config
+   * `dream.synthesize.summary_page`, default OFF; only an explicit
+   * 'true'/'1'/'on' turns it on. The page only lists what the run wrote,
+   * which the cycle report already carries, so by default it is not written.
+   */
+  summaryPage: boolean;
 }
 
 /** Keep orchestrator summaries inside a configured non-default namespace. */
@@ -1716,6 +1724,8 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
   // F1b kill switch (same off-spelling contract as link_manifest).
   const quoteVerifyRaw = (await engine.getConfig('dream.synthesize.quote_verify'))?.trim().toLowerCase();
   const quoteVerify = !(quoteVerifyRaw === 'false' || quoteVerifyRaw === '0' || quoteVerifyRaw === 'off');
+  const summaryPageRaw = (await engine.getConfig('dream.synthesize.summary_page'))?.trim().toLowerCase();
+  const summaryPage = summaryPageRaw === 'true' || summaryPageRaw === '1' || summaryPageRaw === 'on';
   // #4216: mode default 'oneshot' (D1=A). loadOutputRoot pattern: unknown
   // values warn to stderr and fall back to the default rather than failing.
   const modeRaw = (await engine.getConfig('dream.synthesize.mode'))?.trim().toLowerCase();
@@ -1790,6 +1800,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     quoteVerify,
     linkManifest,
     mode: synthMode,
+    summaryPage,
   };
 }
 
